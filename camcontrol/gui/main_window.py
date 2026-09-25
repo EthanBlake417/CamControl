@@ -1,4 +1,5 @@
-"""Main window: live image in the middle, controls panel on the right.
+"""Main window: live image in the middle, controls panel on the right,
+measurements panel at the bottom.
 
 Shortcuts:
     Space       capture
@@ -10,6 +11,7 @@ Shortcuts:
     1           100% (one image pixel per screen pixel)
     Ctrl+= / -  zoom in / out (or use the mouse wheel)
     Ctrl+O      open an image file
+    Ctrl+E      export measurements
 """
 
 import os
@@ -42,8 +44,12 @@ from PySide6.QtWidgets import (
 
 from camcontrol.camera import ADJUSTABLE, format_exposure
 from camcontrol.capture import CAPTURE_DIR, HD2_SIZE, NATIVE_SIZE
+from camcontrol.export import export_table, measurement_rows
 from camcontrol.gui.camera_worker import CameraWorker
 from camcontrol.gui.image_view import ImageView
+from camcontrol.gui.measure_draw import render_annotated
+from camcontrol.gui.measure_panel import MeasurePanel
+from camcontrol.gui.qt_image import to_qimage
 
 AVERAGE_CHOICES = [1, 4, 8, 16, 32]
 SAVE_SIZES = [
@@ -77,14 +83,17 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.settings = QSettings("CamControl", "CamControl")
         self.live = True
+        self._source = "live"  # what the view shows: "live" or an image file name
         self._frame_times: deque[float] = deque(maxlen=30)
 
         self.view = ImageView()
         self.setCentralWidget(self.view)
+        self.measure_panel = MeasurePanel()
 
         self._build_actions()
         self._build_menus()
         self._build_controls()
+        self._build_measure_dock()
         self._build_status_bar()
         self._load_settings()
         self._set_title()
@@ -129,6 +138,10 @@ class MainWindow(QMainWindow):
         self.exp_up_action = self._action("Exposure longer", "E", lambda: self._step_exposure(+1))
         self.exp_down_action = self._action("Exposure shorter", "D", lambda: self._step_exposure(-1))
 
+        self.export_action = self._action("&Export measurements...", "Ctrl+E", self.export_measurements)
+        self.clear_measurements_action = self._action(
+            "&Clear measurements", None, lambda: self.measure_panel.clear())
+
     def _build_menus(self):
         m = self.menuBar().addMenu("&File")
         m.addActions([self.open_action, self.capture_action, self.open_folder_action])
@@ -142,6 +155,29 @@ class MainWindow(QMainWindow):
 
         m = self.menuBar().addMenu("&Camera")
         m.addActions([self.exp_up_action, self.exp_down_action])
+
+        m = self.menuBar().addMenu("&Measure")
+        m.addActions([self.export_action, self.clear_measurements_action])
+
+    def _build_measure_dock(self):
+        panel = self.measure_panel
+        view = self.view
+        view.set_measurements(panel.measurements, panel.calibration)
+
+        panel.tool_changed.connect(view.set_tool)
+        panel.selection_changed.connect(view.set_selected)
+        panel.changed.connect(
+            lambda: view.set_measurements(panel.measurements, panel.calibration, panel.selected_id()))
+        panel.export_requested.connect(self.export_measurements)
+        view.measurement_drawn.connect(self._on_measurement_drawn)
+        view.tool_exit_requested.connect(lambda: panel.set_tool(None))
+
+        dock = QDockWidget("Measurements", self)
+        dock.setObjectName("measure_dock")  # needed for saveState()
+        dock.setWidget(panel)
+        dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
+                         | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
 
     def _tool_button(self, action):
         """A button that mirrors an action (text, checked and enabled state)."""
@@ -372,7 +408,9 @@ class MainWindow(QMainWindow):
     def _set_live(self, on: bool):
         self.live = on
         self.live_action.setChecked(on)
-        if not on:
+        if on:
+            self._source = "live"
+        else:
             self.fps_label.setText("frozen")
             self._frame_times.clear()
         self._set_title()
@@ -412,12 +450,57 @@ class MainWindow(QMainWindow):
         if img is None:
             QMessageBox.warning(self, "CamControl", f"Could not read {path}")
             return
+        # Measurements belong to the image they were drawn on.
+        if self.measure_panel.measurements and QMessageBox.question(
+            self, "Open image", "Clear the current measurements? They were made on a different image."
+        ) == QMessageBox.StandardButton.Yes:
+            self.measure_panel.clear(confirm=False)
         self._set_live(False)  # stop the camera feed replacing it
         self.view.set_image(img)
         h, w = img.shape[:2]
         self.size_label.setText(f"{w} x {h}")
         self.fps_label.setText("file")
-        self._set_title(Path(path).name)
+        self._source = Path(path).name
+        self._set_title(self._source)
+
+    # --- measurements ---------------------------------------------------------------
+
+    def _on_measurement_drawn(self, kind: str, points: list):
+        error = self.measure_panel.add(kind, points)
+        if error:
+            self.statusBar().showMessage(error, 5000)
+
+    def export_measurements(self):
+        """Save the table (Excel or CSV) plus the image and an annotated copy."""
+        panel = self.measure_panel
+        if not panel.measurements or self.view.image is None:
+            QMessageBox.information(self, "Export", "There are no measurements to export.")
+            return
+        default = Path(self.folder_edit.text()) / f"measurements_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export measurements", str(default), "Excel (*.xlsx);;CSV (*.csv)")
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() not in (".xlsx", ".csv"):
+            path = path.with_suffix(".xlsx")
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        cal = panel.calibration
+        image = self.view.image
+        try:
+            export_table(measurement_rows(panel.measurements, cal, self._source), path, cal, self._source)
+            # The exact image that was measured, and a copy with the shapes drawn on.
+            image_path = path.with_name(f"{path.stem}_image.png")
+            annotated_path = path.with_name(f"{path.stem}_annotated.png")
+            to_qimage(image).save(str(image_path))
+            render_annotated(image, panel.measurements, cal).save(str(annotated_path))
+        except Exception as e:  # e.g. the file is open in Excel
+            QMessageBox.warning(self, "Export", f"Export failed: {e}")
+            return
+        self.statusBar().showMessage(
+            f"Exported {len(panel.measurements)} measurements to {path.name}, "
+            f"{image_path.name} and {annotated_path.name}", 8000)
 
     def _on_cursor(self, info):
         if info is None:

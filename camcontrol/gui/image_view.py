@@ -1,41 +1,51 @@
-"""Zoomable, pannable image display with grid and crosshair overlays.
+"""Zoomable, pannable image display with overlays and measurement drawing.
 
-Built on QGraphicsView, so later the measurement tools can be added as
-graphics items on the same scene. Scene coordinates are image pixels:
-(0, 0) is the top-left corner of the image, (w, h) the bottom-right.
+Scene coordinates are image pixels: (0, 0) is the top-left corner of the
+image, (w, h) the bottom-right. Measurement points are stored in these
+coordinates (sub-pixel floats), so they stay put when zooming or panning.
 
-Mouse:
-    wheel        zoom around the cursor
-    left drag    pan
+Mouse, no tool selected:
+    wheel         zoom around the cursor
+    left drag     pan
+
+Mouse and keys, with a measurement tool selected:
+    left click    add a point (line/circle/angle/rectangle finish by themselves)
+    double-click, right-click or Enter
+                  finish a polyline / polygon
+    Backspace     remove the last point
+    Esc           cancel the shape being drawn (press again to leave the tool)
+    middle drag   pan
+    wheel         zoom
 """
 
 import math
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
+
+from camcontrol.calibration import PIXELS, Calibration
+from camcontrol.gui.measure_draw import (
+    MEASURE_COLOR,
+    PREVIEW_COLOR,
+    SELECTED_COLOR,
+    Style,
+    draw_measurement,
+)
+from camcontrol.gui.qt_image import to_qimage
+from camcontrol.measure import KINDS, Measurement
 
 GRID_COLOR = QColor(255, 255, 0)
 CROSSHAIR_COLOR = QColor(255, 0, 0)
 CROSSHAIR_RADIUS_PX = 20  # on screen, whatever the zoom
 
 
-def to_qimage(image: np.ndarray) -> QImage:
-    """Convert an 8-bit BGR or grayscale numpy image to a QImage (a copy)."""
-    image = np.ascontiguousarray(image)
-    h, w = image.shape[:2]
-    if image.ndim == 2:
-        fmt = QImage.Format.Format_Grayscale8
-    else:
-        fmt = QImage.Format.Format_BGR888
-    # .copy() so the QImage owns its data and doesn't point into numpy memory.
-    return QImage(image.data, w, h, image.strides[0], fmt).copy()
-
-
 class ImageView(QGraphicsView):
-    cursor_moved = Signal(object)  # (x, y, value) in image pixels, or None
-    zoom_changed = Signal(float)   # 1.0 = one image pixel per screen pixel
+    cursor_moved = Signal(object)                 # (x, y, value) in image pixels, or None
+    zoom_changed = Signal(float)                  # 1.0 = one image pixel per screen pixel
+    measurement_drawn = Signal(str, list)         # kind, points (image pixels)
+    tool_exit_requested = Signal()                # Esc with nothing being drawn
 
     ZOOM_STEP = 1.25
     MIN_ZOOM = 0.05
@@ -55,6 +65,17 @@ class ImageView(QGraphicsView):
         self.show_crosshair = False
         self.grid_divisions = 8
 
+        # Measurements to draw (owned by the measurement panel).
+        self.measurements: list[Measurement] = []
+        self.calibration: Calibration = PIXELS
+        self.selected_id: int | None = None
+
+        # Shape being drawn right now.
+        self.tool: str | None = None
+        self._points: list[tuple[float, float]] = []
+        self._mouse: tuple[float, float] | None = None
+        self._pan_from: QPointF | None = None  # middle-button pan
+
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
@@ -62,6 +83,7 @@ class ImageView(QGraphicsView):
         self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.setBackgroundBrush(QColor(30, 30, 30))
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)  # so Esc/Enter/Backspace reach us
         self._update_smoothing()
 
     # --- image -----------------------------------------------------------------
@@ -123,7 +145,7 @@ class ImageView(QGraphicsView):
             else Qt.TransformationMode.FastTransformation
         )
 
-    # --- overlays ----------------------------------------------------------------
+    # --- overlays and measurements ------------------------------------------------
 
     def set_show_grid(self, on: bool):
         self.show_grid = on
@@ -133,12 +155,23 @@ class ImageView(QGraphicsView):
         self.show_crosshair = on
         self.viewport().update()
 
+    def set_measurements(self, measurements, calibration, selected_id=None):
+        self.measurements = measurements
+        self.calibration = calibration
+        self.selected_id = selected_id
+        self.viewport().update()
+
+    def set_selected(self, measurement_id):
+        self.selected_id = measurement_id
+        self.viewport().update()
+
     def drawForeground(self, painter: QPainter, rect: QRectF):
-        """Draw overlays on top of the image, in image-pixel coordinates."""
+        """Draw overlays on top of the image."""
         if self._image is None:
             return
         h, w = self._image.shape[:2]
 
+        # Grid and crosshair: drawn in image-pixel coordinates.
         if self.show_grid:
             pen = QPen(GRID_COLOR, 1)
             pen.setCosmetic(True)  # 1 screen pixel wide at any zoom
@@ -161,7 +194,122 @@ class ImageView(QGraphicsView):
             r = CROSSHAIR_RADIUS_PX / self.zoom
             painter.drawEllipse(QPointF(cx, cy), r, r)
 
-    # --- mouse ---------------------------------------------------------------------
+        # Measurements: drawn in window pixels, so lines and text keep the
+        # same on-screen size at any zoom.
+        painter.save()
+        painter.resetTransform()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        to_out = self.viewportTransform().map
+        style = Style()
+        for m in self.measurements:
+            color = SELECTED_COLOR if m.id == self.selected_id else MEASURE_COLOR
+            draw_measurement(painter, m, self.calibration, to_out, self.zoom, color, style)
+        preview = self._preview()
+        if preview is not None:
+            draw_measurement(painter, preview, self.calibration, to_out, self.zoom, PREVIEW_COLOR, style)
+        painter.restore()
+
+    def _preview(self) -> Measurement | None:
+        """The shape being drawn, including the point under the mouse."""
+        if not self.tool or not self._points:
+            return None
+        points = list(self._points)
+        n = KINDS[self.tool].n_points
+        if self._mouse is not None and (n is None or len(points) < n):
+            points.append(self._mouse)
+        return Measurement(0, self.tool, points)
+
+    # --- measurement tools ---------------------------------------------------------
+
+    def set_tool(self, kind: str | None):
+        """Select a measurement tool (a key of measure.KINDS), or None to pan."""
+        self.tool = kind
+        self._points = []
+        if kind:
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
+            self.viewport().unsetCursor()
+        self.viewport().update()
+
+    def _to_image(self, view_pos: QPointF) -> tuple[float, float]:
+        """Window position -> image pixel coordinates (sub-pixel, clamped to the image)."""
+        inverse, _ = self.viewportTransform().inverted()
+        p = inverse.map(QPointF(view_pos))
+        h, w = self._image.shape[:2]
+        return min(max(p.x(), 0.0), float(w)), min(max(p.y(), 0.0), float(h))
+
+    def _finish(self):
+        kind = KINDS[self.tool]
+        if len(self._points) >= kind.min_points:
+            self.measurement_drawn.emit(self.tool, list(self._points))
+        self._points = []
+        self.viewport().update()
+
+    # --- mouse and keys --------------------------------------------------------------
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_from = event.position()
+            return
+        if self.tool and self._image is not None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._points.append(self._to_image(event.position()))
+                if len(self._points) == KINDS[self.tool].n_points:
+                    self._finish()
+                self.viewport().update()
+                return
+            if event.button() == Qt.MouseButton.RightButton:
+                self._finish()  # finishes an open shape; otherwise just clears it
+                return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        # The first click of the double-click already added the point.
+        if self.tool and KINDS[self.tool].n_points is None:
+            self._finish()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._pan_from is not None:
+            delta = event.position() - self._pan_from
+            self._pan_from = event.position()
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - round(delta.x()))
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - round(delta.y()))
+            return
+        super().mouseMoveEvent(event)
+        if self._image is not None:
+            self._mouse = self._to_image(event.position())
+            if self.tool:
+                self.viewport().update()
+        self._report_cursor(event.position())
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.MiddleButton:
+            self._pan_from = None
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        key = event.key()
+        if self.tool:
+            if key == Qt.Key.Key_Escape:
+                if self._points:
+                    self._points = []
+                    self.viewport().update()
+                else:
+                    self.tool_exit_requested.emit()
+                return
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._finish()
+                return
+            if key == Qt.Key.Key_Backspace and self._points:
+                self._points.pop()
+                self.viewport().update()
+                return
+        super().keyPressEvent(event)
 
     def wheelEvent(self, event):
         steps = event.angleDelta().y() / 120
@@ -173,18 +321,17 @@ class ImageView(QGraphicsView):
         if self._fit_mode:
             self.fit()
 
-    def mouseMoveEvent(self, event):
-        super().mouseMoveEvent(event)
-        self._report_cursor(event.position().toPoint())
-
     def leaveEvent(self, event):
         super().leaveEvent(event)
+        self._mouse = None
         self.cursor_moved.emit(None)
+        self.viewport().update()
 
-    def _report_cursor(self, view_pos):
+    def _report_cursor(self, view_pos: QPointF):
         if self._image is None:
             return
-        p = self.mapToScene(view_pos)
+        inverse, _ = self.viewportTransform().inverted()
+        p = inverse.map(QPointF(view_pos))
         x, y = math.floor(p.x()), math.floor(p.y())
         h, w = self._image.shape[:2]
         if 0 <= x < w and 0 <= y < h:

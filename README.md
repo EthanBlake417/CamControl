@@ -4,12 +4,12 @@ Python application for live viewing, capture, and calibrated measurement with a 
 
 ## Status
 
-Early development. Done: camera probe (Phase 0), live view and capture (Phase 1), and the GUI shell (Phase 5). Calibration, measurement and processing come next.
+Early development. Done: camera probe (Phase 0), live view and capture (Phase 1), measurement in pixels (Phase 3), and the GUI (Phase 5). Next: calibration (Phase 2), so measurements can be in µm, then the processing tools (Phase 4).
 
-**GUI** (main app):
+**GUI** (main app). Use PyCharm's Run button on `main.py`, or:
 
 ```powershell
-venv\Scripts\python -m camcontrol.app
+venv\Scripts\python main.py
 ```
 
 The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exposure, gain, contrast, saturation and sharpness; capture with frame averaging, save size, format and folder; grid and crosshair overlays; freeze; opening image files; and a pixel readout (x, y, RGB) in the status bar. Settings are remembered between runs.
@@ -23,6 +23,9 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 | `F` / `1` | fit to window / 100% |
 | Ctrl+= / Ctrl+- | zoom in / out |
 | Ctrl+O | open an image file |
+| Ctrl+E | export measurements |
+
+**Measuring.** Pick a tool in the Measurements panel (Line, Polyline, Circle (3 pt), Angle, Rectangle, Polygon) and click points on the image. Line, circle, angle and rectangle finish by themselves. For a polyline or polygon, double-click, right-click or press Enter to finish. Backspace removes the last point, Esc cancels (press it twice to go back to panning), and middle-drag pans while a tool is active. Results appear in the table, and selecting a row highlights that shape. **Export** writes the table (`.xlsx` with an Info sheet, or `.csv`), the measured image (`_image.png`) and an annotated copy (`_annotated.png`). Freeze the live view (L) or open a file before measuring, so the image doesn't change underneath you. Until calibration exists, all values are in pixels.
 
 **Simple OpenCV viewer** (no Qt; handy for quick checks):
 
@@ -154,9 +157,10 @@ Close HD2 before running anything. Windows lets only one program use the camera 
 ```
 camcontrol/
 ├── README.md
+├── main.py              # starts the GUI
 ├── requirements.txt
 ├── camcontrol/
-│   ├── app.py           # starts the GUI (python -m camcontrol.app)
+│   ├── app.py           # starts the GUI (main.py calls this)
 │   ├── camera.py        # open camera, set resolution/controls, grab frames
 │   ├── uvc_controls.py  # direct DirectShow camera controls (comtypes)
 │   ├── capture.py       # frame averaging, save image + JSON metadata
@@ -164,10 +168,13 @@ camcontrol/
 │   ├── viewer.py        # simple OpenCV live view (no Qt)
 │   ├── gui/
 │   │   ├── main_window.py   # window, controls panel, menus, status bar
-│   │   ├── image_view.py    # zoom/pan image view, grid, crosshair
+│   │   ├── image_view.py    # zoom/pan image view, grid, crosshair, measurement tools
+│   │   ├── measure_panel.py # tool buttons, results table, delete/clear/export
+│   │   ├── measure_draw.py  # draws measurements (on screen and for the annotated export)
+│   │   ├── qt_image.py      # numpy -> QImage
 │   │   └── camera_worker.py # camera thread (keeps the GUI responsive)
-│   ├── calibration.py   # calibration table (JSON), per-axis µm/px
-│   ├── measure.py       # measurement geometry and results
+│   ├── calibration.py   # per-axis µm/px (only "pixels" so far; JSON table in Phase 2)
+│   ├── measure.py       # measurement geometry and results (self-test: python -m camcontrol.measure)
 │   ├── export.py        # CSV / Excel output
 │   └── processing/
 │       ├── flatfield.py
@@ -207,10 +214,10 @@ Results are recorded above under **Phase 0 findings**.
 - Report the X/Y ratio. If within ~1%, pixels can be treated as square.
 - Save named entries (e.g. one per zoom setting) to `calibrations/calibrations.json`.
 
-### Phase 3: Measurement
-- Measurement tools on live or frozen frames, using the active calibration.
-- Results list with export to CSV/Excel.
-- Save an annotated copy of the image alongside the data.
+### Phase 3: Measurement (done, in pixels)
+- Done: line, polyline, 3-point circle, angle, rectangle and polygon on live, frozen or opened images; results table; export to Excel/CSV plus the image and an annotated copy.
+- Geometry is computed on per-axis calibrated points, so non-square pixels will be handled correctly once Phase 2 provides a calibration.
+- To do: hook up calibrations from Phase 2 (`MeasurePanel.set_calibration`).
 
 ### Phase 4: Processing tools
 - Flat-field correction (divide by a blank reference frame).
@@ -221,7 +228,8 @@ Results are recorded above under **Phase 0 findings**.
 
 ### Phase 5: GUI (shell done; built ahead of Phases 2–4)
 - Done: PySide6 app with live view, camera controls, capture, overlays, freeze and open-file.
-- To do: add the measurement panel, calibration and processing tools as those phases are built. Measurements will be graphics items on the `ImageView` scene, which uses image-pixel coordinates.
+- Measurements are drawn in `ImageView.drawForeground` from the panel's list, not as QGraphicsItems. That's simpler, but shapes can't be dragged to edit them; delete and redraw instead.
+- To do: add calibration and processing tools as those phases are built.
 
 ## Useful open-source tools to compare against
 
