@@ -1,0 +1,18 @@
+# Python / environment
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+
+# Output from the app and probes
+captures/
+
+# Vendor software installer (large, not ours)
+HD2 Advanced Imaging & Measurement*/
+
+# Sample and captured images
+*.tif
+*.tiff
