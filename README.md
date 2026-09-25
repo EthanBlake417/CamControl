@@ -24,6 +24,7 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 | Ctrl+= / Ctrl+- | zoom in / out |
 | Ctrl+O | open an image file |
 | Ctrl+E | export measurements |
+| Ctrl+1 / Ctrl+2 | show / hide the Controls / Measurements panel (also **View → Panels**, or the panel's × button) |
 
 **Measuring.** Pick a tool in the Measurements panel (Line, Polyline, Circle (3 pt), Angle, Rectangle, Polygon) and click points on the image. Line, circle, angle and rectangle finish by themselves. For a polyline or polygon, double-click, right-click or press Enter to finish. Backspace removes the last point, Esc cancels (press it twice to go back to panning), and middle-drag pans while a tool is active. Results appear in the table, and selecting a row highlights that shape. **Export** writes the table (`.xlsx` with an Info sheet, or `.csv`), the measured image (`_image.png`) and an annotated copy (`_annotated.png`). Freeze the live view (L) or open a file before measuring, so the image doesn't change underneath you. Until calibration exists, all values are in pixels.
 
@@ -158,9 +159,11 @@ Close HD2 before running anything. Windows lets only one program use the camera 
 camcontrol/
 ├── README.md
 ├── main.py              # starts the GUI
+├── assets/            # get_logo.ico (window/taskbar icon), get_logo.png (About box)
 ├── requirements.txt
 ├── camcontrol/
 │   ├── app.py           # starts the GUI (main.py calls this)
+│   ├── paths.py         # asset file locations
 │   ├── camera.py        # open camera, set resolution/controls, grab frames
 │   ├── uvc_controls.py  # direct DirectShow camera controls (comtypes)
 │   ├── capture.py       # frame averaging, save image + JSON metadata

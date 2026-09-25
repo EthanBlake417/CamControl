@@ -12,6 +12,7 @@ Shortcuts:
     Ctrl+= / -  zoom in / out (or use the mouse wheel)
     Ctrl+O      open an image file
     Ctrl+E      export measurements
+    Ctrl+1 / 2  show / hide the Controls / Measurements panel
 """
 
 import os
@@ -22,7 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
@@ -50,6 +51,7 @@ from camcontrol.gui.image_view import ImageView
 from camcontrol.gui.measure_draw import render_annotated
 from camcontrol.gui.measure_panel import MeasurePanel
 from camcontrol.gui.qt_image import to_qimage
+from camcontrol.paths import LOGO
 
 AVERAGE_CHOICES = [1, 4, 8, 16, 32]
 SAVE_SIZES = [
@@ -152,12 +154,18 @@ class MainWindow(QMainWindow):
         m.addActions([self.live_action, self.grid_action, self.crosshair_action])
         m.addSeparator()
         m.addActions([self.fit_action, self.actual_action, self.zoom_in_action, self.zoom_out_action])
+        m.addSeparator()
+        # Filled in by _add_dock(), one entry per panel.
+        self.panels_menu = m.addMenu("&Panels")
 
         m = self.menuBar().addMenu("&Camera")
         m.addActions([self.exp_up_action, self.exp_down_action])
 
         m = self.menuBar().addMenu("&Measure")
         m.addActions([self.export_action, self.clear_measurements_action])
+
+        m = self.menuBar().addMenu("&Help")
+        m.addAction(self._action("&About CamControl", None, self.show_about))
 
     def _build_measure_dock(self):
         panel = self.measure_panel
@@ -172,12 +180,28 @@ class MainWindow(QMainWindow):
         view.measurement_drawn.connect(self._on_measurement_drawn)
         view.tool_exit_requested.connect(lambda: panel.set_tool(None))
 
-        dock = QDockWidget("Measurements", self)
-        dock.setObjectName("measure_dock")  # needed for saveState()
-        dock.setWidget(panel)
+        self._add_dock("Measurements", "measure_dock", panel,
+                       Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+2")
+
+    def _add_dock(self, title, object_name, widget, area, shortcut):
+        """Add a panel that can be moved, floated or closed.
+
+        Closed panels come back from View > Panels (or the shortcut).
+        Which panels are open is saved with the window layout.
+        """
+        dock = QDockWidget(title, self)
+        dock.setObjectName(object_name)  # needed for saveState()
+        dock.setWidget(widget)
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
-                         | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
-        self.addDockWidget(Qt.DockWidgetArea.BottomDockWidgetArea, dock)
+                         | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                         | QDockWidget.DockWidgetFeature.DockWidgetClosable)
+        self.addDockWidget(area, dock)
+        # Qt's ready-made show/hide action: checked while the panel is visible.
+        toggle = dock.toggleViewAction()
+        toggle.setShortcut(QKeySequence(shortcut))
+        self.addAction(toggle)  # shortcut works even while the panel is hidden
+        self.panels_menu.addAction(toggle)
+        return dock
 
     def _tool_button(self, action):
         """A button that mirrors an action (text, checked and enabled state)."""
@@ -274,12 +298,8 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        dock = QDockWidget("Controls", self)
-        dock.setObjectName("controls_dock")  # needed for saveState()
-        dock.setWidget(panel)
-        dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
-                         | QDockWidget.DockWidgetFeature.DockWidgetFloatable)
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self._add_dock("Controls", "controls_dock", panel,
+                       Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+1")
 
     def _build_status_bar(self):
         self.fps_label = QLabel()
@@ -512,6 +532,18 @@ class MainWindow(QMainWindow):
         else:
             text = f"value {value}"
         self.cursor_label.setText(f"x {x}, y {y}   {text}")
+
+    def show_about(self):
+        box = QMessageBox(self)
+        box.setWindowTitle("About CamControl")
+        logo = QPixmap(str(LOGO))
+        if not logo.isNull():
+            box.setIconPixmap(logo.scaledToWidth(160, Qt.TransformationMode.SmoothTransformation))
+        box.setText(
+            "<b>CamControl</b><br>"
+            "Live view, capture and measurement for the O.C. White Ultra-Cam II."
+        )
+        box.exec()
 
     def closeEvent(self, event):
         self._save_settings()
