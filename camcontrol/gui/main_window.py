@@ -12,7 +12,7 @@ Shortcuts:
     Ctrl+= / -  zoom in / out (or use the mouse wheel)
     Ctrl+O      open an image file
     Ctrl+E      export measurements
-    Ctrl+1 / 2  show / hide the Controls / Measurements panel
+    Ctrl+1/2/3  show / hide the Controls / Measurements / Captures panel
 """
 
 import os
@@ -20,8 +20,6 @@ import time
 from collections import deque
 from pathlib import Path
 
-import cv2
-import numpy as np
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
@@ -44,13 +42,15 @@ from PySide6.QtWidgets import (
 )
 
 from camcontrol.camera import ADJUSTABLE, format_exposure
-from camcontrol.capture import CAPTURE_DIR, HD2_SIZE, NATIVE_SIZE
+from camcontrol.capture import CAPTURE_DIR, HD2_SIZE, NATIVE_SIZE, clean_name, next_capture_path
 from camcontrol.export import export_table, measurement_rows
 from camcontrol.gui.camera_worker import CameraWorker
+from camcontrol.gui.gallery import GalleryPanel
 from camcontrol.gui.image_view import ImageView
 from camcontrol.gui.measure_draw import render_annotated
 from camcontrol.gui.measure_panel import MeasurePanel
 from camcontrol.gui.qt_image import to_qimage
+from camcontrol.image_io import load_image_file
 from camcontrol.paths import LOGO
 
 AVERAGE_CHOICES = [1, 4, 8, 16, 32]
@@ -59,25 +59,6 @@ SAVE_SIZES = [
     ("3264 x 1836 (HD2 size, upscaled)", HD2_SIZE),
 ]
 FORMATS = [("TIFF", "tif"), ("PNG", "png")]
-
-
-def load_image_file(path: str) -> np.ndarray | None:
-    """Read an image for display as 8-bit BGR or grayscale.
-
-    Uses imdecode on the raw bytes, because cv2.imread can't open paths
-    with non-ASCII characters on Windows.
-    """
-    data = np.fromfile(path, dtype=np.uint8)
-    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED)
-    if img is None:
-        return None
-    if img.dtype == np.uint16:
-        img = (img >> 8).astype(np.uint8)  # 16-bit -> 8-bit for display
-    elif img.dtype != np.uint8:
-        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    if img.ndim == 3 and img.shape[2] == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    return img
 
 
 class MainWindow(QMainWindow):
@@ -91,11 +72,13 @@ class MainWindow(QMainWindow):
         self.view = ImageView()
         self.setCentralWidget(self.view)
         self.measure_panel = MeasurePanel()
+        self.gallery = GalleryPanel()
 
         self._build_actions()
         self._build_menus()
         self._build_controls()
         self._build_measure_dock()
+        self._build_gallery_dock()
         self._build_status_bar()
         self._load_settings()
         self._set_title()
@@ -182,6 +165,17 @@ class MainWindow(QMainWindow):
 
         self._add_dock("Measurements", "measure_dock", panel,
                        Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+2")
+
+    def _build_gallery_dock(self):
+        self.gallery.open_requested.connect(self.open_image_path)
+        self.gallery.folder_changed.connect(self._update_next_name)
+        self.gallery_dock = self._add_dock("Captures", "gallery_dock", self.gallery,
+                                           Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+3")
+        self._place_gallery_under_controls()
+
+    def _place_gallery_under_controls(self):
+        """Default spot for the Captures panel: under Controls, wherever that is."""
+        self.splitDockWidget(self.controls_dock, self.gallery_dock, Qt.Orientation.Vertical)
 
     def _add_dock(self, title, object_name, widget, area, shortcut):
         """Add a panel that can be moved, floated or closed.
@@ -275,6 +269,20 @@ class MainWindow(QMainWindow):
         folder_row.addWidget(browse)
         form.addRow("Folder", folder_row)
 
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("blank = date and time")
+        self.name_edit.setToolTip(
+            "Files are saved as name-001, name-002, ... continuing after the\n"
+            "highest number already in the folder, so nothing is overwritten."
+        )
+        form.addRow("Name", self.name_edit)
+        self.next_name_label = QLabel()
+        self.next_name_label.setStyleSheet("color: gray;")
+        form.addRow("", self.next_name_label)
+        # Keep the "Next:" preview current.
+        self.name_edit.textChanged.connect(self._update_next_name)
+        self.format_combo.currentIndexChanged.connect(self._update_next_name)
+
         capture_button = self._tool_button(self.capture_action)
         capture_button.setMinimumHeight(40)
         form.addRow(capture_button)
@@ -298,8 +306,8 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        self._add_dock("Controls", "controls_dock", panel,
-                       Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+1")
+        self.controls_dock = self._add_dock("Controls", "controls_dock", panel,
+                                            Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+1")
 
     def _build_status_bar(self):
         self.fps_label = QLabel()
@@ -320,6 +328,10 @@ class MainWindow(QMainWindow):
         self.average_combo.setCurrentIndex(int(s.value("capture/average_idx", 0)))
         self.size_combo.setCurrentIndex(int(s.value("capture/size_idx", 0)))
         self.format_combo.setCurrentIndex(int(s.value("capture/format_idx", 0)))
+        self.name_edit.setText(s.value("capture/name", ""))
+        self.gallery.set_count(int(s.value("gallery/count", 12)))
+        self.gallery.set_folder(self.folder_edit.text())
+        self._update_next_name()
         # Set the actions, then the view (setChecked doesn't fire triggered).
         for action, key, setter in (
             (self.grid_action, "view/grid", self.view.set_show_grid),
@@ -331,6 +343,10 @@ class MainWindow(QMainWindow):
         if s.contains("window/geometry"):
             self.restoreGeometry(s.value("window/geometry"))
             self.restoreState(s.value("window/state"))
+            # A layout saved before the Captures panel existed doesn't know
+            # where it goes, so put it under Controls (which may have moved).
+            if not s.value("window/has_gallery", False, type=bool):
+                self._place_gallery_under_controls()
         else:
             self.resize(1400, 850)
 
@@ -340,10 +356,13 @@ class MainWindow(QMainWindow):
         s.setValue("capture/average_idx", self.average_combo.currentIndex())
         s.setValue("capture/size_idx", self.size_combo.currentIndex())
         s.setValue("capture/format_idx", self.format_combo.currentIndex())
+        s.setValue("capture/name", self.name_edit.text())
+        s.setValue("gallery/count", self.gallery.count)
         s.setValue("view/grid", self.grid_action.isChecked())
         s.setValue("view/crosshair", self.crosshair_action.isChecked())
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("window/state", self.saveState())
+        s.setValue("window/has_gallery", True)
 
     # --- camera events ------------------------------------------------------------
 
@@ -397,6 +416,9 @@ class MainWindow(QMainWindow):
         self.capture_action.setEnabled(True)
         self.last_saved_label.setText(f"Saved {Path(path).name}")
         self.statusBar().showMessage(f"Saved {path}", 5000)
+        self._update_next_name()
+        # The folder watcher would pick it up too; this also selects it.
+        self.gallery.refresh(select=path)
 
     def _on_error(self, message: str):
         # Capture stays disabled if the camera never opened.
@@ -447,12 +469,23 @@ class MainWindow(QMainWindow):
             self.size_combo.currentData(),
             self.format_combo.currentData(),
             Path(self.folder_edit.text()),
+            clean_name(self.name_edit.text()),
         )
+
+    def _update_next_name(self):
+        path = next_capture_path(Path(self.folder_edit.text()), self.name_edit.text(),
+                                 self.format_combo.currentData())
+        if self.name_edit.text().strip():
+            self.next_name_label.setText(f"Next: {path.name}")
+        else:
+            self.next_name_label.setText("Next: cap_<date>_<time>." + self.format_combo.currentData())
 
     def _choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Capture folder", self.folder_edit.text())
         if folder:
             self.folder_edit.setText(folder)
+            self.gallery.set_folder(folder)
+            self._update_next_name()
 
     def open_capture_folder(self):
         folder = Path(self.folder_edit.text())
@@ -464,8 +497,11 @@ class MainWindow(QMainWindow):
             self, "Open image", self.folder_edit.text(),
             "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)",
         )
-        if not path:
-            return
+        if path:
+            self.open_image_path(path)
+
+    def open_image_path(self, path: str):
+        """Show an image file in the view (freezes the live feed)."""
         img = load_image_file(path)
         if img is None:
             QMessageBox.warning(self, "CamControl", f"Could not read {path}")

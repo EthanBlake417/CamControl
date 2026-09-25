@@ -24,7 +24,9 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 | Ctrl+= / Ctrl+- | zoom in / out |
 | Ctrl+O | open an image file |
 | Ctrl+E | export measurements |
-| Ctrl+1 / Ctrl+2 | show / hide the Controls / Measurements panel (also **View → Panels**, or the panel's × button) |
+| Ctrl+1 / 2 / 3 | show / hide the Controls / Measurements / Captures panel (also **View → Panels**, or the panel's × button) |
+
+**Capturing.** Set a **Name** in the Capture panel and captures are saved as `name-001.tif`, `name-002.tif`, ..., continuing after the highest number already in the folder (so nothing is overwritten; same style as HD2). Leave it blank for date-and-time names. The line under the field shows the next file name. Each image gets a `.json` with its settings. The **Captures** panel shows thumbnails of the newest N images in the capture folder (N is set in the panel). It updates automatically when files change. Double-click a thumbnail to open it; right-click for "Show in Explorer".
 
 **Measuring.** Pick a tool in the Measurements panel (Line, Polyline, Circle (3 pt), Angle, Rectangle, Polygon) and click points on the image. Line, circle, angle and rectangle finish by themselves. For a polyline or polygon, double-click, right-click or press Enter to finish. Backspace removes the last point, Esc cancels (press it twice to go back to panning), and middle-drag pans while a tool is active. Results appear in the table, and selecting a row highlights that shape. **Export** writes the table (`.xlsx` with an Info sheet, or `.csv`), the measured image (`_image.png`) and an annotated copy (`_annotated.png`). Freeze the live view (L) or open a file before measuring, so the image doesn't change underneath you. Until calibration exists, all values are in pixels.
 
@@ -164,6 +166,7 @@ camcontrol/
 ├── camcontrol/
 │   ├── app.py           # starts the GUI (main.py calls this)
 │   ├── paths.py         # asset file locations
+│   ├── image_io.py      # reading image files (handles non-ASCII paths, 16-bit)
 │   ├── camera.py        # open camera, set resolution/controls, grab frames
 │   ├── uvc_controls.py  # direct DirectShow camera controls (comtypes)
 │   ├── capture.py       # frame averaging, save image + JSON metadata
@@ -175,6 +178,7 @@ camcontrol/
 │   │   ├── measure_panel.py # tool buttons, results table, delete/clear/export
 │   │   ├── measure_draw.py  # draws measurements (on screen and for the annotated export)
 │   │   ├── qt_image.py      # numpy -> QImage
+│   │   ├── gallery.py       # Captures panel: recent-image thumbnails
 │   │   └── camera_worker.py # camera thread (keeps the GUI responsive)
 │   ├── calibration.py   # per-axis µm/px (only "pixels" so far; JSON table in Phase 2)
 │   ├── measure.py       # measurement geometry and results (self-test: python -m camcontrol.measure)

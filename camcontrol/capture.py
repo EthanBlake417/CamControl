@@ -14,12 +14,15 @@ So capture here works the same way:
     so the save size is recorded in the metadata.
 
 Each capture writes an image plus a .json sidecar with the settings used.
+Files are named name-001.tif, name-002.tif, ... when a name is given, or
+by date and time when it isn't (see next_capture_path).
 
 Run directly to take one averaged capture without the viewer:
     python -m camcontrol.capture
 """
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -59,6 +62,41 @@ def grab_average(cam: Camera, n_frames: int, max_attempts: int | None = None):
     return np.clip(total / got + 0.5, 0, 255).astype(np.uint8), got
 
 
+def clean_name(name: str) -> str:
+    """Make a user-typed capture name safe as a Windows file name."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name.strip())
+    return name.rstrip(". ")  # Windows doesn't allow trailing dots/spaces
+
+
+def next_capture_path(folder: Path, name: str = "", fmt: str = "tif", prefix: str = "cap") -> Path:
+    """Where the next capture will be saved.
+
+    With a name:    name-001.tif, name-002.tif, ... continuing after the highest
+                    number already in the folder (any extension), so nothing is
+                    overwritten. Same style as HD2 ("..._bright-001.tif").
+    Without a name: cap_YYYYMMDD_HHMMSS.tif (with _1, _2 if taken).
+    """
+    folder = Path(folder)
+    name = clean_name(name)
+    if name:
+        pattern = re.compile(rf"^{re.escape(name)}-(\d+)\.[^.]+$", re.IGNORECASE)
+        numbers = []
+        if folder.is_dir():
+            for p in folder.iterdir():
+                m = pattern.match(p.name)
+                if m:
+                    numbers.append(int(m.group(1)))
+        return folder / f"{name}-{max(numbers, default=0) + 1:03d}.{fmt}"
+
+    stem = f"{prefix}_{datetime.now():%Y%m%d_%H%M%S}"
+    path = folder / f"{stem}.{fmt}"
+    n = 1
+    while path.exists():  # two captures in the same second
+        path = folder / f"{stem}_{n}.{fmt}"
+        n += 1
+    return path
+
+
 def save_capture(
     image,
     *,
@@ -68,29 +106,29 @@ def save_capture(
     save_size: tuple[int, int] = NATIVE_SIZE,
     fmt: str = "tif",
     folder: Path = CAPTURE_DIR,
+    name: str = "",
     prefix: str = "cap",
 ) -> Path:
     """Save an image (resized to save_size if needed) plus a JSON sidecar.
 
-    Returns the image path.
+    See next_capture_path() for how the file is named. Returns the image path.
     """
+    folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     now = datetime.now()
-    stem = f"{prefix}_{now:%Y%m%d_%H%M%S}"
-    path = folder / f"{stem}.{fmt}"
-    # Don't overwrite if two captures land in the same second.
-    n = 1
-    while path.exists():
-        path = folder / f"{stem}_{n}.{fmt}"
-        n += 1
+    path = next_capture_path(folder, name, fmt, prefix)
 
     src_h, src_w = image.shape[:2]
     if (src_w, src_h) != save_size:
         # Bicubic is a good general-purpose choice for scaling up.
         image = cv2.resize(image, save_size, interpolation=cv2.INTER_CUBIC)
 
-    if not cv2.imwrite(str(path), image):
-        raise RuntimeError(f"Could not write {path}")
+    # imencode + tofile instead of cv2.imwrite, which fails on Windows
+    # when the path has non-ASCII characters (e.g. "µ" in a name).
+    ok, data = cv2.imencode(f".{fmt}", image)
+    if not ok:
+        raise RuntimeError(f"Could not encode image as {fmt}")
+    data.tofile(str(path))
 
     meta = {
         "timestamp": now.isoformat(timespec="seconds"),

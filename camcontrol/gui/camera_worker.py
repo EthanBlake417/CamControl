@@ -38,8 +38,8 @@ class CameraWorker(QThread):
     def set_control(self, name: str, value: float):
         self._commands.put(("control", name, value))
 
-    def capture(self, n_frames: int, save_size: tuple[int, int], fmt: str, folder: Path):
-        self._commands.put(("capture", n_frames, save_size, fmt, folder))
+    def capture(self, n_frames: int, save_size: tuple[int, int], fmt: str, folder: Path, name: str = ""):
+        self._commands.put(("capture", n_frames, save_size, fmt, folder, name))
 
     def frame_consumed(self):
         self._awaiting_ack = False
@@ -97,10 +97,10 @@ class CameraWorker(QThread):
         if latest:
             self.settings_changed.emit(cam.values())
 
-        for _, n_frames, save_size, fmt, folder in captures:
-            self._capture(cam, n_frames, save_size, fmt, folder)
+        for _, n_frames, save_size, fmt, folder, name in captures:
+            self._capture(cam, n_frames, save_size, fmt, folder, name)
 
-    def _capture(self, cam: Camera, n_frames, save_size, fmt, folder):
+    def _capture(self, cam: Camera, n_frames, save_size, fmt, folder, name):
         estimate = n_frames * max(exposure_seconds(cam.exposure), 1 / 25)
         self.capture_started.emit(n_frames, estimate)
         try:
@@ -113,6 +113,7 @@ class CameraWorker(QThread):
                 save_size=save_size,
                 fmt=fmt,
                 folder=folder,
+                name=name,
             )
         except Exception as e:  # report any failure to the GUI instead of dying
             self.error.emit(f"Capture failed: {e}")
