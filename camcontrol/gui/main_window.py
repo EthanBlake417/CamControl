@@ -82,6 +82,7 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self._load_settings()
         self._set_title()
+        self._show_source()
 
         self.worker = CameraWorker(camera_index)
         self.worker.opened.connect(self._on_camera_opened)
@@ -304,7 +305,10 @@ class MainWindow(QMainWindow):
         self.zoom_label = QLabel()
         self.cursor_label = QLabel()
         self.cursor_label.setMinimumWidth(260)
-        for w in (self.cursor_label, self.zoom_label, self.size_label, self.fps_label):
+        # What the view is showing: live, frozen, or which file.
+        self.source_label = QLabel()
+        self.source_label.setStyleSheet("font-weight: bold")
+        for w in (self.cursor_label, self.zoom_label, self.size_label, self.fps_label, self.source_label):
             self.statusBar().addPermanentWidget(w)
         self.view.zoom_changed.connect(lambda z: self.zoom_label.setText(f"{z * 100:.0f}%"))
         self.view.cursor_moved.connect(self._on_cursor)
@@ -432,9 +436,18 @@ class MainWindow(QMainWindow):
         if on:
             self._source = "live"
         else:
-            self.fps_label.setText("frozen")
+            self.fps_label.clear()
             self._frame_times.clear()
         self._set_title()
+        self._show_source()
+
+    def _show_source(self, path: str | None = None):
+        if path:
+            self.source_label.setText(Path(path).name)
+            self.source_label.setToolTip(str(path))
+        else:
+            self.source_label.setText("Live" if self.live else "Frozen")
+            self.source_label.setToolTip("")
 
     def _set_title(self, file_name: str | None = None):
         if file_name:
@@ -494,9 +507,9 @@ class MainWindow(QMainWindow):
         self.view.set_image(img)
         h, w = img.shape[:2]
         self.size_label.setText(f"{w} x {h}")
-        self.fps_label.setText("file")
         self._source = Path(path).name
         self._set_title(self._source)
+        self._show_source(path)
 
     # --- measurements ---------------------------------------------------------------
 
