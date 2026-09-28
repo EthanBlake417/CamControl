@@ -120,9 +120,6 @@ class MainWindow(QMainWindow):
         self.zoom_in_action = self._action("Zoom &in", "Ctrl+=", self.view.zoom_in)
         self.zoom_out_action = self._action("Zoom &out", "Ctrl+-", self.view.zoom_out)
 
-        self.exp_up_action = self._action("Exposure longer", "E", lambda: self._step_exposure(+1))
-        self.exp_down_action = self._action("Exposure shorter", "D", lambda: self._step_exposure(-1))
-
         self.export_action = self._action("&Export measurements...", "Ctrl+E", self.export_measurements)
         self.clear_measurements_action = self._action(
             "&Clear measurements", None, lambda: self.measure_panel.clear())
@@ -140,9 +137,6 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         # Filled in by _add_dock(), one entry per panel.
         self.panels_menu = m.addMenu("&Panels")
-
-        m = self.menuBar().addMenu("&Camera")
-        m.addActions([self.exp_up_action, self.exp_down_action])
 
         m = self.menuBar().addMenu("&Measure")
         m.addActions([self.export_action, self.clear_measurements_action])
@@ -215,7 +209,6 @@ class MainWindow(QMainWindow):
         form = QFormLayout(cam_box)
         self.sliders: dict[str, QSlider] = {}
         self.value_labels: dict[str, QLabel] = {}
-        self.defaults: dict[str, int] = {}
         for name in ADJUSTABLE:
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setPageStep(1)
@@ -228,10 +221,6 @@ class MainWindow(QMainWindow):
             form.addRow(name.capitalize(), row)
             self.sliders[name] = slider
             self.value_labels[name] = label
-        defaults_button = QPushButton("Defaults")
-        defaults_button.setToolTip("Reset every control to the camera's default value.")
-        defaults_button.clicked.connect(self._reset_controls)
-        form.addRow(defaults_button)
         cam_box.setEnabled(False)  # until the camera opens
         self.cam_box = cam_box
         layout.addWidget(cam_box)
@@ -375,7 +364,6 @@ class MainWindow(QMainWindow):
             slider.blockSignals(True)
             slider.setRange(r["min"], r["max"])
             slider.blockSignals(False)
-            self.defaults[name] = r["default"]
         self.cam_box.setEnabled(True)
         self.capture_action.setEnabled(True)
         self.statusBar().showMessage("Camera open", 3000)
@@ -437,15 +425,6 @@ class MainWindow(QMainWindow):
     def _on_slider(self, name: str, value: int):
         self._show_value(name, value)
         self.worker.set_control(name, value)
-
-    def _reset_controls(self):
-        for name, value in self.defaults.items():
-            self.sliders[name].setValue(value)
-
-    def _step_exposure(self, step: int):
-        if self.cam_box.isEnabled():
-            slider = self.sliders["exposure"]
-            slider.setValue(slider.value() + step)
 
     def _set_live(self, on: bool):
         self.live = on

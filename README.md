@@ -17,7 +17,6 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 | Key | Action |
 |---|---|
 | Space | capture |
-| `E` / `D` | exposure longer / shorter |
 | `L` | live / freeze |
 | `G` / `C` | grid / crosshair |
 | `F` / `1` | fit to window / 100% |
