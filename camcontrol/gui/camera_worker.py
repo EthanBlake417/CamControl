@@ -7,6 +7,9 @@ set_control() / capture(), which just put a command on a queue. The thread appli
 Frames are sent to the GUI one at a time: a new frame is only emitted after
 the GUI calls frame_consumed(). If the GUI falls behind, frames are dropped
 instead of piling up in memory.
+
+With a flat-field set (set_flat_field), live frames and captures are
+corrected here, on this thread, before the GUI sees them.
 """
 
 import queue
@@ -32,6 +35,7 @@ class CameraWorker(QThread):
         self._commands: queue.Queue = queue.Queue()
         self._running = True
         self._awaiting_ack = False
+        self._flat = None
 
     # --- called from the GUI thread ------------------------------------------
 
@@ -40,6 +44,10 @@ class CameraWorker(QThread):
 
     def capture(self, n_frames: int, save_size: tuple[int, int], fmt: str, folder: Path, name: str = ""):
         self._commands.put(("capture", n_frames, save_size, fmt, folder, name))
+
+    def set_flat_field(self, flat):
+        """A processing.flatfield.FlatField to apply, or None for raw frames."""
+        self._commands.put(("flat", flat))
 
     def frame_consumed(self):
         self._awaiting_ack = False
@@ -66,6 +74,8 @@ class CameraWorker(QThread):
                 frame = cam.read()
                 if frame is not None and not self._awaiting_ack:
                     self._awaiting_ack = True
+                    if self._flat is not None:
+                        frame = self._flat.apply(frame)
                     self.frame_ready.emit(frame)
         finally:
             cam.close()
@@ -85,6 +95,8 @@ class CameraWorker(QThread):
         for cmd in pending:
             if cmd[0] == "capture":
                 captures.append(cmd)
+            elif cmd[0] == "flat":
+                self._flat = cmd[1]
             else:
                 _, name, value = cmd
                 latest[name] = value
@@ -105,6 +117,10 @@ class CameraWorker(QThread):
         self.capture_started.emit(n_frames, estimate)
         try:
             image, got = grab_average(cam, n_frames)
+            extra = {}
+            if self._flat is not None:
+                image = self._flat.apply(image)
+                extra["flat_field"] = self._flat.name
             path = save_capture(
                 image,
                 exposure=cam.exposure,
@@ -114,6 +130,7 @@ class CameraWorker(QThread):
                 fmt=fmt,
                 folder=folder,
                 name=name,
+                extra=extra,
             )
         except Exception as e:  # report any failure to the GUI instead of dying
             self.error.emit(f"Capture failed: {e}")

@@ -4,7 +4,7 @@ Python application for live viewing, capture, and calibrated measurement with a 
 
 ## Status
 
-Early development. Done: camera probe (Phase 0), live view and capture (Phase 1), measurement in pixels (Phase 3), and the GUI (Phase 5). Next: calibration (Phase 2), so measurements can be in µm, then the processing tools (Phase 4).
+Early development. Done: camera probe (Phase 0), live view and capture (Phase 1), measurement in pixels (Phase 3), processing tools (Phase 4) and the GUI (Phase 5). Next: calibration (Phase 2), so measurements can be in µm.
 
 **GUI** (main app). Use PyCharm's Run button on `main.py`, or:
 
@@ -22,12 +22,25 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 | `F` / `1` | fit to window / 100% |
 | Ctrl+= / Ctrl+- | zoom in / out |
 | Ctrl+O | open an image file |
+| Ctrl+S | save the image in the view (e.g. a processing result) |
 | Ctrl+E | export measurements |
-| Ctrl+1 / 2 / 3 | show / hide the Controls / Measurements / Captures panel (also **View → Panels**, or the panel's × button) |
+| Ctrl+1 / 2 / 3 / 4 | show / hide the Controls / Measurements / Captures / Counting panel (also **View → Panels**, or the panel's × button) |
 
-**Capturing.** Set a **Name** in the Capture panel and captures are saved as `name-001.tif`, `name-002.tif`, ..., continuing after the highest number already in the folder (so nothing is overwritten; same style as HD2). Leave it blank for date-and-time names. The line under the field shows the next file name. Each image gets a `.json` with its settings. The **Captures** panel shows thumbnails of the newest N images in the capture folder (N is set in the panel). It updates automatically when files change. Double-click a thumbnail to open it; right-click for "Show in Explorer". The right end of the status bar shows what the view is showing: **Live**, **Frozen**, or the open file's name (hover for the full path).
+**Capturing.** Set a **Name** in the Capture panel and captures are saved as `name-001.tif`, `name-002.tif`, ..., continuing after the highest number already in the folder (so nothing is overwritten; same style as HD2). Leave it blank for date-and-time names. The line under the field shows the next file name. Each image gets a `.json` with its settings. The **Captures** panel shows thumbnails of the newest N images in the capture folder (N is set in the panel). It updates automatically when files change. Double-click a thumbnail to open it; right-click for "Show in Explorer". Ctrl- or Shift-click selects several images, and right-clicking them offers the processing tools. The right end of the status bar shows what the view is showing: **Live**, **Frozen**, or the open file's name (hover for the full path).
 
 **Measuring.** Pick a tool in the Measurements panel (Line, Polyline, Circle (3 pt), Angle, Rectangle, Polygon) and click points on the image. Line, circle, angle and rectangle finish by themselves. For a polyline or polygon, double-click, right-click or press Enter to finish. Backspace removes the last point, Esc cancels (press it twice to go back to panning), and middle-drag pans while a tool is active. Results appear in the table, and selecting a row highlights that shape. **Export** writes the table (`.xlsx` with an Info sheet, or `.csv`), the measured image (`_image.png`) and an annotated copy (`_annotated.png`). Freeze the live view (L) or open a file before measuring, so the image doesn't change underneath you. Until calibration exists, all values are in pixels.
+
+**Counting.** In the Counting panel (a tab next to Measurements), name up to 5 classes, pick one, and press **Count**. Each left-click on the image adds a mark of that class; right-click removes the nearest mark, Backspace undoes the last one, and Esc stops counting. Counts and percentages update as you click. **Export** writes the counts (`.xlsx` with Summary, Marks and Info sheets, or `.csv` plus `_marks.csv`), the image and a copy with the marks drawn on (`_marked.png`).
+
+**Processing** (Process menu, or select images in Captures and right-click). Results appear in the view marked "(unsaved)"; **File → Save image as** (Ctrl+S) saves them with a `.json` listing the input files and settings. All tools accept any image files, including full-size 3264x1836 SD card images, but the images in one run must be the same size (except for stitching).
+
+| Tool | What it does | How to take the images |
+|---|---|---|
+| Flat-field correction | Evens out uneven lighting and removes fixed dust shadows | Capture an empty, evenly lit field (blank slide), averaging several frames. With it in the view, **Process → Flat-field correction → Use current image as flat reference** (saved to `flats/`). Then turn on **Correct live view and captures** (also a button in the Capture panel), or correct an opened image. |
+| Focus stack | Combines the sharp parts of each image for extended depth of field. Aligns the images first. | Don't move the sample. Step the focus through it, one capture per step. |
+| HDR (exposure fusion) | Shows detail in both bright and dark areas | Same view at 3 or more exposures (short, medium, long). |
+| Stitch | Joins overlapping images into one large image | Move the sample so neighbouring images overlap by about a third. Needs visible detail in the overlaps. |
+| Fluorescence composite | Tints each channel image (one per filter) and adds them together | One capture per filter. Colors are guessed from file names (DAPI, FITC, GFP, TRITC, Cy5, ...) and can be changed. |
 
 **Simple OpenCV viewer** (no Qt; handy for quick checks):
 
@@ -178,22 +191,27 @@ camcontrol/
 │   │   ├── measure_draw.py  # draws measurements (on screen and for the annotated export)
 │   │   ├── qt_image.py      # numpy -> QImage
 │   │   ├── gallery.py       # Captures panel: recent-image thumbnails
+│   │   ├── count_panel.py   # Counting panel, drawing marks
+│   │   ├── process_dialogs.py # dialogs for focus stack, HDR, stitch, fluorescence
+│   │   ├── jobs.py          # runs processing in the background
 │   │   └── camera_worker.py # camera thread (keeps the GUI responsive)
 │   ├── calibration.py   # per-axis µm/px (only "pixels" so far; JSON table in Phase 2)
 │   ├── measure.py       # measurement geometry and results (self-test: python -m camcontrol.measure)
 │   ├── export.py        # CSV / Excel output
-│   └── processing/
+│   └── processing/      # no GUI code; each runs a self-test: python -m camcontrol.processing.hdr
+│       ├── common.py        # alignment, color helpers
 │       ├── flatfield.py
 │       ├── focus_stack.py
 │       ├── hdr.py
 │       ├── stitch.py
-│       ├── count.py
+│       ├── count.py         # counting marks and export
 │       └── fluorescence.py
 ├── tools/
 │   ├── probe_camera.py  # Phase 0 diagnostic
 │   └── camera_settings.py  # opens the driver's own settings dialog
 ├── calibrations/
 │   └── calibrations.json
+├── flats/               # flat-field references taken in the app
 └── captures/
 ```
 
@@ -225,17 +243,18 @@ Results are recorded above under **Phase 0 findings**.
 - Geometry is computed on per-axis calibrated points, so non-square pixels will be handled correctly once Phase 2 provides a calibration.
 - To do: hook up calibrations from Phase 2 (`MeasurePanel.set_calibration`).
 
-### Phase 4: Processing tools
+### Phase 4: Processing tools (done)
 - Flat-field correction (divide by a blank reference frame).
 - Focus stacking (align frames, pick sharpest pixels by Laplacian).
 - HDR via `cv2.createMergeMertens`.
 - Stitching via `cv2.Stitcher_create(cv2.Stitcher_SCANS)`.
 - Class counting and fluorescence composites.
+- Possible later additions: a dark-frame option for flat-field, showing the focus-stack depth map, a live preview while adjusting fluorescence colors.
 
 ### Phase 5: GUI (shell done; built ahead of Phases 2–4)
 - Done: PySide6 app with live view, camera controls, capture, overlays, freeze and open-file.
 - Measurements are drawn in `ImageView.drawForeground` from the panel's list, not as QGraphicsItems. That's simpler, but shapes can't be dragged to edit them; delete and redraw instead.
-- To do: add calibration and processing tools as those phases are built.
+- To do: add calibration once Phase 2 is built.
 
 ## Useful open-source tools to compare against
 

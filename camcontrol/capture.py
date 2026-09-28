@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 
 from camcontrol.camera import Camera, exposure_seconds
+from camcontrol.image_io import save_image_file
 
 CAPTURE_DIR = Path(__file__).resolve().parent.parent / "captures"
 
@@ -108,8 +109,11 @@ def save_capture(
     folder: Path = CAPTURE_DIR,
     name: str = "",
     prefix: str = "cap",
+    extra: dict | None = None,
 ) -> Path:
     """Save an image (resized to save_size if needed) plus a JSON sidecar.
+
+    extra: more entries for the sidecar (e.g. the flat-field used).
 
     See next_capture_path() for how the file is named. Returns the image path.
     """
@@ -123,12 +127,7 @@ def save_capture(
         # Bicubic is a good general-purpose choice for scaling up.
         image = cv2.resize(image, save_size, interpolation=cv2.INTER_CUBIC)
 
-    # imencode + tofile instead of cv2.imwrite, which fails on Windows
-    # when the path has non-ASCII characters (e.g. "µ" in a name).
-    ok, data = cv2.imencode(f".{fmt}", image)
-    if not ok:
-        raise RuntimeError(f"Could not encode image as {fmt}")
-    data.tofile(str(path))
+    save_image_file(path, image)
 
     meta = {
         "timestamp": now.isoformat(timespec="seconds"),
@@ -141,6 +140,7 @@ def save_capture(
         "frames_averaged": frames_averaged,
         # Filled in once calibration (Phase 2) exists.
         "calibration": None,
+        **(extra or {}),
     }
     path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
     return path

@@ -16,6 +16,13 @@ Mouse and keys, with a measurement tool selected:
     Esc           cancel the shape being drawn (press again to leave the tool)
     middle drag   pan
     wheel         zoom
+
+While counting (Counting panel):
+    left click    add a mark of the selected class
+    right click   remove the nearest mark
+    Backspace     undo the last mark
+    Esc           stop counting
+    middle drag   pan
 """
 
 import math
@@ -26,6 +33,7 @@ from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
 from camcontrol.calibration import PIXELS, Calibration
+from camcontrol.gui.count_panel import draw_marks
 from camcontrol.gui.measure_draw import (
     MEASURE_COLOR,
     PREVIEW_COLOR,
@@ -39,13 +47,18 @@ from camcontrol.measure import KINDS, Measurement
 GRID_COLOR = QColor(255, 255, 0)
 CROSSHAIR_COLOR = QColor(255, 0, 0)
 CROSSHAIR_RADIUS_PX = 20  # on screen, whatever the zoom
+MARK_RADIUS_PX = 6        # counting marks, on screen
+REMOVE_RADIUS_PX = 15     # right-click removes a mark within this distance, on screen
 
 
 class ImageView(QGraphicsView):
     cursor_moved = Signal(object)                 # (x, y, value) in image pixels, or None
     zoom_changed = Signal(float)                  # 1.0 = one image pixel per screen pixel
     measurement_drawn = Signal(str, list)         # kind, points (image pixels)
-    tool_exit_requested = Signal()                # Esc with nothing being drawn
+    tool_exit_requested = Signal()                # Esc with nothing being drawn, or while counting
+    count_add = Signal(float, float)              # counting: left click at (x, y)
+    count_remove = Signal(float, float, float)    # counting: right click at (x, y), max distance
+    count_undo = Signal()                         # counting: Backspace
 
     ZOOM_STEP = 1.25
     MIN_ZOOM = 0.05
@@ -75,6 +88,11 @@ class ImageView(QGraphicsView):
         self._points: list[tuple[float, float]] = []
         self._mouse: tuple[float, float] | None = None
         self._pan_from: QPointF | None = None  # middle-button pan
+
+        # Counting marks to draw (owned by the counting panel), and the class
+        # being counted (None = not counting).
+        self.counter = None
+        self.count_class: int | None = None
 
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -207,6 +225,8 @@ class ImageView(QGraphicsView):
         preview = self._preview()
         if preview is not None:
             draw_measurement(painter, preview, self.calibration, to_out, self.zoom, PREVIEW_COLOR, style)
+        if self.counter is not None:
+            draw_marks(painter, self.counter, to_out, MARK_RADIUS_PX)
         painter.restore()
 
     def _preview(self) -> Measurement | None:
@@ -226,6 +246,23 @@ class ImageView(QGraphicsView):
         self.tool = kind
         self._points = []
         if kind:
+            self.count_class = None  # one clicking mode at a time
+        self._update_mode()
+
+    def set_counter(self, counter):
+        self.counter = counter
+        self.viewport().update()
+
+    def set_count_class(self, cls: int | None):
+        """Start counting marks of this class, or None to stop."""
+        self.count_class = cls
+        if cls is not None:
+            self.tool = None
+            self._points = []
+        self._update_mode()
+
+    def _update_mode(self):
+        if self.tool or self.count_class is not None:
             self.setDragMode(QGraphicsView.DragMode.NoDrag)
             self.viewport().setCursor(Qt.CursorShape.CrossCursor)
         else:
@@ -253,6 +290,13 @@ class ImageView(QGraphicsView):
         if event.button() == Qt.MouseButton.MiddleButton:
             self._pan_from = event.position()
             return
+        if self.count_class is not None and self._image is not None:
+            x, y = self._to_image(event.position())
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.count_add.emit(x, y)
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.count_remove.emit(x, y, REMOVE_RADIUS_PX / self.zoom)
+            return
         if self.tool and self._image is not None:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._points.append(self._to_image(event.position()))
@@ -266,6 +310,10 @@ class ImageView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event):
+        # Counting fast: the second click of a "double-click" is another mark.
+        if self.count_class is not None:
+            self.mousePressEvent(event)
+            return
         # The first click of the double-click already added the point.
         if self.tool and KINDS[self.tool].n_points is None:
             self._finish()
@@ -294,6 +342,13 @@ class ImageView(QGraphicsView):
 
     def keyPressEvent(self, event):
         key = event.key()
+        if self.count_class is not None:
+            if key == Qt.Key.Key_Escape:
+                self.tool_exit_requested.emit()
+                return
+            if key == Qt.Key.Key_Backspace:
+                self.count_undo.emit()
+                return
         if self.tool:
             if key == Qt.Key.Key_Escape:
                 if self._points:

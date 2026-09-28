@@ -1,9 +1,8 @@
-"""Main window: live image in the middle, controls panel on the right,
-measurements panel at the bottom.
+"""Main window: live image in the middle, controls and captures panels on
+the right, measurements and counting panels at the bottom.
 
 Shortcuts:
     Space       capture
-    E / D       exposure longer / shorter
     L           live / freeze
     G           grid
     C           crosshair
@@ -11,13 +10,19 @@ Shortcuts:
     1           100% (one image pixel per screen pixel)
     Ctrl+= / -  zoom in / out (or use the mouse wheel)
     Ctrl+O      open an image file
+    Ctrl+S      save the image in the view (e.g. a processing result)
     Ctrl+E      export measurements
-    Ctrl+1/2/3  show / hide the Controls / Measurements / Captures panel
+    Ctrl+1..4   show / hide the Controls / Measurements / Captures / Counting panel
+
+Processing tools (Process menu, or select images in Captures and right-click)
+show their result in the view, unsaved, until you press Ctrl+S.
 """
 
+import json
 import os
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt
@@ -45,13 +50,23 @@ from camcontrol.camera import ADJUSTABLE, format_exposure
 from camcontrol.capture import CAPTURE_DIR, HD2_SIZE, NATIVE_SIZE, clean_name, next_capture_path
 from camcontrol.export import export_table, measurement_rows
 from camcontrol.gui.camera_worker import CameraWorker
+from camcontrol.gui.count_panel import CountPanel, render_marks
 from camcontrol.gui.gallery import GalleryPanel
 from camcontrol.gui.image_view import ImageView
+from camcontrol.gui.jobs import run_job
 from camcontrol.gui.measure_draw import render_annotated
 from camcontrol.gui.measure_panel import MeasurePanel
+from camcontrol.gui.process_dialogs import (
+    FILE_FILTER,
+    FluorescenceDialog,
+    FocusStackDialog,
+    HdrDialog,
+    StitchDialog,
+)
 from camcontrol.gui.qt_image import to_qimage
-from camcontrol.image_io import load_image_file
+from camcontrol.image_io import load_image_file, save_image_file
 from camcontrol.paths import LOGO
+from camcontrol.processing.flatfield import FlatField
 
 AVERAGE_CHOICES = [1, 4, 8, 16, 32]
 SAVE_SIZES = [
@@ -59,6 +74,14 @@ SAVE_SIZES = [
     ("3264 x 1836 (HD2 size, upscaled)", HD2_SIZE),
 ]
 FORMATS = [("TIFF", "tif"), ("PNG", "png")]
+FLAT_DIR = CAPTURE_DIR.parent / "flats"  # flat-field references taken in the app
+# Process menu / Captures right-click tools: key -> dialog class.
+PROCESS_DIALOGS = {
+    "stack": FocusStackDialog,
+    "hdr": HdrDialog,
+    "stitch": StitchDialog,
+    "composite": FluorescenceDialog,
+}
 
 
 class MainWindow(QMainWindow):
@@ -67,17 +90,26 @@ class MainWindow(QMainWindow):
         self.settings = QSettings("CamControl", "CamControl")
         self.live = True
         self._source = "live"  # what the view shows: "live" or an image file name
+        # Set while the view shows an unsaved processing result: what made it
+        # (saved to the .json sidecar) and a suggested file name.
+        self._result: dict | None = None
         self._frame_times: deque[float] = deque(maxlen=30)
+        self.flat: FlatField | None = None
+        self._flat_path: str | None = None
+        self._dialogs = {}  # processing dialogs, kept so they remember their files and options
+        self._job = None    # background processing job while one runs
 
         self.view = ImageView()
         self.setCentralWidget(self.view)
         self.measure_panel = MeasurePanel()
+        self.count_panel = CountPanel()
         self.gallery = GalleryPanel()
 
         self._build_actions()
         self._build_menus()
         self._build_controls()
         self._build_measure_dock()
+        self._build_count_dock()
         self._build_gallery_dock()
         self._build_status_bar()
         self._load_settings()
@@ -91,6 +123,8 @@ class MainWindow(QMainWindow):
         self.worker.capture_started.connect(self._on_capture_started)
         self.worker.capture_done.connect(self._on_capture_done)
         self.worker.error.connect(self._on_error)
+        if self.flat_live_action.isChecked():  # turned on from saved settings
+            self.worker.set_flat_field(self.flat)
         self.worker.start()
 
     # --- building the UI ----------------------------------------------------
@@ -109,6 +143,7 @@ class MainWindow(QMainWindow):
         self.open_action = self._action("&Open image...", "Ctrl+O", self.open_image)
         self.capture_action = self._action("&Capture", "Space", self.capture)
         self.capture_action.setEnabled(False)  # until the camera opens
+        self.save_action = self._action("&Save image as...", "Ctrl+S", self.save_image)
         self.open_folder_action = self._action("Open captures &folder", None, self.open_capture_folder)
         self.quit_action = self._action("&Quit", "Ctrl+Q", self.close)
 
@@ -124,10 +159,26 @@ class MainWindow(QMainWindow):
         self.export_action = self._action("&Export measurements...", "Ctrl+E", self.export_measurements)
         self.clear_measurements_action = self._action(
             "&Clear measurements", None, lambda: self.measure_panel.clear())
+        self.export_counts_action = self._action("Export &counts...", None, self.export_counts)
+
+        self.process_actions = {
+            key: self._action(dialog.title + "...", None, lambda _=False, k=key: self.run_process(k))
+            for key, dialog in PROCESS_DIALOGS.items()
+        }
+        self.flat_info_action = self._action("No flat reference")
+        self.flat_info_action.setEnabled(False)
+        self.flat_set_action = self._action("&Use current image as flat reference", None,
+                                            self.set_flat_from_view)
+        self.flat_load_action = self._action("&Load flat reference...", None, self.load_flat)
+        self.flat_live_action = self._action("&Correct live view and captures", None,
+                                             self._set_flat_live, checkable=True)
+        self.flat_apply_action = self._action("Correct the &image in the view", None,
+                                              self.apply_flat_to_view)
+        self._update_flat_actions()
 
     def _build_menus(self):
         m = self.menuBar().addMenu("&File")
-        m.addActions([self.open_action, self.capture_action, self.open_folder_action])
+        m.addActions([self.open_action, self.save_action, self.capture_action, self.open_folder_action])
         m.addSeparator()
         m.addAction(self.quit_action)
 
@@ -141,6 +192,16 @@ class MainWindow(QMainWindow):
 
         m = self.menuBar().addMenu("&Measure")
         m.addActions([self.export_action, self.clear_measurements_action])
+        m.addSeparator()
+        m.addAction(self.export_counts_action)
+
+        m = self.menuBar().addMenu("&Process")
+        flat_menu = m.addMenu("&Flat-field correction")
+        flat_menu.addActions([self.flat_info_action, self.flat_set_action, self.flat_load_action])
+        flat_menu.addSeparator()
+        flat_menu.addActions([self.flat_live_action, self.flat_apply_action])
+        m.addSeparator()
+        m.addActions(list(self.process_actions.values()))
 
         m = self.menuBar().addMenu("&Help")
         m.addAction(self._action("&About CamControl", None, self.show_about))
@@ -157,13 +218,39 @@ class MainWindow(QMainWindow):
         panel.export_requested.connect(self.export_measurements)
         view.measurement_drawn.connect(self._on_measurement_drawn)
         view.tool_exit_requested.connect(lambda: panel.set_tool(None))
+        # Measuring and counting both use clicks, so only one is on at a time.
+        panel.tool_changed.connect(lambda tool: tool and self.count_panel.set_counting(False))
 
-        self._add_dock("Measurements", "measure_dock", panel,
-                       Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+2")
+        self.measure_dock = self._add_dock("Measurements", "measure_dock", panel,
+                                           Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+2")
+
+    def _build_count_dock(self):
+        panel = self.count_panel
+        view = self.view
+        view.set_counter(panel.counter)
+
+        def on_mode(cls):
+            if cls is not None:
+                self.measure_panel.set_tool(None)
+            view.set_count_class(cls)
+
+        panel.mode_changed.connect(on_mode)
+        panel.changed.connect(view.viewport().update)
+        panel.export_requested.connect(self.export_counts)
+        view.count_add.connect(panel.add)
+        view.count_remove.connect(panel.remove_near)
+        view.count_undo.connect(panel.undo)
+        view.tool_exit_requested.connect(lambda: panel.set_counting(False))
+
+        self.count_dock = self._add_dock("Counting", "count_dock", panel,
+                                         Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+4")
+        self.tabifyDockWidget(self.measure_dock, self.count_dock)
+        self.measure_dock.raise_()
 
     def _build_gallery_dock(self):
         self.gallery.open_requested.connect(self.open_image_path)
         self.gallery.folder_changed.connect(self._update_next_name)
+        self.gallery.process_requested.connect(self.run_process)
         self.gallery_dock = self._add_dock("Captures", "gallery_dock", self.gallery,
                                            Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+3")
         self._place_gallery_under_controls()
@@ -273,6 +360,11 @@ class MainWindow(QMainWindow):
         self.name_edit.textChanged.connect(self._update_next_name)
         self.format_combo.currentIndexChanged.connect(self._update_next_name)
 
+        flat_button = self._tool_button(self.flat_live_action)
+        flat_button.setToolTip("Correct uneven lighting in the live view and captures.\n"
+                               "Set a flat reference first: Process > Flat-field correction.")
+        form.addRow(flat_button)
+
         capture_button = self._tool_button(self.capture_action)
         capture_button.setMinimumHeight(40)
         form.addRow(capture_button)
@@ -325,6 +417,11 @@ class MainWindow(QMainWindow):
         self.gallery.set_count(int(s.value("gallery/count", 12)))
         self.gallery.set_folder(self.folder_edit.text())
         self._update_next_name()
+        flat_path = s.value("flatfield/path", "")
+        if flat_path and Path(flat_path).is_file():
+            self._use_flat(flat_path, quiet=True)
+            if s.value("flatfield/on", False, type=bool):
+                self._set_flat_live(True)
         # Set the actions, then the view (setChecked doesn't fire triggered).
         for action, key, setter in (
             (self.grid_action, "view/grid", self.view.set_show_grid),
@@ -340,6 +437,11 @@ class MainWindow(QMainWindow):
             # where it goes, so put it under Controls (which may have moved).
             if not s.value("window/has_gallery", False, type=bool):
                 self._place_gallery_under_controls()
+            # Same for the Counting panel: a tab next to Measurements.
+            if not s.value("window/has_counting", False, type=bool):
+                self.tabifyDockWidget(self.measure_dock, self.count_dock)
+                self.count_dock.show()
+                self.measure_dock.raise_()
         else:
             self.resize(1400, 850)
 
@@ -356,6 +458,9 @@ class MainWindow(QMainWindow):
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("window/state", self.saveState())
         s.setValue("window/has_gallery", True)
+        s.setValue("window/has_counting", True)
+        s.setValue("flatfield/path", self._flat_path or "")
+        s.setValue("flatfield/on", self.flat_live_action.isChecked())
 
     # --- camera events ------------------------------------------------------------
 
@@ -435,6 +540,7 @@ class MainWindow(QMainWindow):
         self.live_action.setChecked(on)
         if on:
             self._source = "live"
+            self._result = None
         else:
             self.fps_label.clear()
             self._frame_times.clear()
@@ -445,6 +551,9 @@ class MainWindow(QMainWindow):
         if path:
             self.source_label.setText(Path(path).name)
             self.source_label.setToolTip(str(path))
+        elif self._result is not None:
+            self.source_label.setText(f"{self._source} (unsaved)")
+            self.source_label.setToolTip("Processing result. File > Save image as (Ctrl+S) to keep it.")
         else:
             self.source_label.setText("Live" if self.live else "Frozen")
             self.source_label.setToolTip("")
@@ -498,18 +607,196 @@ class MainWindow(QMainWindow):
         if img is None:
             QMessageBox.warning(self, "CamControl", f"Could not read {path}")
             return
-        # Measurements belong to the image they were drawn on.
-        if self.measure_panel.measurements and QMessageBox.question(
-            self, "Open image", "Clear the current measurements? They were made on a different image."
-        ) == QMessageBox.StandardButton.Yes:
-            self.measure_panel.clear(confirm=False)
+        self._ask_clear_annotations("Open image")
         self._set_live(False)  # stop the camera feed replacing it
         self.view.set_image(img)
         h, w = img.shape[:2]
         self.size_label.setText(f"{w} x {h}")
         self._source = Path(path).name
+        self._result = None
         self._set_title(self._source)
         self._show_source(path)
+
+    def _ask_clear_annotations(self, title: str):
+        """Measurements and counts belong to the image they were made on."""
+        if not (self.measure_panel.measurements or self.count_panel.counter.marks):
+            return
+        if QMessageBox.question(
+            self, title, "Clear the current measurements and counts? They were made on a different image."
+        ) == QMessageBox.StandardButton.Yes:
+            self.measure_panel.clear(confirm=False)
+            self.count_panel.clear(confirm=False)
+
+    def save_image(self):
+        """Save the image in the view: a processing result, a frozen frame or a copy of a file."""
+        image = self.view.image
+        if image is None:
+            return
+        stem = self._result["short_name"] if self._result else "image"
+        default = next_capture_path(Path(self.folder_edit.text()), stem, "tif")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save image", str(default), "TIFF (*.tif);;PNG (*.png);;JPEG (*.jpg)")
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() not in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
+            path = path.with_suffix(".tif")
+        meta = {"timestamp": datetime.now().isoformat(timespec="seconds"),
+                "saved_size": [image.shape[1], image.shape[0]]}
+        if self._result:
+            meta.update(self._result["meta"])
+        else:
+            meta["source"] = self._source
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            save_image_file(path, image)
+            path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+        except Exception as e:
+            QMessageBox.warning(self, "Save image", f"Save failed: {e}")
+            return
+        self.statusBar().showMessage(f"Saved {path}", 5000)
+        if self._result:  # it's a file now
+            self._result = None
+            self._source = path.name
+            self._set_title(self._source)
+            self._show_source(str(path))
+        self.gallery.refresh(select=str(path))
+
+    # --- processing -----------------------------------------------------------------
+
+    def show_result(self, image, title: str, short_name: str, meta: dict):
+        """Show a processing result in the view, frozen and unsaved."""
+        self._ask_clear_annotations(title)
+        self._set_live(False)
+        self.view.set_image(image)
+        h, w = image.shape[:2]
+        self.size_label.setText(f"{w} x {h}")
+        self._source = title
+        self._result = {"short_name": short_name, "meta": meta}
+        self._set_title(f"{title} (unsaved)")
+        self._show_source()
+        self.statusBar().showMessage(f"{title} done. File > Save image as (Ctrl+S) to keep it.", 8000)
+
+    def run_process(self, key: str, paths: list | None = None):
+        """Open a processing dialog, then run it in the background.
+
+        paths: images to start with; by default, those selected in Captures.
+        """
+        if self._job is not None:
+            return  # one at a time
+        if key not in self._dialogs:
+            self._dialogs[key] = PROCESS_DIALOGS[key](self)
+        dialog = self._dialogs[key]
+        dialog.start_folder = self.folder_edit.text()
+        if paths is None:
+            selected = self.gallery.selected_paths()
+            paths = selected if len(selected) >= dialog.min_images else None
+        if paths:
+            dialog.set_paths(paths)
+        if not dialog.exec():  # cancelled
+            return
+
+        paths = dialog.paths()
+        settings = dialog.settings()
+        process = dialog.process
+
+        def work():  # runs on the background thread
+            images = []
+            for p in paths:
+                img = load_image_file(p)
+                if img is None:
+                    raise ValueError(f"Could not read {p}")
+                images.append(img)
+            return process(images, settings)
+
+        meta = {"processing": dialog.title, "inputs": [Path(p).name for p in paths],
+                "input_folder": str(Path(paths[0]).parent), "settings": settings}
+        title = f"{dialog.title} of {len(paths)} image{'s' if len(paths) > 1 else ''}"
+
+        def done(image):
+            self._job = None
+            self.show_result(image, title, dialog.short_name, meta)
+
+        def failed(message):
+            self._job = None
+            QMessageBox.warning(self, dialog.title, message)
+
+        self._job = run_job(self, f"{dialog.title}: working on {len(paths)} images...", work, done, failed)
+
+    # --- flat-field -----------------------------------------------------------------
+
+    def _use_flat(self, path: str, quiet: bool = False) -> bool:
+        img = load_image_file(path)
+        if img is None:
+            if not quiet:
+                QMessageBox.warning(self, "Flat-field", f"Could not read {path}")
+            return False
+        self.flat = FlatField(img, Path(path).name)
+        self._flat_path = str(path)
+        if self.flat_live_action.isChecked():
+            self.worker.set_flat_field(self.flat)  # swap in the new reference
+        self._update_flat_actions()
+        return True
+
+    def _update_flat_actions(self):
+        has = self.flat is not None
+        self.flat_info_action.setText(
+            f"Reference: {self.flat.name}" if has else "No flat reference (use or load one below)")
+        self.flat_live_action.setEnabled(has)
+        self.flat_apply_action.setEnabled(has)
+        if not has:
+            self.flat_live_action.setChecked(False)
+
+    def set_flat_from_view(self):
+        """Save the image in the view as the flat reference and use it."""
+        image = self.view.image
+        if image is None:
+            return
+        if self.live and self.flat_live_action.isChecked():
+            QMessageBox.information(
+                self, "Flat-field",
+                "The live view is already corrected. Turn off \"Correct live view and captures\" first, "
+                "so the reference is taken from the uncorrected image.")
+            return
+        if QMessageBox.question(
+            self, "Flat-field",
+            "Use the image in the view as the flat reference?\n\n"
+            "It should show an empty, evenly lit field (e.g. a blank slide) with the same "
+            "lighting and zoom you'll use for samples. Averaging several frames when "
+            "capturing it gives a cleaner reference."
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        FLAT_DIR.mkdir(parents=True, exist_ok=True)
+        path = FLAT_DIR / f"flat_{time.strftime('%Y%m%d_%H%M%S')}.tif"
+        save_image_file(path, image)
+        if self._use_flat(str(path)):
+            self.statusBar().showMessage(f"Flat reference saved to {path}", 8000)
+
+    def load_flat(self):
+        start = str(FLAT_DIR) if FLAT_DIR.is_dir() else self.folder_edit.text()
+        path, _ = QFileDialog.getOpenFileName(self, "Load flat reference", start, FILE_FILTER)
+        if path and self._use_flat(path):
+            self.statusBar().showMessage(f"Flat reference: {Path(path).name}", 5000)
+
+    def _set_flat_live(self, on: bool):
+        on = on and self.flat is not None
+        self.flat_live_action.setChecked(on)
+        if hasattr(self, "worker"):  # at startup, __init__ sends it once the worker exists
+            self.worker.set_flat_field(self.flat if on else None)
+
+    def apply_flat_to_view(self):
+        image = self.view.image
+        if image is None or self.flat is None:
+            return
+        if self.live:
+            QMessageBox.information(self, "Flat-field",
+                                    "This corrects a frozen or opened image. For the live view, "
+                                    "turn on \"Correct live view and captures\".")
+            return
+        name = self._source
+        self.show_result(self.flat.apply(image), f"{name} (flat-field corrected)", "flat",
+                         {"processing": "Flat-field correction", "inputs": [name],
+                          "flat_field": self.flat.name})
 
     # --- measurements ---------------------------------------------------------------
 
@@ -550,6 +837,34 @@ class MainWindow(QMainWindow):
             f"Exported {len(panel.measurements)} measurements to {path.name}, "
             f"{image_path.name} and {annotated_path.name}", 8000)
 
+    def export_counts(self):
+        """Save the counts (Excel or CSV) plus the image and a copy with the marks."""
+        counter = self.count_panel.counter
+        if not counter.marks or self.view.image is None:
+            QMessageBox.information(self, "Export counts", "There are no counts to export.")
+            return
+        default = Path(self.folder_edit.text()) / f"counts_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export counts", str(default), "Excel (*.xlsx);;CSV (*.csv)")
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() not in (".xlsx", ".csv"):
+            path = path.with_suffix(".xlsx")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        image = self.view.image
+        try:
+            counter.export(path, self._source)
+            image_path = path.with_name(f"{path.stem}_image.png")
+            marked_path = path.with_name(f"{path.stem}_marked.png")
+            to_qimage(image).save(str(image_path))
+            render_marks(image, counter).save(str(marked_path))
+        except Exception as e:  # e.g. the file is open in Excel
+            QMessageBox.warning(self, "Export counts", f"Export failed: {e}")
+            return
+        self.statusBar().showMessage(
+            f"Exported {len(counter.marks)} marks to {path.name}, {image_path.name} and {marked_path.name}", 8000)
+
     def _on_cursor(self, info):
         if info is None:
             self.cursor_label.setText("")
@@ -574,6 +889,8 @@ class MainWindow(QMainWindow):
         box.exec()
 
     def closeEvent(self, event):
+        if self._job is not None:
+            self._job.wait()  # let a running processing job finish first
         self._save_settings()
         self.worker.stop()
         super().closeEvent(event)
