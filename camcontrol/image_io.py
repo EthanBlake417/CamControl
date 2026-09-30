@@ -6,6 +6,19 @@ import cv2
 import numpy as np
 
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp"}
+VIDEO_EXTENSIONS = {".mp4", ".avi"}  # what the Recording panel writes
+
+
+def is_video(path) -> bool:
+    return Path(path).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def load_video_frame(path) -> np.ndarray | None:
+    """The first frame of a video (for thumbnails), or None."""
+    cap = cv2.VideoCapture(str(path))
+    ok, frame = cap.read()
+    cap.release()
+    return frame if ok else None
 
 
 def load_image_file(path) -> np.ndarray | None:

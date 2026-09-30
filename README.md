@@ -22,21 +22,35 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 | `F` / `1` | fit to window / 100% |
 | Ctrl+= / Ctrl+- | zoom in / out |
 | Ctrl+O | open an image file |
-| Ctrl+S | save the image in the view (e.g. a processing result) |
+| Ctrl+S | save the image in the view (e.g. a processing result, or a paused video frame) |
+| Ctrl+Shift+S | save settings (File → Save settings) |
 | Ctrl+E | export measurements |
-| Ctrl+1 / 2 / 3 / 4 | show / hide the Controls / Measurements / Captures / Counting panel (also **View → Panels**, or the panel's × button) |
+| Ctrl+K | side-by-side compare |
+| Ctrl+1 / 2 / 3 / 4 | show / hide the Controls / Measurements / Captures / Counting panel (also **View → Panels**, or the panel's × button). Side panels always run the full height of the window. |
 
-**Capturing.** Set a **Name** in the Capture panel and captures are saved as `name-001.tif`, `name-002.tif`, ..., continuing after the highest number already in the folder (so nothing is overwritten; same style as HD2). Leave it blank for date-and-time names. The line under the field shows the next file name. Each image gets a `.json` with its settings. The **Captures** panel shows thumbnails of the newest N images in the capture folder (N is set in the panel). It updates automatically when files change. Double-click a thumbnail to open it; right-click for "Show in Explorer". Ctrl- or Shift-click selects several images, and right-clicking them offers the processing tools. The right end of the status bar shows what the view is showing: **Live**, **Frozen**, or the open file's name (hover for the full path).
+**Panels** work like PyCharm's tool windows. Each panel has a button with its name on a thin stripe along the edge it's on (left, right or bottom). Each edge shows one panel at a time: clicking a button opens that panel and minimizes the others on the same edge. Click it again, or the panel's **–** button, to minimize it so the image gets its space. Highlighted buttons are open panels. To move a panel, drag its button to another stripe (all three show while dragging, even empty ones), or along its stripe to change the order.
+
+**Controls panel**, top to bottom: **Camera** (connection status, **Reconnect**, sliders); **Output** (folder, name, next file name, flat-field on/off, shared by everything that saves files); then tabs for **Photo** (averaging, save size, format, Capture), **Video** and **Time-lapse**; and **View**. If the camera was off or unplugged when the app started, or it stops sending pictures, turn it on and click **Reconnect** (also **File → Reconnect camera**).
+
+**Capturing.** Set a **Name** in the Output box and captures are saved as `name-001.tif`, `name-002.tif`, ..., continuing after the highest number already in the folder (so nothing is overwritten; same style as HD2). Leave it blank for date-and-time names. The line under the field shows the next file name. Each image gets a `.json` with its settings. The **Captures** panel shows thumbnails of the newest N images and videos in the capture folder (N is set in the panel; videos have a play mark). It updates automatically when files change. Double-click a thumbnail to open it, or to play a video; right-click for "Show in Explorer". Ctrl- or Shift-click selects several, and right-clicking them offers the processing tools. **Delete** (right-click, or the Delete key) moves the selected files and their `.json` settings files to the Recycle Bin, after asking. A `.json` shared by two images of the same name (e.g. `name-001.tif` and `name-001.png`) goes when the last of them does.
+
+**Videos** (MP4/AVI, e.g. from the Video tab) play in the main view with a bar underneath: play/pause, previous/next frame, a slider to jump, and the time and frame number. A paused frame can be zoomed, measured, counted or saved (Ctrl+S; its `.json` records the frame number). **Close video**, or Live, goes back to the camera. The right end of the status bar shows what the view is showing: **Live**, **Frozen**, or the open file's name (hover for the full path).
 
 **Measuring.** Pick a tool in the Measurements panel (Line, Polyline, Circle (3 pt), Angle, Rectangle, Polygon) and click points on the image. Line, circle, angle and rectangle finish by themselves. For a polyline or polygon, double-click, right-click or press Enter to finish. Backspace removes the last point, Esc cancels (press it twice to go back to panning), and middle-drag pans while a tool is active. Results appear in the table, and selecting a row highlights that shape. **Export** writes the table (`.xlsx` with an Info sheet, or `.csv`), the measured image (`_image.png`) and an annotated copy (`_annotated.png`). Freeze the live view (L) or open a file before measuring, so the image doesn't change underneath you. Until calibration exists, all values are in pixels.
 
 **Counting.** In the Counting panel (a tab next to Measurements), name up to 5 classes, pick one, and press **Count**. Each left-click on the image adds a mark of that class; right-click removes the nearest mark, Backspace undoes the last one, and Esc stops counting. Counts and percentages update as you click. **Export** writes the counts (`.xlsx` with Summary, Marks and Info sheets, or `.csv` plus `_marks.csv`), the image and a copy with the marks drawn on (`_marked.png`).
 
+**Settings files** (File menu: **Open settings**, **Open recent settings**, **Save settings** (Ctrl+Shift+S), **Save settings as**). Saves the whole setup to a `.json` file you name, e.g. `brightfield 10x.json`: camera sliders, Photo averaging/size/format, Output folder and name, flat-field reference and whether it's on, Video/Time-lapse settings, and grid/crosshair. They're saved to `settings/` by default, but can go anywhere and be copied to another PC. The most recently opened or saved file opens again when the app starts, and its name shows in the window title. Camera values in a file opened before the camera connects are applied as soon as it does. To delete a settings file, delete it in Explorer.
+
+**Compare** (View → Compare side by side, Ctrl+K, or right-click an image in Captures → Compare side by side). Shows a saved image next to the main view, which can be live, frozen, a file or a result. Both halves get the same space, each under its own name, with one button bar across the top. With **Link zoom/pan** on, zooming or panning either image does the same to the other. Images of different sizes are matched by position in the picture. **Save both** writes the two images side by side in one file, with their names on them.
+
+**Video and time-lapse** (the Video and Time-lapse tabs in Controls). **Video** records the live view to MP4 (small) or AVI (Motion JPEG: better quality, much larger), optionally stopping after a set time. Frames are repeated or skipped to match the chosen frame rate, so the video plays at real speed even though the camera's rate varies. **Time-lapse** takes a capture every N seconds/minutes/hours, for a set number of images or until stopped. It uses the Photo tab's averaging, size and format, and a `.json` for each image records its number and the interval. Optionally the images are joined into a video at the end. Files are saved to the Output folder with the Output name, continuing its numbering. Flat-field correction applies to both if it's on. Closing the app asks first while either is running.
+
 **Processing** (Process menu, or select images in Captures and right-click). Results appear in the view marked "(unsaved)"; **File → Save image as** (Ctrl+S) saves them with a `.json` listing the input files and settings. All tools accept any image files, including full-size 3264x1836 SD card images, but the images in one run must be the same size (except for stitching).
 
 | Tool | What it does | How to take the images |
 |---|---|---|
-| Flat-field correction | Evens out uneven lighting and removes fixed dust shadows | Capture an empty, evenly lit field (blank slide), averaging several frames. With it in the view, **Process → Flat-field correction → Use current image as flat reference** (saved to `flats/`). Then turn on **Correct live view and captures** (also a button in the Capture panel), or correct an opened image. |
+| Flat-field correction | Evens out uneven lighting and removes fixed dust shadows | Capture an empty, evenly lit field (blank slide), averaging several frames. With it in the view, **Process → Flat-field correction → Use current image as flat reference** (saved to `flats/`). Then turn on **Correct live view and captures** (also a button in the Output box), or correct an opened image. |
 | Focus stack | Combines the sharp parts of each image for extended depth of field. Aligns the images first. | Don't move the sample. Step the focus through it, one capture per step. |
 | HDR (exposure fusion) | Shows detail in both bright and dark areas | Same view at 3 or more exposures (short, medium, long). |
 | Stitch | Joins overlapping images into one large image | Move the sample so neighbouring images overlap by about a third. Needs visible detail in the overlaps. |
@@ -182,6 +196,8 @@ camcontrol/
 │   ├── camera.py        # open camera, set resolution/controls, grab frames
 │   ├── uvc_controls.py  # direct DirectShow camera controls (comtypes)
 │   ├── capture.py       # frame averaging, save image + JSON metadata
+│   ├── recording.py     # video recording and time-lapse (run by the camera thread)
+│   ├── settings_file.py # settings files (JSON): save, load, recent list
 │   ├── overlays.py      # display-only zoom/pan, grid, crosshair
 │   ├── viewer.py        # simple OpenCV live view (no Qt)
 │   ├── gui/
@@ -194,6 +210,10 @@ camcontrol/
 │   │   ├── count_panel.py   # Counting panel, drawing marks
 │   │   ├── process_dialogs.py # dialogs for focus stack, HDR, stitch, fluorescence
 │   │   ├── jobs.py          # runs processing in the background
+│   │   ├── compare.py       # side-by-side compare pane
+│   │   ├── record_panel.py  # Video and Time-lapse tabs of the Controls panel
+│   │   ├── video_player.py  # video playback bar
+│   │   ├── tool_stripes.py  # PyCharm-style panel stripes along the window edges
 │   │   └── camera_worker.py # camera thread (keeps the GUI responsive)
 │   ├── calibration.py   # per-axis µm/px (only "pixels" so far; JSON table in Phase 2)
 │   ├── measure.py       # measurement geometry and results (self-test: python -m camcontrol.measure)
@@ -212,6 +232,7 @@ camcontrol/
 ├── calibrations/
 │   └── calibrations.json
 ├── flats/               # flat-field references taken in the app
+├── settings/            # settings files (default location)
 └── captures/
 ```
 

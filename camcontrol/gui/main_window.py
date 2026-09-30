@@ -12,6 +12,7 @@ Shortcuts:
     Ctrl+O      open an image file
     Ctrl+S      save the image in the view (e.g. a processing result)
     Ctrl+E      export measurements
+    Ctrl+K      side-by-side compare (right-click an image in Captures to pick it)
     Ctrl+1..4   show / hide the Controls / Measurements / Captures / Counting panel
 
 Processing tools (Process menu, or select images in Captures and right-click)
@@ -25,7 +26,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt
+from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -39,8 +40,10 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -49,7 +52,9 @@ from PySide6.QtWidgets import (
 from camcontrol.camera import ADJUSTABLE, format_exposure
 from camcontrol.capture import CAPTURE_DIR, HD2_SIZE, NATIVE_SIZE, clean_name, next_capture_path
 from camcontrol.export import export_table, measurement_rows
+from camcontrol import settings_file
 from camcontrol.gui.camera_worker import CameraWorker
+from camcontrol.gui.compare import CompareArea, side_by_side
 from camcontrol.gui.count_panel import CountPanel, render_marks
 from camcontrol.gui.gallery import GalleryPanel
 from camcontrol.gui.image_view import ImageView
@@ -64,7 +69,10 @@ from camcontrol.gui.process_dialogs import (
     StitchDialog,
 )
 from camcontrol.gui.qt_image import to_qimage
-from camcontrol.image_io import load_image_file, save_image_file
+from camcontrol.gui.record_panel import RecordPanel
+from camcontrol.gui.tool_stripes import ToolStripes
+from camcontrol.gui.video_player import VideoPlayer
+from camcontrol.image_io import is_video, load_image_file, save_image_file
 from camcontrol.paths import LOGO
 from camcontrol.processing.flatfield import FlatField
 
@@ -98,12 +106,40 @@ class MainWindow(QMainWindow):
         self._flat_path: str | None = None
         self._dialogs = {}  # processing dialogs, kept so they remember their files and options
         self._job = None    # background processing job while one runs
+        self._pending_camera: dict | None = None  # settings-file camera values waiting for the camera
+        self._camera_values: dict = {}             # latest values the camera reported
+        self.settings_path: str | None = None      # settings file opened or saved last
 
+        self.camera_index = camera_index
+        self.camera_open = False
+
+        self._set_corners()
+        # No Qt tab groups: each edge shows one panel at a time and the stripe
+        # buttons act as its tabs. (Qt's tab bars also leave stray tabs drawn
+        # in the corner when a tabbed panel is hidden.)
+        self.setDockOptions(QMainWindow.DockOption.AnimatedDocks | QMainWindow.DockOption.AllowNestedDocks)
+        # PyCharm-style stripes along the edges: a button per panel to minimize / restore it.
+        self.stripes = ToolStripes(self)
+
+        # The main view, with the compare view beside it (hidden until used).
+        # Under it, the video player bar (shown while a video is open).
         self.view = ImageView()
-        self.setCentralWidget(self.view)
+        self.compare = CompareArea(self.view)
+        self.player = VideoPlayer()
+        self.player.hide()
+        self.player.frame_ready.connect(self._on_video_frame)
+        self.player.close_requested.connect(lambda: self._set_live(True))
+        centre = QWidget()
+        centre_layout = QVBoxLayout(centre)
+        centre_layout.setContentsMargins(0, 0, 0, 0)
+        centre_layout.setSpacing(0)
+        centre_layout.addWidget(self.compare, stretch=1)
+        centre_layout.addWidget(self.player)
+        self.setCentralWidget(centre)
         self.measure_panel = MeasurePanel()
         self.count_panel = CountPanel()
         self.gallery = GalleryPanel()
+        self.record_panel = RecordPanel(self)  # the Video and Time-lapse tabs in Controls
 
         self._build_actions()
         self._build_menus()
@@ -111,21 +147,13 @@ class MainWindow(QMainWindow):
         self._build_measure_dock()
         self._build_count_dock()
         self._build_gallery_dock()
+        self._build_compare()
         self._build_status_bar()
         self._load_settings()
         self._set_title()
         self._show_source()
 
-        self.worker = CameraWorker(camera_index)
-        self.worker.opened.connect(self._on_camera_opened)
-        self.worker.frame_ready.connect(self._on_frame)
-        self.worker.settings_changed.connect(self._on_camera_settings)
-        self.worker.capture_started.connect(self._on_capture_started)
-        self.worker.capture_done.connect(self._on_capture_done)
-        self.worker.error.connect(self._on_error)
-        if self.flat_live_action.isChecked():  # turned on from saved settings
-            self.worker.set_flat_field(self.flat)
-        self.worker.start()
+        self._start_worker()
 
     # --- building the UI ----------------------------------------------------
 
@@ -145,6 +173,12 @@ class MainWindow(QMainWindow):
         self.capture_action.setEnabled(False)  # until the camera opens
         self.save_action = self._action("&Save image as...", "Ctrl+S", self.save_image)
         self.open_folder_action = self._action("Open captures &folder", None, self.open_capture_folder)
+        self.reconnect_action = self._action("&Reconnect camera", None, self.reconnect_camera)
+        self.open_settings_action = self._action("Open se&ttings...", None, self.open_settings)
+        self.save_settings_action = self._action("Save setti&ngs", "Ctrl+Shift+S", self.save_settings)
+        self.save_settings_as_action = self._action("Save settings &as...", None, self.save_settings_as)
+        self.compare_action = self._action("&Compare side by side", "Ctrl+K", self._show_compare, checkable=True)
+        self.open_compare_action = self._action("Open image to co&mpare...", None, self.open_compare)
         self.quit_action = self._action("&Quit", "Ctrl+Q", self.close)
 
         self.live_action = self._action("&Live", "L", self._set_live, checkable=True)
@@ -178,7 +212,16 @@ class MainWindow(QMainWindow):
 
     def _build_menus(self):
         m = self.menuBar().addMenu("&File")
-        m.addActions([self.open_action, self.save_action, self.capture_action, self.open_folder_action])
+        m.addActions([self.open_action, self.open_compare_action, self.save_action,
+                      self.capture_action, self.open_folder_action])
+        m.addSeparator()
+        # Settings files (camera, capture, output, flat-field, recording, view).
+        m.addAction(self.open_settings_action)
+        self.recent_menu = m.addMenu("Open &recent settings")
+        self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
+        m.addActions([self.save_settings_action, self.save_settings_as_action])
+        m.addSeparator()
+        m.addAction(self.reconnect_action)
         m.addSeparator()
         m.addAction(self.quit_action)
 
@@ -186,6 +229,8 @@ class MainWindow(QMainWindow):
         m.addActions([self.live_action, self.grid_action, self.crosshair_action])
         m.addSeparator()
         m.addActions([self.fit_action, self.actual_action, self.zoom_in_action, self.zoom_out_action])
+        m.addSeparator()
+        m.addAction(self.compare_action)
         m.addSeparator()
         # Filled in by _add_dock(), one entry per panel.
         self.panels_menu = m.addMenu("&Panels")
@@ -244,32 +289,54 @@ class MainWindow(QMainWindow):
 
         self.count_dock = self._add_dock("Counting", "count_dock", panel,
                                          Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+4")
-        self.tabifyDockWidget(self.measure_dock, self.count_dock)
-        self.measure_dock.raise_()
+        self.count_dock.hide()  # same edge as Measurements; its stripe button opens it
 
     def _build_gallery_dock(self):
         self.gallery.open_requested.connect(self.open_image_path)
         self.gallery.folder_changed.connect(self._update_next_name)
         self.gallery.process_requested.connect(self.run_process)
+        self.gallery.compare_requested.connect(self.compare_path)
+        # On the left by default: each edge shows one panel at a time, and
+        # Controls has the right.
         self.gallery_dock = self._add_dock("Captures", "gallery_dock", self.gallery,
-                                           Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+3")
-        self._place_gallery_under_controls()
+                                           Qt.DockWidgetArea.LeftDockWidgetArea, "Ctrl+3")
 
-    def _place_gallery_under_controls(self):
-        """Default spot for the Captures panel: under Controls, wherever that is."""
-        self.splitDockWidget(self.controls_dock, self.gallery_dock, Qt.Orientation.Vertical)
+    def _build_compare(self):
+        self.compare.open_requested.connect(self.open_compare)
+        self.compare.save_requested.connect(self.save_compare)
+        self.compare.close_requested.connect(lambda: self._show_compare(False))
+        self.compare.view.cursor_moved.connect(self._on_cursor)
 
-    def _add_dock(self, title, object_name, widget, area, shortcut):
-        """Add a panel that can be moved, floated or closed.
+    def _place_gallery_default(self):
+        """Default spot for the Captures panel: the left edge."""
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.gallery_dock)
+        self.gallery_dock.show()
 
-        Closed panels come back from View > Panels (or the shortcut).
+    def _add_dock(self, title, object_name, widget, area, shortcut, scroll=False):
+        """Add a panel that can be moved, floated or minimized.
+
+        Minimized panels come back from their button on the edge stripe,
+        View > Panels, or the shortcut.
         Which panels are open is saved with the window layout.
+        scroll: put the panel in a scroll area, so a tall panel scrolls
+        instead of forcing the whole window to be taller than the screen.
         """
         dock = QDockWidget(title, self)
         dock.setObjectName(object_name)  # needed for saveState()
+        if scroll:
+            area_widget = QScrollArea()
+            area_widget.setWidget(widget)
+            area_widget.setWidgetResizable(True)
+            area_widget.setFrameShape(QScrollArea.Shape.NoFrame)
+            # Scroll up/down only: the panel can't be made narrower than its
+            # contents (which would cut them off on the right).
+            area_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            area_widget.setMinimumWidth(widget.minimumSizeHint().width()
+                                        + area_widget.verticalScrollBar().sizeHint().width())
+            widget = area_widget
         dock.setWidget(widget)
+        # No floating: panels are moved by dragging their stripe button (or title).
         dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetMovable
-                         | QDockWidget.DockWidgetFeature.DockWidgetFloatable
                          | QDockWidget.DockWidgetFeature.DockWidgetClosable)
         self.addDockWidget(area, dock)
         # Qt's ready-made show/hide action: checked while the panel is visible.
@@ -277,6 +344,7 @@ class MainWindow(QMainWindow):
         toggle.setShortcut(QKeySequence(shortcut))
         self.addAction(toggle)  # shortcut works even while the panel is hidden
         self.panels_menu.addAction(toggle)
+        self.stripes.add(dock, area)  # its button on the edge stripe
         return dock
 
     def _tool_button(self, action):
@@ -291,10 +359,21 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
 
-        # Camera: one slider per control. Ranges are filled in when the
-        # camera opens and reports them (_on_camera_opened).
+        # Camera: connection status, then one slider per control. Ranges are
+        # filled in when the camera opens and reports them (_on_camera_opened).
         cam_box = QGroupBox("Camera")
-        form = QFormLayout(cam_box)
+        cam_layout = QVBoxLayout(cam_box)
+        status_row = QHBoxLayout()
+        self.camera_status = QLabel("Connecting...")
+        status_row.addWidget(self.camera_status, stretch=1)
+        reconnect = QPushButton("Reconnect")
+        reconnect.setToolTip("Connect to the camera again, e.g. after turning it on or plugging it in.")
+        reconnect.clicked.connect(self.reconnect_camera)
+        status_row.addWidget(reconnect)
+        cam_layout.addLayout(status_row)
+        self.slider_box = QWidget()
+        form = QFormLayout(self.slider_box)
+        form.setContentsMargins(0, 0, 0, 0)
         self.sliders: dict[str, QSlider] = {}
         self.value_labels: dict[str, QLabel] = {}
         for name in ADJUSTABLE:
@@ -309,33 +388,13 @@ class MainWindow(QMainWindow):
             form.addRow(name.capitalize(), row)
             self.sliders[name] = slider
             self.value_labels[name] = label
-        cam_box.setEnabled(False)  # until the camera opens
-        self.cam_box = cam_box
+        self.slider_box.setEnabled(False)  # until the camera opens
+        cam_layout.addWidget(self.slider_box)
         layout.addWidget(cam_box)
 
-        # Capture
-        cap_box = QGroupBox("Capture")
-        form = QFormLayout(cap_box)
-        self.average_combo = QComboBox()
-        for n in AVERAGE_CHOICES:
-            self.average_combo.addItem(f"{n} frame{'s' if n > 1 else ''}", n)
-        self.average_combo.setToolTip("Averaging several frames reduces noise.")
-        form.addRow("Average", self.average_combo)
-
-        self.size_combo = QComboBox()
-        for text, size in SAVE_SIZES:
-            self.size_combo.addItem(text, size)
-        self.size_combo.setToolTip(
-            "The camera sends 1920x1080 at most. 3264x1836 is scaled up to match\n"
-            "HD2 files: more pixels, no extra detail, and a different µm/px."
-        )
-        form.addRow("Save size", self.size_combo)
-
-        self.format_combo = QComboBox()
-        for text, ext in FORMATS:
-            self.format_combo.addItem(text, ext)
-        form.addRow("Format", self.format_combo)
-
+        # Output: where photos, videos and time-lapses go (shared by all three).
+        out_box = QGroupBox("Output")
+        form = QFormLayout(out_box)
         folder_row = QHBoxLayout()
         self.folder_edit = QLineEdit()
         self.folder_edit.setReadOnly(True)
@@ -356,14 +415,39 @@ class MainWindow(QMainWindow):
         self.next_name_label = QLabel()
         self.next_name_label.setStyleSheet("color: gray;")
         form.addRow("", self.next_name_label)
+
+        flat_button = self._tool_button(self.flat_live_action)
+        flat_button.setToolTip("Correct uneven lighting in the live view, photos, videos and time-lapses.\n"
+                               "Set a flat reference first: Process > Flat-field correction.")
+        form.addRow(flat_button)
+        layout.addWidget(out_box)
+
+        # Photo / Video / Time-lapse: one tab each, so only the options for
+        # what you're doing take up room.
+        photo_page = QWidget()
+        form = QFormLayout(photo_page)
+        self.average_combo = QComboBox()
+        for n in AVERAGE_CHOICES:
+            self.average_combo.addItem(f"{n} frame{'s' if n > 1 else ''}", n)
+        self.average_combo.setToolTip("Averaging several frames reduces noise.")
+        form.addRow("Average", self.average_combo)
+
+        self.size_combo = QComboBox()
+        for text, size in SAVE_SIZES:
+            self.size_combo.addItem(text, size)
+        self.size_combo.setToolTip(
+            "The camera sends 1920x1080 at most. 3264x1836 is scaled up to match\n"
+            "HD2 files: more pixels, no extra detail, and a different µm/px."
+        )
+        form.addRow("Save size", self.size_combo)
+
+        self.format_combo = QComboBox()
+        for text, ext in FORMATS:
+            self.format_combo.addItem(text, ext)
+        form.addRow("Format", self.format_combo)
         # Keep the "Next:" preview current.
         self.name_edit.textChanged.connect(self._update_next_name)
         self.format_combo.currentIndexChanged.connect(self._update_next_name)
-
-        flat_button = self._tool_button(self.flat_live_action)
-        flat_button.setToolTip("Correct uneven lighting in the live view and captures.\n"
-                               "Set a flat reference first: Process > Flat-field correction.")
-        form.addRow(flat_button)
 
         capture_button = self._tool_button(self.capture_action)
         capture_button.setMinimumHeight(40)
@@ -371,7 +455,16 @@ class MainWindow(QMainWindow):
         self.last_saved_label = QLabel("")
         self.last_saved_label.setWordWrap(True)
         form.addRow(self.last_saved_label)
-        layout.addWidget(cap_box)
+
+        rec = self.record_panel
+        rec.record_requested.connect(self._request_recording)
+        rec.timelapse_requested.connect(self._request_timelapse)
+        rec.set_enabled(False)  # until the camera opens
+        self.capture_tabs = QTabWidget()
+        self.capture_tabs.addTab(photo_page, "Photo")
+        self.capture_tabs.addTab(rec.video_page, "Video")
+        self.capture_tabs.addTab(rec.timelapse_page, "Time-lapse")
+        layout.addWidget(self.capture_tabs)
 
         # View
         view_box = QGroupBox("View")
@@ -389,7 +482,7 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
         self.controls_dock = self._add_dock("Controls", "controls_dock", panel,
-                                            Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+1")
+                                            Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+1", scroll=True)
 
     def _build_status_bar(self):
         self.fps_label = QLabel()
@@ -413,8 +506,13 @@ class MainWindow(QMainWindow):
         self.average_combo.setCurrentIndex(int(s.value("capture/average_idx", 0)))
         self.size_combo.setCurrentIndex(int(s.value("capture/size_idx", 0)))
         self.format_combo.setCurrentIndex(int(s.value("capture/format_idx", 0)))
+        self.capture_tabs.setCurrentIndex(int(s.value("capture/tab", 0)))
         self.name_edit.setText(s.value("capture/name", ""))
         self.gallery.set_count(int(s.value("gallery/count", 12)))
+        try:
+            self.record_panel.set_state(json.loads(s.value("recording/state", "{}")))
+        except (ValueError, TypeError):
+            pass  # unreadable saved state: keep the defaults
         self.gallery.set_folder(self.folder_edit.text())
         self._update_next_name()
         flat_path = s.value("flatfield/path", "")
@@ -430,20 +528,51 @@ class MainWindow(QMainWindow):
             on = s.value(key, False, type=bool)
             action.setChecked(on)
             setter(on)
-        if s.contains("window/geometry"):
+        # A layout saved while Recording was a tab under Captures (2026-09-28)
+        # could be taller than the screen, so it isn't restored; the default
+        # layout is used once instead.
+        if s.contains("window/geometry") and not (s.value("window/has_recording", False, type=bool)
+                                                  and not s.value("window/has_recording_dock", False, type=bool)):
             self.restoreGeometry(s.value("window/geometry"))
             self.restoreState(s.value("window/state"))
+            self._set_corners()  # the saved layout includes the old corner settings
             # A layout saved before the Captures panel existed doesn't know
-            # where it goes, so put it under Controls (which may have moved).
+            # where it goes.
             if not s.value("window/has_gallery", False, type=bool):
-                self._place_gallery_under_controls()
-            # Same for the Counting panel: a tab next to Measurements.
-            if not s.value("window/has_counting", False, type=bool):
-                self.tabifyDockWidget(self.measure_dock, self.count_dock)
-                self.count_dock.show()
-                self.measure_dock.raise_()
+                self._place_gallery_default()
+            self._untabify()  # layouts saved before 2026-09-29 had tab groups
         else:
             self.resize(1400, 850)
+            QTimer.singleShot(0, lambda: self.resizeDocks(
+                [self.gallery_dock, self.controls_dock], [300, 380], Qt.Orientation.Horizontal))
+        # Stripe button order, and at most one open panel per edge.
+        self.stripes.set_order(s.value("panels/order", ""))
+        # The settings file used last, if it's still there.
+        recent = self._recent_settings()
+        if recent:
+            self.open_settings_path(recent[0], quiet=True)
+
+    def _untabify(self):
+        """Take panels out of Qt tab groups (see the dock options in __init__)."""
+        for dock in (self.controls_dock, self.measure_dock, self.count_dock, self.gallery_dock):
+            for other in self.tabifiedDockWidgets(dock):
+                area = self.dockWidgetArea(other)
+                hidden = other.isHidden()
+                self.removeDockWidget(other)
+                self.addDockWidget(area, other)
+                other.setHidden(hidden)
+
+    def _set_corners(self):
+        """Side panels own the corners, so they always run the full height of
+        the window: a bottom panel sits between the left and right panels,
+        under the image, instead of spreading under them."""
+        for corner, area in (
+            (Qt.Corner.TopLeftCorner, Qt.DockWidgetArea.LeftDockWidgetArea),
+            (Qt.Corner.BottomLeftCorner, Qt.DockWidgetArea.LeftDockWidgetArea),
+            (Qt.Corner.TopRightCorner, Qt.DockWidgetArea.RightDockWidgetArea),
+            (Qt.Corner.BottomRightCorner, Qt.DockWidgetArea.RightDockWidgetArea),
+        ):
+            self.setCorner(corner, area)
 
     def _save_settings(self):
         s = self.settings
@@ -451,6 +580,7 @@ class MainWindow(QMainWindow):
         s.setValue("capture/average_idx", self.average_combo.currentIndex())
         s.setValue("capture/size_idx", self.size_combo.currentIndex())
         s.setValue("capture/format_idx", self.format_combo.currentIndex())
+        s.setValue("capture/tab", self.capture_tabs.currentIndex())
         s.setValue("capture/name", self.name_edit.text())
         s.setValue("gallery/count", self.gallery.count)
         s.setValue("view/grid", self.grid_action.isChecked())
@@ -459,23 +589,84 @@ class MainWindow(QMainWindow):
         s.setValue("window/state", self.saveState())
         s.setValue("window/has_gallery", True)
         s.setValue("window/has_counting", True)
+        s.setValue("panels/order", self.stripes.order())
+        s.setValue("window/has_recording", True)
+        s.setValue("window/has_recording_dock", True)
+        s.setValue("recording/state", json.dumps(self.record_panel.state()))
         s.setValue("flatfield/path", self._flat_path or "")
         s.setValue("flatfield/on", self.flat_live_action.isChecked())
+
+    # --- camera connection --------------------------------------------------------
+
+    def _start_worker(self):
+        """Open the camera on a new background thread."""
+        self._set_camera_status("Connecting...")
+        w = CameraWorker(self.camera_index)
+        w.opened.connect(self._on_camera_opened)
+        w.open_failed.connect(self._on_open_failed)
+        w.frame_ready.connect(self._on_frame)
+        w.settings_changed.connect(self._on_camera_settings)
+        w.capture_started.connect(self._on_capture_started)
+        w.capture_done.connect(self._on_capture_done)
+        w.error.connect(self._on_error)
+        w.recording_changed.connect(self._on_recording_changed)
+        w.recording_progress.connect(self.record_panel.set_record_progress)
+        w.timelapse_progress.connect(self._on_timelapse_progress)
+        w.timelapse_finished.connect(self._on_timelapse_finished)
+        if self.flat_live_action.isChecked():  # turned on from saved settings or a settings file
+            w.set_flat_field(self.flat)
+        self.worker = w
+        w.start()
+
+    def _set_camera_status(self, text: str, style: str = "", tooltip: str = ""):
+        self.camera_status.setText(text)
+        self.camera_status.setStyleSheet(style)
+        self.camera_status.setToolTip(tooltip)
+
+    def _on_open_failed(self, message: str):
+        self.camera_open = False
+        self._set_camera_status("Not connected", "color: #c00; font-weight: bold;", message)
+        self.statusBar().showMessage(f"{message} Turn the camera on, then click Reconnect.")
+
+    def reconnect_camera(self):
+        """Close the camera (if open) and open it again."""
+        busy = self._busy_recording()
+        if busy and QMessageBox.question(
+            self, "Reconnect camera", f"{' and '.join(busy).capitalize()}. Stop it and reconnect?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.statusBar().showMessage("Reconnecting to the camera...")
+        self.worker.stop()  # closes the camera; a recording is finished and saved
+        self.camera_open = False
+        self.slider_box.setEnabled(False)
+        self.capture_action.setEnabled(False)
+        self.record_panel.set_enabled(False)
+        self._start_worker()
+
+    def _busy_recording(self) -> list[str]:
+        return [what for what, on in (("a video is recording", self.record_panel.record_button.isChecked()),
+                                      ("a time-lapse is running", self.record_panel.tl_button.isChecked())) if on]
 
     # --- camera events ------------------------------------------------------------
 
     def _on_camera_opened(self, ranges: dict):
         for name, slider in self.sliders.items():
             r = ranges.get(name)
+            slider.setEnabled(r is not None)
             if r is None:
-                slider.setEnabled(False)
                 continue
             slider.blockSignals(True)
             slider.setRange(r["min"], r["max"])
             slider.blockSignals(False)
-        self.cam_box.setEnabled(True)
+        self.camera_open = True
+        self._set_camera_status("Connected", "color: green;")
+        self.slider_box.setEnabled(True)
         self.capture_action.setEnabled(True)
+        self.record_panel.set_enabled(True)
         self.statusBar().showMessage("Camera open", 3000)
+        if self._pending_camera:
+            self._apply_camera_values(self._pending_camera)
+            self._pending_camera = None
 
     def _on_frame(self, frame):
         # Always acknowledge, so the worker sends the next frame.
@@ -494,6 +685,7 @@ class MainWindow(QMainWindow):
         self.size_label.setText(f"{w} x {h}")
 
     def _on_camera_settings(self, values: dict):
+        self._camera_values.update(values)
         for name, value in values.items():
             slider = self.sliders.get(name)
             if slider is None:
@@ -519,7 +711,7 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, message: str):
         # Capture stays disabled if the camera never opened.
-        self.capture_action.setEnabled(self.cam_box.isEnabled())
+        self.capture_action.setEnabled(self.camera_open)
         self.statusBar().showMessage(message)
         QMessageBox.warning(self, "CamControl", message)
 
@@ -541,6 +733,7 @@ class MainWindow(QMainWindow):
         if on:
             self._source = "live"
             self._result = None
+            self._close_video()
         else:
             self.fps_label.clear()
             self._frame_times.clear()
@@ -557,12 +750,13 @@ class MainWindow(QMainWindow):
         else:
             self.source_label.setText("Live" if self.live else "Frozen")
             self.source_label.setToolTip("")
+        self.compare.set_main_title(self.source_label.text(), self.source_label.toolTip())
 
     def _set_title(self, file_name: str | None = None):
-        if file_name:
-            self.setWindowTitle(f"CamControl - {file_name}")
-        else:
-            self.setWindowTitle(f"CamControl - {'live' if self.live else 'frozen'}")
+        title = f"CamControl - {file_name or ('live' if self.live else 'frozen')}"
+        if self.settings_path:
+            title += f"   [{Path(self.settings_path).stem}]"
+        self.setWindowTitle(title)
 
     def capture(self):
         self.worker.capture(
@@ -582,7 +776,7 @@ class MainWindow(QMainWindow):
             self.next_name_label.setText("Next: cap_<date>_<time>." + self.format_combo.currentData())
 
     def _choose_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Capture folder", self.folder_edit.text())
+        folder = QFileDialog.getExistingDirectory(self, "Output folder", self.folder_edit.text())
         if folder:
             self.folder_edit.setText(folder)
             self.gallery.set_folder(folder)
@@ -595,20 +789,24 @@ class MainWindow(QMainWindow):
 
     def open_image(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open image", self.folder_edit.text(),
-            "Images (*.tif *.tiff *.png *.jpg *.jpeg *.bmp);;All files (*)",
+            self, "Open image or video", self.folder_edit.text(),
+            "Images and videos (*.tif *.tiff *.png *.jpg *.jpeg *.bmp *.mp4 *.avi);;All files (*)",
         )
         if path:
             self.open_image_path(path)
 
     def open_image_path(self, path: str):
-        """Show an image file in the view (freezes the live feed)."""
+        """Show an image file in the view (freezes the live feed). Videos play."""
+        if is_video(path):
+            self.open_video_path(path)
+            return
         img = load_image_file(path)
         if img is None:
             QMessageBox.warning(self, "CamControl", f"Could not read {path}")
             return
         self._ask_clear_annotations("Open image")
         self._set_live(False)  # stop the camera feed replacing it
+        self._close_video()
         self.view.set_image(img)
         h, w = img.shape[:2]
         self.size_label.setText(f"{w} x {h}")
@@ -616,6 +814,30 @@ class MainWindow(QMainWindow):
         self._result = None
         self._set_title(self._source)
         self._show_source(path)
+
+    def open_video_path(self, path: str):
+        """Open a video under the player bar, paused on its first frame."""
+        self._ask_clear_annotations("Open video")
+        self._set_live(False)
+        if not self.player.open(path):  # shows the first frame via _on_video_frame
+            self._close_video()
+            QMessageBox.warning(self, "CamControl", f"Could not play {path}")
+            return
+        self.player.show()
+        self._source = Path(path).name
+        self._result = None
+        self._set_title(self._source)
+        self._show_source(path)
+        self.player.play()
+
+    def _on_video_frame(self, frame):
+        self.view.set_image(frame)
+        h, w = frame.shape[:2]
+        self.size_label.setText(f"{w} x {h}")
+
+    def _close_video(self):
+        self.player.close_video()
+        self.player.hide()
 
     def _ask_clear_annotations(self, title: str):
         """Measurements and counts belong to the image they were made on."""
@@ -647,6 +869,9 @@ class MainWindow(QMainWindow):
             meta.update(self._result["meta"])
         else:
             meta["source"] = self._source
+            if self.player.is_open:
+                self.player.pause()
+                meta["video_frame"] = self.player.position + 1
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             save_image_file(path, image)
@@ -668,6 +893,7 @@ class MainWindow(QMainWindow):
         """Show a processing result in the view, frozen and unsaved."""
         self._ask_clear_annotations(title)
         self._set_live(False)
+        self._close_video()
         self.view.set_image(image)
         h, w = image.shape[:2]
         self.size_label.setText(f"{w} x {h}")
@@ -689,7 +915,7 @@ class MainWindow(QMainWindow):
         dialog = self._dialogs[key]
         dialog.start_folder = self.folder_edit.text()
         if paths is None:
-            selected = self.gallery.selected_paths()
+            selected = [p for p in self.gallery.selected_paths() if not is_video(p)]
             paths = selected if len(selected) >= dialog.min_images else None
         if paths:
             dialog.set_paths(paths)
@@ -888,7 +1114,241 @@ class MainWindow(QMainWindow):
         )
         box.exec()
 
+    # --- settings files ------------------------------------------------------------------
+
+    def current_settings(self) -> dict:
+        data = {
+            "capture": {
+                "average": self.average_combo.currentData(),
+                "save_size": list(self.size_combo.currentData()),
+                "format": self.format_combo.currentData(),
+            },
+            "output": {"folder": self.folder_edit.text(), "name": self.name_edit.text()},
+            "flat_field": {"path": self._flat_path, "on": self.flat_live_action.isChecked()},
+            "recording": self.record_panel.state(),
+            "view": {"grid": self.grid_action.isChecked(), "crosshair": self.crosshair_action.isChecked()},
+        }
+        # What the camera last reported, or what's waiting to be applied.
+        camera = self._camera_values or self._pending_camera
+        if camera:
+            data["camera"] = {n: v for n, v in camera.items() if n in self.sliders}
+        return data
+
+    def _recent_settings(self) -> list[str]:
+        recent = self.settings.value("settings_files/recent", []) or []
+        if isinstance(recent, str):  # QSettings returns a lone string for a one-item list
+            recent = [recent]
+        return [p for p in recent if Path(p).is_file()]
+
+    def _remember_settings_file(self, path):
+        self.settings_path = str(path)
+        self.settings.setValue("settings_files/recent",
+                               settings_file.add_recent(self._recent_settings(), path))
+        self._set_title(None if self._source == "live" else self._source)
+
+    def _fill_recent_menu(self):
+        menu = self.recent_menu
+        menu.clear()
+        recent = self._recent_settings()
+        for path in recent:
+            menu.addAction(Path(path).name, lambda p=path: self.open_settings_path(p)).setToolTip(path)
+        if not recent:
+            menu.addAction("(none yet)").setEnabled(False)
+        else:
+            menu.addSeparator()
+            menu.addAction("Clear list", lambda: self.settings.setValue("settings_files/recent", []))
+        menu.setToolTipsVisible(True)
+
+    def _settings_start_folder(self) -> str:
+        if self.settings_path:
+            return str(Path(self.settings_path).parent)
+        return str(settings_file.SETTINGS_DIR)
+
+    def open_settings(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open settings", self._settings_start_folder(),
+                                              settings_file.FILE_FILTER)
+        if path:
+            self.open_settings_path(path)
+
+    def open_settings_path(self, path: str, quiet: bool = False):
+        try:
+            data = settings_file.load_settings_file(path)
+        except (OSError, ValueError) as e:
+            if not quiet:
+                QMessageBox.warning(self, "Open settings", f"Could not open {Path(path).name}: {e}")
+            return
+        problems = self.apply_settings(data)
+        self._remember_settings_file(path)
+        message = f"Settings: {Path(path).name}"
+        if problems:
+            message += ". " + " ".join(problems)
+        self.statusBar().showMessage(message, 8000)
+
+    def save_settings(self):
+        if not self.settings_path:
+            self.save_settings_as()
+            return
+        self._write_settings(self.settings_path)
+
+    def save_settings_as(self):
+        start = self.settings_path or str(settings_file.SETTINGS_DIR / "settings.json")
+        path, _ = QFileDialog.getSaveFileName(self, "Save settings as", start, settings_file.FILE_FILTER)
+        if not path:
+            return
+        if Path(path).suffix.lower() != ".json":
+            path += ".json"
+        self._write_settings(path)
+
+    def _write_settings(self, path: str):
+        try:
+            settings_file.save_settings_file(path, self.current_settings())
+        except OSError as e:
+            QMessageBox.warning(self, "Save settings", f"Could not save: {e}")
+            return
+        self._remember_settings_file(path)
+        self.statusBar().showMessage(f"Saved settings to {path}", 6000)
+
+    def apply_settings(self, data: dict) -> list[str]:
+        """Apply a settings file's contents. Returns notes about anything that couldn't be applied."""
+        problems = []
+        camera = data.get("camera")
+        if camera:
+            if self.camera_open:
+                self._apply_camera_values(camera)
+            else:
+                self._pending_camera = camera  # applied when the camera opens
+                problems.append("Camera settings will be applied when the camera opens.")
+
+        cap = data.get("capture", {})
+        for combo, value in ((self.average_combo, cap.get("average")),
+                             (self.size_combo, tuple(cap["save_size"]) if "save_size" in cap else None),
+                             (self.format_combo, cap.get("format"))):
+            i = combo.findData(value) if value is not None else -1
+            if i >= 0:
+                combo.setCurrentIndex(i)
+
+        flat = data.get("flat_field", {})
+        path = flat.get("path")
+        if path and Path(path).is_file():
+            if path != self._flat_path:
+                self._use_flat(path)
+            self._set_flat_live(bool(flat.get("on")))
+        else:
+            self._set_flat_live(False)
+            if path:
+                problems.append(f"Flat reference not found ({Path(path).name}); correction is off.")
+
+        if "recording" in data:
+            self.record_panel.set_state(data["recording"])
+
+        out = data.get("output", {})
+        if out.get("folder"):
+            self.folder_edit.setText(out["folder"])
+            self.gallery.set_folder(out["folder"])
+        if "name" in out:
+            self.name_edit.setText(out["name"])
+        self._update_next_name()
+
+        view = data.get("view", {})
+        for action, key, setter in ((self.grid_action, "grid", self.view.set_show_grid),
+                                    (self.crosshair_action, "crosshair", self.view.set_show_crosshair)):
+            if key in view:
+                action.setChecked(bool(view[key]))
+                setter(bool(view[key]))
+        return problems
+
+    def _apply_camera_values(self, values: dict):
+        for name, value in values.items():
+            slider = self.sliders.get(name)
+            if slider is not None and slider.isEnabled():
+                slider.setValue(int(value))  # sends it to the camera via _on_slider
+
+    # --- compare -------------------------------------------------------------------------
+
+    def _show_compare(self, on: bool):
+        self.compare_action.setChecked(on)
+        self.compare.set_comparing(on)
+
+    def compare_path(self, path: str):
+        if not self.compare.load(path):
+            QMessageBox.warning(self, "Compare", f"Could not read {path}")
+            return
+        self._show_compare(True)
+
+    def open_compare(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open image to compare", self.folder_edit.text(), FILE_FILTER)
+        if path:
+            self.compare_path(path)
+
+    def save_compare(self):
+        if self.view.image is None or self.compare.view.image is None:
+            QMessageBox.information(self, "Compare", "Open an image to compare first.")
+            return
+        left_name = self._source if self._source != "live" else "live"
+        right_name = Path(self.compare.path).name
+        default = next_capture_path(Path(self.folder_edit.text()), "compare", "png")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save side by side", str(default), "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)")
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() not in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
+            path = path.with_suffix(".png")
+        try:
+            save_image_file(path, side_by_side(self.view.image, self.compare.view.image, left_name, right_name))
+        except Exception as e:
+            QMessageBox.warning(self, "Compare", f"Save failed: {e}")
+            return
+        self.statusBar().showMessage(f"Saved {path}", 5000)
+
+    # --- video and time-lapse -----------------------------------------------------------
+
+    def _request_recording(self, start: bool):
+        if start:
+            self.worker.start_recording(Path(self.folder_edit.text()), clean_name(self.name_edit.text()),
+                                        **self.record_panel.video_settings())
+        else:
+            self.worker.stop_recording()
+
+    def _on_recording_changed(self, on: bool, path: str):
+        self.record_panel.set_recording(on, path)
+        if on:
+            self.statusBar().showMessage(f"Recording to {Path(path).name}...")
+        elif path:
+            self.statusBar().showMessage(f"Saved video {path}", 8000)
+            self._update_next_name()
+
+    def _request_timelapse(self, start: bool):
+        if not start:
+            self.worker.stop_timelapse()
+            return
+        opts = {
+            "n_frames": self.average_combo.currentData(),
+            "save_size": self.size_combo.currentData(),
+            "fmt": self.format_combo.currentData(),
+            "folder": Path(self.folder_edit.text()),
+            "name": clean_name(self.name_edit.text()),
+        }
+        self.worker.start_timelapse(self.record_panel.make_timelapse(), opts)
+        self.record_panel.set_timelapse_running(True)
+
+    def _on_timelapse_progress(self, taken: int, total: int, next_due: float, path: str):
+        self.record_panel.set_timelapse_progress(taken, total, next_due)
+        self.last_saved_label.setText(f"Saved {Path(path).name} (time-lapse)")
+        self._update_next_name()
+
+    def _on_timelapse_finished(self, message: str):
+        self.record_panel.set_timelapse_message(message)
+        self.statusBar().showMessage(message, 10000)
+        self._update_next_name()
+
     def closeEvent(self, event):
+        busy = self._busy_recording()
+        if busy and QMessageBox.question(
+            self, "Quit", f"{' and '.join(busy).capitalize()}. Stop and quit?"
+        ) != QMessageBox.StandardButton.Yes:
+            event.ignore()
+            return
         if self._job is not None:
             self._job.wait()  # let a running processing job finish first
         self._save_settings()
