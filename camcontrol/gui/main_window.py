@@ -77,7 +77,7 @@ from camcontrol.gui.tool_stripes import ToolStripes
 from camcontrol.gui.video_player import VideoPlayer
 from camcontrol.image_io import is_video, load_image_file, save_image_file
 from camcontrol.paths import LOGO
-from camcontrol.measure import compute
+from camcontrol.measure import CIRCLE_KINDS, compute
 from camcontrol.processing.count import Counter
 from camcontrol.processing.fiber_axis import analyse as analyse_fibers
 from camcontrol.processing.flatfield import FlatField
@@ -1209,7 +1209,7 @@ class MainWindow(QMainWindow):
             # Fibers marked with Circle measurements (in pixels, whatever the calibration).
             circles = []
             for m in pane.measurements:
-                if m.kind == "circle":
+                if m.kind in CIRCLE_KINDS:
                     r = compute(m)
                     circles.append((*r["center_px"], r["radius"]))
         axes = analyse_fibers(image, circles or None, method=self.fiber_panel.method(),
@@ -1226,7 +1226,7 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage(f"Found {len(axes)} fiber{'s' if len(axes) != 1 else ''}{note}.", 6000)
             else:
                 self.statusBar().showMessage(
-                    "No fibers found. Draw a Circle (3 pt) round the fiber in Measurements, then Find axes.", 10000)
+                    "No fibers found. Draw a Circle (3 pt or centre) round the fiber in Measurements, then Find axes.", 10000)
             if self.fiber_dock.isHidden():  # show the results (minimizing the others on its edge)
                 self.fiber_dock.toggleViewAction().trigger()
 

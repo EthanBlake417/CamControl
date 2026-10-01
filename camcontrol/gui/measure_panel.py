@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from camcontrol.calibration import PIXELS, Calibration
-from camcontrol.measure import KINDS, Measurement, compute, fmt
+from camcontrol.measure import CIRCLE_KINDS, KINDS, Measurement, compute, fmt
 
 HINT = ("Click points on the image. Polyline/polygon: double-click, right-click or Enter to finish. "
         "Backspace undoes a point, Esc cancels. Middle-drag pans.")
@@ -178,7 +178,7 @@ class MeasurePanel(QWidget):
             r = compute(m, self.calibration)
             length = r.get("length", r.get("perimeter"))
             details = ""
-            if m.kind == "circle":
+            if m.kind in CIRCLE_KINDS:
                 cx, cy = r["center_px"]
                 details = f"⌀ {fmt(r['diameter'])}, r {fmt(r['radius'])} {u}; centre ({cx:.1f}, {cy:.1f}) px"
             elif m.kind == "rectangle":

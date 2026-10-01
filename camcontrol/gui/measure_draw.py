@@ -16,7 +16,7 @@ from PySide6.QtGui import QColor, QFontMetricsF, QImage, QPainter, QPen, QPolygo
 
 from camcontrol.calibration import Calibration
 from camcontrol.gui.qt_image import to_qimage
-from camcontrol.measure import Measurement, compute, summary
+from camcontrol.measure import CIRCLE_KINDS, Measurement, compute, summary
 
 MEASURE_COLOR = QColor(0, 255, 0)
 SELECTED_COLOR = QColor(255, 140, 0)
@@ -62,7 +62,9 @@ def draw_measurement(painter: QPainter, m: Measurement, cal: Calibration, to_out
         corners = [to_out(QPointF(x, y)) for x, y in ((x0, y0), (x1, y0), (x1, y1), (x0, y1))]
         painter.drawPolygon(QPolygonF(corners))
         anchor = QPointF(min(c.x() for c in corners), min(c.y() for c in corners))
-    elif m.kind == "circle":
+    elif m.kind in CIRCLE_KINDS:
+        if m.kind == "circle_centre" and len(pts) == 2:
+            painter.drawLine(pts[0], pts[1])  # the radius being drawn out
         if results is not None:
             cx, cy = results["center_px"]
             centre = to_out(QPointF(cx, cy))

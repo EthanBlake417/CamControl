@@ -34,10 +34,13 @@ KINDS: dict[str, Kind] = {k.name: k for k in [
     Kind("line", "Line", 2, 2),
     Kind("polyline", "Polyline", None, 2),
     Kind("circle", "Circle (3 pt)", 3, 3),
+    Kind("circle_centre", "Circle (centre)", 2, 2),  # centre, then a point on the edge
     Kind("angle", "Angle", 3, 3),
     Kind("rectangle", "Rectangle", 2, 2),
     Kind("polygon", "Polygon", None, 3),
 ]}
+
+CIRCLE_KINDS = ("circle", "circle_centre")
 
 
 @dataclass
@@ -117,8 +120,13 @@ def compute(m: Measurement, cal: Calibration = PIXELS) -> dict:
     if m.kind == "polyline":
         return {"length": path_length(p)}
 
-    if m.kind == "circle":
-        cx, cy, r = circle_through(p[0], p[1], p[2])
+    if m.kind in CIRCLE_KINDS:
+        if m.kind == "circle":
+            cx, cy, r = circle_through(p[0], p[1], p[2])
+        else:
+            (cx, cy), r = p[0], distance(p[0], p[1])
+            if r == 0:
+                raise ValueError("the circle has zero radius")
         return {
             "radius": r,
             "diameter": 2 * r,
@@ -151,7 +159,7 @@ def summary(m: Measurement, results: dict, cal: Calibration = PIXELS) -> str:
     u = cal.unit
     if m.kind in ("line", "polyline"):
         return f"{fmt(results['length'])} {u}"
-    if m.kind == "circle":
+    if m.kind in CIRCLE_KINDS:
         return f"⌀ {fmt(results['diameter'])} {u}"
     if m.kind == "angle":
         return f"{fmt(results['angle_deg'])}°"
@@ -172,6 +180,9 @@ if __name__ == "__main__":
     c = compute(Measurement(1, "circle", [(0, 10), (10, 0), (-10, 0)]))
     check("circle radius", c["radius"], 10)
     check("circle centre x", c["center_px"][0], 0)
+    c = compute(Measurement(1, "circle_centre", [(5, 5), (8, 9)]))
+    check("centre circle radius", c["radius"], 5)
+    check("centre circle centre y", c["center_px"][1], 5)
     check("angle 90", compute(Measurement(1, "angle", [(10, 0), (0, 0), (0, 10)]))["angle_deg"], 90)
     check("angle 45", compute(Measurement(1, "angle", [(10, 0), (0, 0), (10, 10)]))["angle_deg"], 45)
     r = compute(Measurement(1, "rectangle", [(2, 3), (12, 8)]))

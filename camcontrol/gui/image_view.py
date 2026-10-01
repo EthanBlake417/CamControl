@@ -10,6 +10,7 @@ Mouse, no tool selected:
 
 Mouse and keys, with a measurement tool selected:
     left click    add a point (line/circle/angle/rectangle finish by themselves)
+    left drag     Circle (centre): press at the centre, release on the edge
     double-click, right-click or Enter
                   finish a polyline / polygon
     Backspace     remove the last point
@@ -50,6 +51,7 @@ CROSSHAIR_COLOR = QColor(255, 0, 0)
 CROSSHAIR_RADIUS_PX = 20  # on screen, whatever the zoom
 MARK_RADIUS_PX = 6        # counting marks, on screen
 REMOVE_RADIUS_PX = 15     # right-click removes a mark within this distance, on screen
+DRAG_MIN_PX = 6           # a press-release further apart than this (on screen) is a drag
 
 
 class ImageView(QGraphicsView):
@@ -90,6 +92,7 @@ class ImageView(QGraphicsView):
         self._points: list[tuple[float, float]] = []
         self._mouse: tuple[float, float] | None = None
         self._pan_from: QPointF | None = None  # middle-button pan
+        self._press_pos: QPointF | None = None  # where the last measuring click went down
 
         # Counting marks to draw (owned by the counting panel), and the class
         # being counted (None = not counting).
@@ -315,6 +318,7 @@ class ImageView(QGraphicsView):
         if self.tool and self._image is not None:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._points.append(self._to_image(event.position()))
+                self._press_pos = event.position()
                 if len(self._points) == KINDS[self.tool].n_points:
                     self._finish()
                 self.viewport().update()
@@ -352,6 +356,15 @@ class ImageView(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.MiddleButton:
             self._pan_from = None
+            return
+        # Circle (centre) dragged out from the centre: the release point is the edge.
+        # (A plain click leaves it waiting for a second click instead.)
+        press, self._press_pos = self._press_pos, None
+        if (event.button() == Qt.MouseButton.LeftButton and self.tool == "circle_centre"
+                and len(self._points) == 1 and press is not None
+                and (event.position() - press).manhattanLength() > DRAG_MIN_PX):
+            self._points.append(self._to_image(event.position()))
+            self._finish()
             return
         super().mouseReleaseEvent(event)
 

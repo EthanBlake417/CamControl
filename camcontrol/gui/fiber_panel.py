@@ -43,7 +43,7 @@ METHOD_TIPS = {
 
 HINT = ("Angles: 0° is horizontal, + is turned counter-clockwise, - clockwise (-90° to +90°). Solid magenta line: slow axis (through the "
         "stress rods / wedges / ellipse). Dashed yellow: fast axis. Fibers are found automatically; "
-        "for one that isn't, draw a Circle (3 pt) round it in Measurements, then Find axes.")
+        "for one that isn't, draw a Circle (3 pt or centre) round it in Measurements, then Find axes.")
 
 
 def signed_angle(deg: float) -> float:
