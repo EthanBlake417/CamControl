@@ -23,6 +23,7 @@ import json
 import os
 import time
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -77,6 +78,7 @@ from camcontrol.gui.video_player import VideoPlayer
 from camcontrol.image_io import is_video, load_image_file, save_image_file
 from camcontrol.paths import LOGO
 from camcontrol.measure import compute
+from camcontrol.processing.count import Counter
 from camcontrol.processing.fiber_axis import analyse as analyse_fibers
 from camcontrol.processing.flatfield import FlatField
 
@@ -95,6 +97,18 @@ PROCESS_DIALOGS = {
     "stitch": StitchDialog,
     "composite": FluorescenceDialog,
 }
+
+
+@dataclass
+class Pane:
+    """One image of the window (left = main view, right = compare view) and the
+    measurements, counting marks and fiber axes made on it. The panels show
+    whichever pane is active (the one clicked last)."""
+    view: ImageView
+    measurements: list
+    counter: Counter
+    next_id: int = 1
+    fiber_axes: list = field(default_factory=list)
 
 
 class MainWindow(QMainWindow):
@@ -145,6 +159,12 @@ class MainWindow(QMainWindow):
         self.count_panel = CountPanel()
         self.fiber_panel = FiberPanel()
         self._fiber_last = 0.0  # when the live view was last measured
+        # Left image, right (compare) image; the panels start on the left one.
+        self.panes = [
+            Pane(self.view, self.measure_panel.measurements, self.count_panel.counter),
+            Pane(self.compare.view, [], Counter(names=self.count_panel.counter.names)),
+        ]
+        self.active = 0
         self.gallery = GalleryPanel()
         self.record_panel = RecordPanel(self)  # the Video and Time-lapse tabs in Controls
 
@@ -265,16 +285,21 @@ class MainWindow(QMainWindow):
 
     def _build_measure_dock(self):
         panel = self.measure_panel
-        view = self.view
-        view.set_measurements(panel.measurements, panel.calibration)
+        for i, pane in enumerate(self.panes):
+            pane.view.set_measurements(pane.measurements, panel.calibration)
+            pane.view.activated.connect(lambda i=i: self.set_active(i))
+            pane.view.measurement_drawn.connect(self._on_measurement_drawn)
+            pane.view.tool_exit_requested.connect(lambda: panel.set_tool(None))
+            panel.tool_changed.connect(pane.view.set_tool)  # tools work on either image
 
-        panel.tool_changed.connect(view.set_tool)
-        panel.selection_changed.connect(view.set_selected)
-        panel.changed.connect(
-            lambda: view.set_measurements(panel.measurements, panel.calibration, panel.selected_id()))
+        def redraw():
+            for i, pane in enumerate(self.panes):  # calibration may have changed for both
+                selected = panel.selected_id() if i == self.active else None
+                pane.view.set_measurements(pane.measurements, panel.calibration, selected)
+
+        panel.selection_changed.connect(lambda sel: self._active_view().set_selected(sel))
+        panel.changed.connect(redraw)
         panel.export_requested.connect(self.export_measurements)
-        view.measurement_drawn.connect(self._on_measurement_drawn)
-        view.tool_exit_requested.connect(lambda: panel.set_tool(None))
         # Measuring and counting both use clicks, so only one is on at a time.
         panel.tool_changed.connect(lambda tool: tool and self.count_panel.set_counting(False))
 
@@ -283,21 +308,24 @@ class MainWindow(QMainWindow):
 
     def _build_count_dock(self):
         panel = self.count_panel
-        view = self.view
-        view.set_counter(panel.counter)
 
         def on_mode(cls):
             if cls is not None:
                 self.measure_panel.set_tool(None)
-            view.set_count_class(cls)
+            for pane in self.panes:
+                pane.view.set_count_class(cls)
 
         panel.mode_changed.connect(on_mode)
-        panel.changed.connect(view.viewport().update)
+        panel.changed.connect(lambda: self._active_view().viewport().update())
         panel.export_requested.connect(self.export_counts)
-        view.count_add.connect(panel.add)
-        view.count_remove.connect(panel.remove_near)
-        view.count_undo.connect(panel.undo)
-        view.tool_exit_requested.connect(lambda: panel.set_counting(False))
+        for pane in self.panes:
+            view = pane.view
+            view.set_counter(pane.counter)
+            # The click made this view active first, so the panel holds its marks.
+            view.count_add.connect(panel.add)
+            view.count_remove.connect(panel.remove_near)
+            view.count_undo.connect(panel.undo)
+            view.tool_exit_requested.connect(lambda: panel.set_counting(False))
 
         self.count_dock = self._add_dock("Counting", "count_dock", panel,
                                          Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+4")
@@ -306,7 +334,7 @@ class MainWindow(QMainWindow):
     def _build_fiber_dock(self):
         panel = self.fiber_panel
         panel.find_requested.connect(self.find_fiber_axes)
-        panel.changed.connect(lambda: self.view.set_fiber_axes(panel.axes, panel.selected()))
+        panel.changed.connect(lambda: self._active_view().set_fiber_axes(panel.axes, panel.selected()))
         panel.export_requested.connect(self.export_fiber_axes)
         panel.live_changed.connect(lambda on: on and self.find_fiber_axes())
         self.fiber_dock = self._add_dock("Fiber axis", "fiber_dock", panel,
@@ -708,7 +736,7 @@ class MainWindow(QMainWindow):
         # Fiber axes on the live view, a few times a second.
         if self.fiber_panel.live_check.isChecked() and now - self._fiber_last >= FIBER_LIVE_INTERVAL_S:
             self._fiber_last = now
-            self.find_fiber_axes(quiet=True)
+            self.find_fiber_axes(quiet=True, pane_index=0)  # the live image is the left one
 
     def _on_camera_settings(self, values: dict):
         self._camera_values.update(values)
@@ -865,8 +893,51 @@ class MainWindow(QMainWindow):
         self.player.close_video()
         self.player.hide()
 
+    # --- which image the panels work on --------------------------------------------
+
+    def _active_view(self) -> ImageView:
+        return self.panes[self.active].view
+
+    def _active_source(self) -> str:
+        """Name of the active image, for exports."""
+        if self.active == 1 and self.compare.path:
+            return Path(self.compare.path).name
+        return self._source
+
+    def set_active(self, index: int):
+        """Make the panels show (and work on) the left (0) or right (1) image."""
+        if index == self.active or (index == 1 and not self.compare.comparing):
+            return
+        old = self.panes[self.active]
+        old.next_id = self.measure_panel.next_id
+        old.fiber_axes = self.fiber_panel.axes
+        old.view.set_selected(None)
+        old.view.set_fiber_axes(old.fiber_axes)
+        self.active = index
+        new = self.panes[index]
+        self.measure_panel.set_state(new.measurements, new.next_id)
+        self.count_panel.set_counter(new.counter)
+        self.fiber_panel.set_axes(new.fiber_axes)
+        self.compare.set_active(index)
+        side = "right" if index else "left"
+        self.statusBar().showMessage(f"Working on the {side} image: {self._active_source()}", 4000)
+
+    def _clear_pane(self, index: int):
+        pane = self.panes[index]
+        pane.measurements.clear()
+        pane.next_id = 1
+        pane.counter.marks.clear()
+        pane.fiber_axes = []
+        pane.view.set_fiber_axes([])
+        if index == self.active:
+            self.measure_panel.set_state(pane.measurements, 1)
+            self.count_panel.set_counter(pane.counter)
+            self.fiber_panel.set_axes([])
+        pane.view.viewport().update()
+
     def _ask_clear_annotations(self, title: str):
         """Measurements and counts belong to the image they were made on."""
+        self.set_active(0)  # the left image is the one changing
         if not (self.measure_panel.measurements or self.count_panel.counter.marks):
             return
         if QMessageBox.question(
@@ -876,11 +947,12 @@ class MainWindow(QMainWindow):
             self.count_panel.clear(confirm=False)
 
     def save_image(self):
-        """Save the image in the view: a processing result, a frozen frame or a copy of a file."""
-        image = self.view.image
+        """Save the active image: a processing result, a frozen frame or a copy of a file."""
+        image = self._active_view().image
         if image is None:
             return
-        stem = self._result["short_name"] if self._result else "image"
+        on_right = self.active == 1
+        stem = self._result["short_name"] if self._result and not on_right else "image"
         default = next_capture_path(Path(self.folder_edit.text()), stem, "tif")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save image", str(default), "TIFF (*.tif);;PNG (*.png);;JPEG (*.jpg)")
@@ -891,7 +963,9 @@ class MainWindow(QMainWindow):
             path = path.with_suffix(".tif")
         meta = {"timestamp": datetime.now().isoformat(timespec="seconds"),
                 "saved_size": [image.shape[1], image.shape[0]]}
-        if self._result:
+        if on_right:
+            meta["source"] = self._active_source()
+        elif self._result:
             meta.update(self._result["meta"])
         else:
             meta["source"] = self._source
@@ -906,7 +980,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Save image", f"Save failed: {e}")
             return
         self.statusBar().showMessage(f"Saved {path}", 5000)
-        if self._result:  # it's a file now
+        if self._result and not on_right:  # it's a file now
             self._result = None
             self._source = path.name
             self._set_title(self._source)
@@ -1060,7 +1134,7 @@ class MainWindow(QMainWindow):
     def export_measurements(self):
         """Save the table (Excel or CSV) plus the image and an annotated copy."""
         panel = self.measure_panel
-        if not panel.measurements or self.view.image is None:
+        if not panel.measurements or self._active_view().image is None:
             QMessageBox.information(self, "Export", "There are no measurements to export.")
             return
         default = Path(self.folder_edit.text()) / f"measurements_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1074,9 +1148,10 @@ class MainWindow(QMainWindow):
         path.parent.mkdir(parents=True, exist_ok=True)
 
         cal = panel.calibration
-        image = self.view.image
+        image = self._active_view().image
+        source = self._active_source()
         try:
-            export_table(measurement_rows(panel.measurements, cal, self._source), path, cal, self._source)
+            export_table(measurement_rows(panel.measurements, cal, source), path, cal, source)
             # The exact image that was measured, and a copy with the shapes drawn on.
             image_path = path.with_name(f"{path.stem}_image.png")
             annotated_path = path.with_name(f"{path.stem}_annotated.png")
@@ -1092,7 +1167,7 @@ class MainWindow(QMainWindow):
     def export_counts(self):
         """Save the counts (Excel or CSV) plus the image and a copy with the marks."""
         counter = self.count_panel.counter
-        if not counter.marks or self.view.image is None:
+        if not counter.marks or self._active_view().image is None:
             QMessageBox.information(self, "Export counts", "There are no counts to export.")
             return
         default = Path(self.folder_edit.text()) / f"counts_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1104,9 +1179,9 @@ class MainWindow(QMainWindow):
         if path.suffix.lower() not in (".xlsx", ".csv"):
             path = path.with_suffix(".xlsx")
         path.parent.mkdir(parents=True, exist_ok=True)
-        image = self.view.image
+        image = self._active_view().image
         try:
-            counter.export(path, self._source)
+            counter.export(path, self._active_source())
             image_path = path.with_name(f"{path.stem}_image.png")
             marked_path = path.with_name(f"{path.stem}_marked.png")
             to_qimage(image).save(str(image_path))
@@ -1117,21 +1192,27 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Exported {len(counter.marks)} marks to {path.name}, {image_path.name} and {marked_path.name}", 8000)
 
-    def find_fiber_axes(self, quiet: bool = False):
-        """Measure the fiber axes in the image in the view."""
-        image = self.view.image
+    def find_fiber_axes(self, quiet: bool = False, pane_index: int | None = None):
+        """Measure the fiber axes in the active image (or the given pane's)."""
+        index = self.active if pane_index is None else pane_index
+        pane = self.panes[index]
+        image = pane.view.image
         if image is None:
             return
         circles = None
         if self.fiber_panel.use_circles.isChecked():
             # Fibers marked with Circle measurements (in pixels, whatever the calibration).
             circles = []
-            for m in self.measure_panel.measurements:
+            for m in pane.measurements:
                 if m.kind == "circle":
                     r = compute(m)
                     circles.append((*r["center_px"], r["radius"]))
         axes = analyse_fibers(image, circles or None)
-        self.fiber_panel.set_axes(axes)
+        if index == self.active:
+            self.fiber_panel.set_axes(axes)
+        else:  # e.g. live updates of the left image while the right one is active
+            pane.fiber_axes = axes
+            pane.view.set_fiber_axes(axes)
         if not quiet:
             if axes:
                 unclear = sum(not f.clear for f in axes)
@@ -1146,7 +1227,7 @@ class MainWindow(QMainWindow):
     def export_fiber_axes(self):
         """Save the fiber table (Excel or CSV) plus the image and a copy with the axes drawn."""
         panel = self.fiber_panel
-        if not panel.axes or self.view.image is None:
+        if not panel.axes or self._active_view().image is None:
             QMessageBox.information(self, "Export fiber axes", "There are no fiber axes to export. Click Find axes first.")
             return
         default = Path(self.folder_edit.text()) / f"fiber_axes_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1158,9 +1239,9 @@ class MainWindow(QMainWindow):
         if path.suffix.lower() not in (".xlsx", ".csv"):
             path = path.with_suffix(".xlsx")
         path.parent.mkdir(parents=True, exist_ok=True)
-        image = self.view.image
+        image = self._active_view().image
         try:
-            table = pd.DataFrame(panel.rows(self._source))
+            table = pd.DataFrame(panel.rows(self._active_source()))
             if path.suffix.lower() == ".xlsx":
                 table.to_excel(path, index=False, sheet_name="Fiber axes")
             else:
@@ -1350,13 +1431,17 @@ class MainWindow(QMainWindow):
     # --- compare -------------------------------------------------------------------------
 
     def _show_compare(self, on: bool):
+        if not on:
+            self.set_active(0)
         self.compare_action.setChecked(on)
         self.compare.set_comparing(on)
+        self.compare.set_active(self.active)
 
     def compare_path(self, path: str):
         if not self.compare.load(path):
             QMessageBox.warning(self, "Compare", f"Could not read {path}")
             return
+        self._clear_pane(1)  # its measurements and marks were on the previous image
         self._show_compare(True)
 
     def open_compare(self):

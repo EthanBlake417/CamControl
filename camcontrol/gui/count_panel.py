@@ -124,6 +124,11 @@ class CountPanel(QWidget):
     def _emit_mode(self):
         self.mode_changed.emit(self.active_class)
 
+    def set_counter(self, counter: Counter):
+        """Show another image's marks (class names are shared by all images)."""
+        self.counter = counter
+        self._refresh()
+
     # --- marks ----------------------------------------------------------------------------
 
     def add(self, x: float, y: float):

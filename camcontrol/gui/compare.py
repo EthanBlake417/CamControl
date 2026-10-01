@@ -62,6 +62,7 @@ def side_by_side(left: np.ndarray, right: np.ndarray, left_name: str, right_name
 def _title_label(text: str) -> QLabel:
     label = QLabel(text)
     label.setStyleSheet("font-weight: bold; padding: 2px 4px;")
+    label.setToolTip("Click an image to measure, count or find fiber axes on it.")
     # Cut long names short instead of widening the pane.
     label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
     return label
@@ -147,6 +148,12 @@ class CompareArea(QWidget):
         if on and not was:
             self.splitter.setSizes([10000, 10000])  # scaled to fit: two equal halves
             self.sync_from(self.main_view)
+
+    def set_active(self, index: int):
+        """Highlight the title of the image the panels work on (0 = left, 1 = right)."""
+        for i, title in enumerate((self.main_title, self.compare_title)):
+            background = " background: #cad8ef;" if i == index else ""
+            title.setStyleSheet(f"font-weight: bold; padding: 2px 4px;{background}")
 
     def set_main_title(self, text: str, tooltip: str = ""):
         self.main_title.setText(text)

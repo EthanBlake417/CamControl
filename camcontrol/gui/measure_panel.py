@@ -143,6 +143,17 @@ class MeasurePanel(QWidget):
         self._refresh_table()
         self.changed.emit()
 
+    def set_state(self, measurements: list[Measurement], next_id: int):
+        """Show another image's measurements (the list is used, not copied)."""
+        self.measurements = measurements
+        self._next_id = next_id
+        self._refresh_table()
+        self.changed.emit()
+
+    @property
+    def next_id(self) -> int:
+        return self._next_id
+
     def set_calibration(self, cal: Calibration):
         self.calibration = cal
         self._refresh_table()

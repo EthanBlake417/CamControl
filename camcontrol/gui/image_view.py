@@ -60,6 +60,7 @@ class ImageView(QGraphicsView):
     count_add = Signal(float, float)              # counting: left click at (x, y)
     count_remove = Signal(float, float, float)    # counting: right click at (x, y), max distance
     count_undo = Signal()                         # counting: Backspace
+    activated = Signal()                          # clicked: becomes the image the panels work on
 
     ZOOM_STEP = 1.25
     MIN_ZOOM = 0.05
@@ -299,6 +300,8 @@ class ImageView(QGraphicsView):
     # --- mouse and keys --------------------------------------------------------------
 
     def mousePressEvent(self, event):
+        # First, so the panels switch to this image before the click is used.
+        self.activated.emit()
         if event.button() == Qt.MouseButton.MiddleButton:
             self._pan_from = event.position()
             return
