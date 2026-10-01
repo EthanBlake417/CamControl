@@ -9,7 +9,7 @@ the image in the view and exports.
 import math
 
 from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -59,13 +59,17 @@ def fmt_angle(deg: float) -> str:
 
 
 def draw_fiber_axes(painter: QPainter, axes: list[FiberAxis], to_out, zoom: float, style: Style,
-                    selected: int | None = None):
-    """Each fiber's outline, slow axis (solid) and fast axis (dashed), with a label."""
+                    selected: int | None = None, show_parts: bool = True):
+    """Each fiber's outline, slow axis (solid) and fast axis (dashed), with a label.
+    With show_parts, also the stress parts found (shaded, a cross at each one's
+    centre) and the point the axis turns about (a small ring)."""
     for i, f in enumerate(axes):
         centre = to_out(QPointF(f.cx, f.cy))
         pivot = to_out(QPointF(*f.axis_point))
         r = f.radius * zoom
         width = style.line_width * (1.6 if i == selected else 1)
+        if show_parts:
+            draw_stress_parts(painter, f, to_out, width, style)
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.setPen(QPen(QColor(255, 255, 255, 160), max(1.0, width / 2), Qt.PenStyle.DotLine))
         painter.drawEllipse(centre, r, r)
@@ -75,20 +79,40 @@ def draw_fiber_axes(painter: QPainter, axes: list[FiberAxis], to_out, zoom: floa
             d = QPointF(math.cos(a), -math.sin(a)) * (r * LINE_LENGTH)  # screen y points down
             painter.setPen(QPen(color, width, dash))
             painter.drawLine(pivot - d, pivot + d)
+        if show_parts:  # the point the axis turns about
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(QColor(255, 255, 255), max(1.0, width / 2)))
+            painter.drawEllipse(pivot, style.marker * 1.5, style.marker * 1.5)
         # Label above the fiber (draw_label puts the text below-right of the point).
         text = f"{i + 1}: {fmt_angle(f.slow_deg)}°" + ("" if f.clear else " (unclear)")
         above = centre + QPointF(-r * 0.7, -r * LINE_LENGTH - style.font_px * 2.2)
         draw_label(painter, above, text, SLOW_COLOR, style)
 
 
-def render_fiber_axes(image, axes: list[FiberAxis]) -> QImage:
+def draw_stress_parts(painter: QPainter, f: FiberAxis, to_out, width: float, style: Style):
+    """The stress parts the axis was measured from: shaded outlines and a cross at each centre."""
+    fill = QColor(SLOW_COLOR)
+    fill.setAlpha(45)
+    painter.setBrush(fill)
+    painter.setPen(QPen(SLOW_COLOR, max(1.0, width / 2), Qt.PenStyle.DotLine))
+    for outline in f.parts:
+        painter.drawPolygon(QPolygonF([to_out(QPointF(x, y)) for x, y in outline]))
+    painter.setPen(QPen(SLOW_COLOR, width))
+    k = style.marker * 1.5
+    for x, y in f.part_centres:
+        c = to_out(QPointF(x, y))
+        painter.drawLine(c + QPointF(-k, -k), c + QPointF(k, k))
+        painter.drawLine(c + QPointF(-k, k), c + QPointF(k, -k))
+
+
+def render_fiber_axes(image, axes: list[FiberAxis], show_parts: bool = True) -> QImage:
     """A full-resolution copy of the image with the axes drawn on it."""
     qimg = to_qimage(image).convertToFormat(QImage.Format.Format_RGB32)
     w = image.shape[1]
     style = Style(line_width=max(2.0, w / 600), font_px=max(14, round(w / 60)))
     painter = QPainter(qimg)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    draw_fiber_axes(painter, axes, lambda p: p, 1.0, style)
+    draw_fiber_axes(painter, axes, lambda p: p, 1.0, style, show_parts=show_parts)
     painter.end()
     return qimg
 
@@ -131,6 +155,12 @@ class FiberPanel(QWidget):
             "(Mirror symmetry and Second moments; for stress parts off the fiber's middle).")
         self.parts_centre_check.toggled.connect(self.method_changed)
         left.addWidget(self.parts_centre_check)
+        self.show_parts_check = QCheckBox("Show stress parts")
+        self.show_parts_check.setChecked(True)
+        self.show_parts_check.setToolTip(
+            "Shade the stress parts the axis was measured from, with a cross at each one's centre,\n"
+            "and ring the point the axis turns about. Also used for the exported drawing.")
+        left.addWidget(self.show_parts_check)
         self.use_circles = QCheckBox("Use circle measurements")
         self.use_circles.setChecked(True)
         self.use_circles.setToolTip("If there are Circle measurements, measure the fibers inside them\n"

@@ -338,9 +338,15 @@ class MainWindow(QMainWindow):
         panel.changed.connect(lambda: self._active_view().set_fiber_axes(panel.axes, panel.selected()))
         panel.export_requested.connect(self.export_fiber_axes)
         panel.live_changed.connect(lambda on: on and self.find_fiber_axes())
+        panel.show_parts_check.toggled.connect(self._show_fiber_parts)
         self.fiber_dock = self._add_dock("Fiber axis", "fiber_dock", panel,
                                          Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+5")
         self.fiber_dock.hide()  # same edge as Measurements; its stripe button opens it
+
+    def _show_fiber_parts(self, on: bool):
+        for pane in self.panes:
+            pane.view.show_fiber_parts = on
+            pane.view.viewport().update()
 
     def _build_gallery_dock(self):
         self.gallery.open_requested.connect(self.open_image_path)
@@ -562,6 +568,7 @@ class MainWindow(QMainWindow):
         self.gallery.set_count(int(s.value("gallery/count", 12)))
         self.fiber_panel.set_method(s.value("fiber/method", "symmetry"))
         self.fiber_panel.parts_centre_check.setChecked(s.value("fiber/parts_centre", False, type=bool))
+        self.fiber_panel.show_parts_check.setChecked(s.value("fiber/show_parts", True, type=bool))
         try:
             self.record_panel.set_state(json.loads(s.value("recording/state", "{}")))
         except (ValueError, TypeError):
@@ -638,6 +645,7 @@ class MainWindow(QMainWindow):
         s.setValue("gallery/count", self.gallery.count)
         s.setValue("fiber/method", self.fiber_panel.method())
         s.setValue("fiber/parts_centre", self.fiber_panel.parts_centre_check.isChecked())
+        s.setValue("fiber/show_parts", self.fiber_panel.show_parts_check.isChecked())
         s.setValue("view/grid", self.grid_action.isChecked())
         s.setValue("view/crosshair", self.crosshair_action.isChecked())
         s.setValue("window/geometry", self.saveGeometry())
@@ -1255,7 +1263,7 @@ class MainWindow(QMainWindow):
             image_path = path.with_name(f"{path.stem}_image.png")
             drawn_path = path.with_name(f"{path.stem}_axes.png")
             to_qimage(image).save(str(image_path))
-            render_fiber_axes(image, panel.axes).save(str(drawn_path))
+            render_fiber_axes(image, panel.axes, panel.show_parts_check.isChecked()).save(str(drawn_path))
         except Exception as e:  # e.g. the file is open in Excel
             QMessageBox.warning(self, "Export fiber axes", f"Export failed: {e}")
             return

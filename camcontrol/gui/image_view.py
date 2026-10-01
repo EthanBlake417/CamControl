@@ -102,6 +102,7 @@ class ImageView(QGraphicsView):
         # Fiber axes to draw (from the Fiber axis panel) and the selected one.
         self.fiber_axes = []
         self.fiber_selected: int | None = None
+        self.show_fiber_parts = True
 
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -237,7 +238,8 @@ class ImageView(QGraphicsView):
         if self.counter is not None:
             draw_marks(painter, self.counter, to_out, MARK_RADIUS_PX)
         if self.fiber_axes:
-            draw_fiber_axes(painter, self.fiber_axes, to_out, self.zoom, style, self.fiber_selected)
+            draw_fiber_axes(painter, self.fiber_axes, to_out, self.zoom, style, self.fiber_selected,
+                            self.show_fiber_parts)
         painter.restore()
 
     def _preview(self) -> Measurement | None:

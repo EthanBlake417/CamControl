@@ -41,7 +41,7 @@ Run directly to test on an image (default: "Fiber Types.png"):
 
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -73,6 +73,8 @@ class FiberAxis:
     method: str = "moments"  # what the angle came from (see METHODS)
     axis_x: float | None = None  # point the axis goes through; None: the fiber centre
     axis_y: float | None = None
+    parts: list[np.ndarray] = field(default_factory=list)  # stress part outlines, (n, 2) image pixels
+    part_centres: list[tuple[float, float]] = field(default_factory=list)
 
     @property
     def axis_point(self) -> tuple[float, float]:
@@ -202,7 +204,11 @@ def measure_axis(image: np.ndarray, cx: float, cy: float, radius: float,
         px, py = x0 + (ax + bx) / 2, y0 + (ay + by) / 2
     elif not parts_centre:
         px = py = None
-    return FiberAxis(cx, cy, radius, angle, elongation, fiber_type, n_parts, used, px, py)
+    # For drawing: outlines simplified to ~0.5% of the radius, in image pixels.
+    outlines = [cv2.approxPolyDP(c, max(0.5, radius * 0.005), True).reshape(-1, 2).astype(np.float64) + (x0, y0)
+                for c in parts]
+    centres = [(x0 + x, y0 + y) for x, y in (_centroid(c) for c in parts)]
+    return FiberAxis(cx, cy, radius, angle, elongation, fiber_type, n_parts, used, px, py, outlines, centres)
 
 
 def _stress_parts(mask: np.ndarray, radius: float) -> list[np.ndarray]:
