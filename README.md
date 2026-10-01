@@ -46,7 +46,7 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 
 **Video and time-lapse** (the Video and Time-lapse tabs in Controls). **Video** records the live view to MP4 (small) or AVI (Motion JPEG: better quality, much larger), optionally stopping after a set time. Frames are repeated or skipped to match the chosen frame rate, so the video plays at real speed even though the camera's rate varies. **Time-lapse** takes a capture every N seconds/minutes/hours, for a set number of images or until stopped. It uses the Photo tab's averaging, size and format, and a `.json` for each image records its number and the interval. Optionally the images are joined into a video at the end. Files are saved to the Output folder with the Output name, continuing its numbering. Flat-field correction applies to both if it's on. Closing the app asks first while either is running.
 
-**Fiber axis** (panel at the bottom, Ctrl+5; also Measure → Find fiber axes). For polarization-maintaining fiber end faces (Panda, Bow-tie, Elliptical-clad), **Find axes** finds each fiber and draws its slow axis (solid magenta, through the stress rods / wedges / ellipse) and fast axis (dashed yellow, at 90°). The table lists the type, both angles (0° = horizontal, + = turned counter-clockwise, − = clockwise, from −90° to +90°), how clear the axis is, the centre and the diameter. Fibers are found automatically as round regions brighter or darker than the background; if one isn't, draw a **Circle (3 pt)** or **Circle (centre)** round it in Measurements and click Find axes again (with "Use circle measurements" on, only circled fibers are measured). **Update live** keeps measuring the live view about 4 times a second, e.g. while rotating a fiber into line. **Export** writes the table (Excel/CSV), the image and a copy with the axes drawn. Method: inside the cladding (leaving out the core and edge), pixels whose color clearly differs from the cladding are the stress parts. The **Method** box picks how the slow axis is found from them: **Mirror symmetry** (default: the line the end face is most mirror-symmetric about, together with the line at 90°), **Stress part centres** (the line through the centres of the two stress parts) or **Second moments** (principal axis of all stress-part pixels; the far corners of bow-tie wedges weigh most). On a fiber with lopsided stress parts these can differ by a few degrees. **Turn about stress parts** measures about the centre of the stress parts instead of the fiber centre (`camcontrol/processing/fiber_axis.py`, self-test: `python -m camcontrol.processing.fiber_axis`).
+**Fiber axis** (panel at the bottom, Ctrl+5; also Measure → Find fiber axes). For polarization-maintaining fiber end faces (Panda, Bow-tie, Elliptical-clad), **Find axes** finds each fiber and draws its slow axis (solid magenta, through the stress rods / wedges / ellipse) and fast axis (dashed yellow, at 90°). The table lists the type, both angles (0° = horizontal, + = turned counter-clockwise, − = clockwise, from −90° to +90°), how clear the axis is, the centre and the diameter. Fibers are found automatically as round regions brighter or darker than the background; if one isn't, draw a **Circle (3 pt)** or **Circle (centre)** round it in Measurements and click Find axes again (with "Use circle measurements" on, only circled fibers are measured). **Update live** keeps measuring the live view about 4 times a second, e.g. while rotating a fiber into line. **Export** writes the table (Excel/CSV), the image and a copy with the axes drawn. The **Method** box picks the formula for the slow axis (**Mirror symmetry**, the default; **Stress part centres**; or **Second moments**), and **Turn about stress parts** measures about the centre of the stress parts instead of the fiber centre. On a fiber with lopsided stress parts the methods can differ by a few degrees. How each one works: [Fiber axis formulas](#fiber-axis-formulas) (`camcontrol/processing/fiber_axis.py`, self-test: `python -m camcontrol.processing.fiber_axis`).
 
 **Processing** (Process menu, or select images in Captures and right-click). Results appear in the view marked "(unsaved)"; **File → Save image as** (Ctrl+S) saves them with a `.json` listing the input files and settings. All tools accept any image files, including full-size 3264x1836 SD card images, but the images in one run must be the same size (except for stitching).
 
@@ -76,6 +76,52 @@ venv\Scripts\python -m camcontrol.viewer
 | arrows | pan while zoomed |
 | `f` | toggle on-screen info |
 | `q` / Esc | quit |
+
+## Fiber axis formulas
+
+What the Fiber axis panel calculates, step by step (`camcontrol/processing/fiber_axis.py`). Coordinates are image pixels with $x$ to the right; $y$ is flipped to point up so angles read as on screen. Angles $\theta$ are counter-clockwise from horizontal.
+
+**1. Finding the fiber.** The image is blurred and split into bright and dark with Otsu's threshold. The program keeps outlines that are round ($4\pi A / P^2 > 0.75$, where $A$ is the area and $P$ the perimeter), fill their enclosing circle ($A / \pi r_{enc}^2 > 0.8$), are at least 5% of the image's short side in radius and don't touch the image edge. The centre $(c_x, c_y)$ is the centre of the smallest enclosing circle, and the radius is $R = \sqrt{A/\pi}$. If nothing is found this way, circle detection on edges (Hough) is used instead. A Circle measurement replaces this step when **Use circle measurements** is on.
+
+**2. Finding the stress parts.** Only a ring of the fiber is used: $0.12R < d < 0.92R$, where $d$ is the distance from the fiber centre. That leaves out the core and the cladding edge. Each pixel is converted to Lab color, and its difference from the cladding is
+
+$$D = \lVert \mathrm{Lab}_{pixel} - \mathrm{median}(\mathrm{Lab}_{ring}) \rVert$$
+
+$D$ is blurred (σ = $R/100$). The stress-part mask is the ring pixels with $D > \max(T_{Otsu}, 8)$: Otsu's threshold splits the ring into "like the cladding" and "not", and the minimum of 8 stops noise being picked up on a plain fiber. The mask works for colored stress parts and for dark gray ones.
+
+**3. The slow axis.** By the **Method** box:
+
+- **Second moments.** For the $N$ mask pixels at offsets $(x_i, y_i)$ from the pivot point:
+
+  $$\mu_{20} = \tfrac{1}{N}\textstyle\sum x_i^2, \quad \mu_{02} = \tfrac{1}{N}\sum y_i^2, \quad \mu_{11} = \tfrac{1}{N}\sum x_i y_i$$
+
+  $$\theta = \tfrac{1}{2}\,\mathrm{atan2}\!\left(2\mu_{11},\ \mu_{20} - \mu_{02}\right)$$
+
+  This is the long axis of the ellipse that best fits the mask. Each pixel counts by its distance squared, so the parts far from the centre (the outer corners of bow-tie wedges) decide the angle most.
+
+- **Stress part centres.** Small specks are removed (morphological opening, then parts smaller than $(0.08R)^2$ are dropped). Then the angle is that of the line through the centres $(a_x, a_y)$ and $(b_x, b_y)$ of the two largest parts:
+
+  $$\theta = \mathrm{atan2}\!\left(-(b_y - a_y),\ b_x - a_x\right)$$
+
+  Each part counts the same whatever its shape or size. With only one part (Elliptical-clad), Second moments is used instead, and the table's Method column says so.
+
+- **Mirror symmetry** (default). PM fibers are mirror-symmetric about both the slow and fast axes. The difference map $D$ inside the ring is scaled so the fiber's radius is about 200 px. For each candidate angle $\theta$, the map is turned by $-\theta$ about the pivot, so the candidate axis becomes horizontal. It is then compared with its own mirror images:
+
+  $$E(\theta) = \mathrm{mean}_{ring}\left(\,\lvert M - M_{\updownarrow} \rvert + \lvert M - M_{\leftrightarrow} \rvert\,\right)$$
+
+  Here $M$ is the turned map, $M_{\updownarrow}$ is $M$ flipped top to bottom (mirror about the candidate slow axis) and $M_{\leftrightarrow}$ is $M$ flipped left to right (mirror about the fast axis). The angle with the smallest $E$ wins. The search is ±20° around the Second moments angle in 1° steps, then ±1° in 0.05° steps. No threshold is involved, and one lopsided stress part pulls the result less than in the other methods. It takes about 1.5 times as long as the others.
+
+**Pivot.** Second moments and Mirror symmetry turn about the fiber centre $(c_x, c_y)$ by default. With **Turn about stress parts** on, they turn about the mask's centre $(\bar{x}, \bar{y})$ instead, and the offsets become $(x_i - \bar{x},\ y_i - \bar{y})$. Stress part centres always goes through the midpoint of the two centres. The axis lines are drawn through the point used, shown in the "Axis through" column.
+
+**4. Fast axis, signed angle and clarity.** The fast axis is $\theta + 90°$. The table shows angles from −90° to +90°: $\theta_{signed} = ((\theta + 90) \bmod 180) - 90$. **Clarity** comes from the second moments for every method. The spreads along and across the axis are the eigenvalues
+
+$$\lambda_{1,2} = \frac{\mu_{20} + \mu_{02}}{2} \pm \sqrt{\left(\frac{\mu_{20} - \mu_{02}}{2}\right)^2 + \mu_{11}^2}$$
+
+and clarity $= \sqrt{\lambda_1 / \lambda_2}$, the length-to-width ratio of the fitted ellipse. A value of 1 means round, so there's no axis; below 1.3 the result is marked "(unclear)".
+
+**5. Type guess.** One stress part means Elliptical. Two parts are Panda if both are round ($4\pi A / P^2 > 0.8$), otherwise Bow-tie. Any other count gives "?".
+
+**Example** (bow-tie images `36879B-00FBB-001.tif` and `-008.tif`, whose two wedges are slightly lopsided): Second moments −2.7°, Stress part centres −1.4°, Mirror symmetry +0.5°. All three follow a known rotation of the image to within 0.01°. They differ only in what they treat as "the axis" of an imperfect fiber.
 
 ## Hardware
 
