@@ -25,7 +25,7 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 | Ctrl+S | save the image in the view (e.g. a processing result, or a paused video frame) |
 | Ctrl+Shift+S | save settings (File → Save settings) |
 | Ctrl+E | export measurements |
-| Ctrl+K | side-by-side compare |
+| Ctrl+K | compare images in a grid |
 | Ctrl+1 / 2 / 3 / 4 / 5 | show / hide the Controls / Measurements / Captures / Counting / Fiber axis panel (also **View → Panels**, or the panel's × button). Side panels always run the full height of the window. |
 
 **Panels** work like PyCharm's tool windows. Each panel has a button with its name on a thin stripe along the edge it's on (left, right or bottom). Each edge shows one panel at a time: clicking a button opens that panel and minimizes the others on the same edge. Click it again, or the panel's **–** button, to minimize it so the image gets its space. Highlighted buttons are open panels. To move a panel, drag its button to another stripe (all three show while dragging, even empty ones), or along its stripe to change the order.
@@ -42,7 +42,7 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 
 **Settings files** (File menu: **Open settings**, **Open recent settings**, **Save settings** (Ctrl+Shift+S), **Save settings as**). Saves the whole setup to a `.json` file you name, e.g. `brightfield 10x.json`: camera sliders, Photo averaging/size/format, Output folder and name, flat-field reference and whether it's on, Video/Time-lapse settings, and grid/crosshair. They're saved to `settings/` by default, but can go anywhere and be copied to another PC. The most recently opened or saved file opens again when the app starts, and its name shows in the window title. Camera values in a file opened before the camera connects are applied as soon as it does. To delete a settings file, delete it in Explorer.
 
-**Compare** (View → Compare side by side, Ctrl+K, or right-click an image in Captures → Compare side by side). Shows a saved image next to the main view, which can be live, frozen, a file or a result. Both halves get the same space, each under its own name, with one button bar across the top. With **Link zoom/pan** on, zooming or panning either image does the same to the other. Images of different sizes are matched by position in the picture. **Save both** writes the two images side by side in one file, with their names on them.
+**Compare** (View → Compare images, Ctrl+K, or select images in Captures and right-click → Add to compare). Shows saved images in a grid with the main view, which can be live, frozen, a file or a result. **Add images...** adds more (up to 11, several at once), and the **×** above each one removes it. **Remove all** clears them; **Close** hides the grid but keeps the images for next time. The grid picks the number of columns that shows the images largest in the space there is, and every image gets the same space under its own name. Click an image to measure, count or find fiber axes on it: each image keeps its own measurements, marks and axes, and the highlighted name shows which one the panels are working on. With **Link zoom/pan** on, zooming or panning any image does the same to all the others. Images of different sizes are matched by position in the picture. **Save grid** writes all the images in one file, at the same height, with their names on them.
 
 **Video and time-lapse** (the Video and Time-lapse tabs in Controls). **Video** records the live view to MP4 (small) or AVI (Motion JPEG: better quality, much larger), optionally stopping after a set time. Frames are repeated or skipped to match the chosen frame rate, so the video plays at real speed even though the camera's rate varies. **Time-lapse** takes a capture every N seconds/minutes/hours, for a set number of images or until stopped. It uses the Photo tab's averaging, size and format, and a `.json` for each image records its number and the interval. Optionally the images are joined into a video at the end. Files are saved to the Output folder with the Output name, continuing its numbering. Flat-field correction applies to both if it's on. Closing the app asks first while either is running.
 
@@ -258,7 +258,7 @@ camcontrol/
 │   │   ├── count_panel.py   # Counting panel, drawing marks
 │   │   ├── process_dialogs.py # dialogs for focus stack, HDR, stitch, fluorescence
 │   │   ├── jobs.py          # runs processing in the background
-│   │   ├── compare.py       # side-by-side compare pane
+│   │   ├── compare.py       # compare grid
 │   │   ├── record_panel.py  # Video and Time-lapse tabs of the Controls panel
 │   │   ├── fiber_panel.py   # Fiber axis panel and drawing
 │   │   ├── video_player.py  # video playback bar

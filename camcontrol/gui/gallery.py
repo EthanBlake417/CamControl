@@ -85,7 +85,7 @@ class GalleryPanel(QWidget):
     open_requested = Signal(str)  # image path
     folder_changed = Signal()     # files in the folder were added, removed or changed
     process_requested = Signal(str, list)  # tool key (see PROCESS_TOOLS), image paths
-    compare_requested = Signal(str)        # show this image next to the main view
+    compare_requested = Signal(list)       # add these images to the compare grid
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -261,8 +261,10 @@ class GalleryPanel(QWidget):
         images = [p for p in selected if not is_video(p)]  # the tools work on images only
         menu = QMenu(self)
         menu.addAction("Play" if is_video(path) else "Open", lambda: self.open_requested.emit(path))
-        compare = menu.addAction("Compare side by side", lambda: self.compare_requested.emit(path))
-        compare.setEnabled(not is_video(path))
+        n = len(images)
+        compare = menu.addAction(f"Add to compare ({n} image{'s' if n != 1 else ''})",
+                                 lambda: self.compare_requested.emit(images))
+        compare.setEnabled(n > 0)
         menu.addAction("Show in Explorer",
                        lambda: subprocess.Popen(["explorer", "/select,", os.path.normpath(path)]))
         menu.addSeparator()

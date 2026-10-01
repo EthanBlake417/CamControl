@@ -12,7 +12,7 @@ Shortcuts:
     Ctrl+O      open an image file
     Ctrl+S      save the image in the view (e.g. a processing result)
     Ctrl+E      export measurements
-    Ctrl+K      side-by-side compare (right-click an image in Captures to pick it)
+    Ctrl+K      compare images in a grid (right-click images in Captures to add them)
     Ctrl+1..5   show / hide the Controls / Measurements / Captures / Counting / Fiber axis panel
 
 Processing tools (Process menu, or select images in Captures and right-click)
@@ -56,7 +56,7 @@ from camcontrol.capture import CAPTURE_DIR, HD2_SIZE, NATIVE_SIZE, clean_name, n
 from camcontrol.export import export_table, measurement_rows
 from camcontrol import settings_file
 from camcontrol.gui.camera_worker import CameraWorker
-from camcontrol.gui.compare import CompareArea, side_by_side
+from camcontrol.gui.compare import CompareArea, grid_image
 from camcontrol.gui.count_panel import CountPanel, render_marks
 from camcontrol.gui.fiber_panel import FiberPanel, render_fiber_axes
 from camcontrol.gui.gallery import GalleryPanel
@@ -101,7 +101,7 @@ PROCESS_DIALOGS = {
 
 @dataclass
 class Pane:
-    """One image of the window (left = main view, right = compare view) and the
+    """One image of the window (the main view, or a compare image) and the
     measurements, counting marks and fiber axes made on it. The panels show
     whichever pane is active (the one clicked last)."""
     view: ImageView
@@ -109,6 +109,7 @@ class Pane:
     counter: Counter
     next_id: int = 1
     fiber_axes: list = field(default_factory=list)
+    path: str | None = None  # compare images: the file shown
 
 
 class MainWindow(QMainWindow):
@@ -140,7 +141,7 @@ class MainWindow(QMainWindow):
         # PyCharm-style stripes along the edges: a button per panel to minimize / restore it.
         self.stripes = ToolStripes(self)
 
-        # The main view, with the compare view beside it (hidden until used).
+        # The main view, with the compare images round it in a grid (when comparing).
         # Under it, the video player bar (shown while a video is open).
         self.view = ImageView()
         self.compare = CompareArea(self.view)
@@ -159,11 +160,8 @@ class MainWindow(QMainWindow):
         self.count_panel = CountPanel()
         self.fiber_panel = FiberPanel()
         self._fiber_last = 0.0  # when the live view was last measured
-        # Left image, right (compare) image; the panels start on the left one.
-        self.panes = [
-            Pane(self.view, self.measure_panel.measurements, self.count_panel.counter),
-            Pane(self.compare.view, [], Counter(names=self.count_panel.counter.names)),
-        ]
+        # The main view first, then any compare images; the panels start on the main view.
+        self.panes = [Pane(self.view, self.measure_panel.measurements, self.count_panel.counter)]
         self.active = 0
         self.gallery = GalleryPanel()
         self.record_panel = RecordPanel(self)  # the Video and Time-lapse tabs in Controls
@@ -205,8 +203,8 @@ class MainWindow(QMainWindow):
         self.open_settings_action = self._action("Open se&ttings...", None, self.open_settings)
         self.save_settings_action = self._action("Save setti&ngs", "Ctrl+Shift+S", self.save_settings)
         self.save_settings_as_action = self._action("Save settings &as...", None, self.save_settings_as)
-        self.compare_action = self._action("&Compare side by side", "Ctrl+K", self._show_compare, checkable=True)
-        self.open_compare_action = self._action("Open image to co&mpare...", None, self.open_compare)
+        self.compare_action = self._action("&Compare images", "Ctrl+K", self._show_compare, checkable=True)
+        self.open_compare_action = self._action("Add images to co&mpare...", None, self.open_compare)
         self.quit_action = self._action("&Quit", "Ctrl+Q", self.close)
 
         self.live_action = self._action("&Live", "L", self._set_live, checkable=True)
@@ -285,12 +283,7 @@ class MainWindow(QMainWindow):
 
     def _build_measure_dock(self):
         panel = self.measure_panel
-        for i, pane in enumerate(self.panes):
-            pane.view.set_measurements(pane.measurements, panel.calibration)
-            pane.view.activated.connect(lambda i=i: self.set_active(i))
-            pane.view.measurement_drawn.connect(self._on_measurement_drawn)
-            pane.view.tool_exit_requested.connect(lambda: panel.set_tool(None))
-            panel.tool_changed.connect(pane.view.set_tool)  # tools work on either image
+        panel.tool_changed.connect(lambda tool: [p.view.set_tool(tool) for p in self.panes])  # tools work on any image
 
         def redraw():
             for i, pane in enumerate(self.panes):  # calibration may have changed for both
@@ -318,14 +311,6 @@ class MainWindow(QMainWindow):
         panel.mode_changed.connect(on_mode)
         panel.changed.connect(lambda: self._active_view().viewport().update())
         panel.export_requested.connect(self.export_counts)
-        for pane in self.panes:
-            view = pane.view
-            view.set_counter(pane.counter)
-            # The click made this view active first, so the panel holds its marks.
-            view.count_add.connect(panel.add)
-            view.count_remove.connect(panel.remove_near)
-            view.count_undo.connect(panel.undo)
-            view.tool_exit_requested.connect(lambda: panel.set_counting(False))
 
         self.count_dock = self._add_dock("Counting", "count_dock", panel,
                                          Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+4")
@@ -343,6 +328,27 @@ class MainWindow(QMainWindow):
                                          Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+5")
         self.fiber_dock.hide()  # same edge as Measurements; its stripe button opens it
 
+    def _connect_pane(self, pane: Pane):
+        """Hook an image's view up to the panels (the main view, or a compare image when added)."""
+        view = pane.view
+        view.set_measurements(pane.measurements, self.measure_panel.calibration)
+        view.activated.connect(lambda p=pane: self.set_active(self.panes.index(p)))
+        view.measurement_drawn.connect(self._on_measurement_drawn)
+        view.tool_exit_requested.connect(lambda: self.measure_panel.set_tool(None))
+        view.set_counter(pane.counter)
+        # The click made this view active first, so the panel holds its marks.
+        view.count_add.connect(self.count_panel.add)
+        view.count_remove.connect(self.count_panel.remove_near)
+        view.count_undo.connect(self.count_panel.undo)
+        view.tool_exit_requested.connect(lambda: self.count_panel.set_counting(False))
+        view.cursor_moved.connect(self._on_cursor)
+        # Join in whatever is going on (a measuring tool or counting picked already).
+        if self.view is not view:
+            view.set_tool(self.view.tool)
+            if self.view.count_class is not None:
+                view.set_count_class(self.view.count_class)
+            view.show_fiber_parts = self.view.show_fiber_parts
+
     def _show_fiber_parts(self, on: bool):
         for pane in self.panes:
             pane.view.show_fiber_parts = on
@@ -352,17 +358,19 @@ class MainWindow(QMainWindow):
         self.gallery.open_requested.connect(self.open_image_path)
         self.gallery.folder_changed.connect(self._update_next_name)
         self.gallery.process_requested.connect(self.run_process)
-        self.gallery.compare_requested.connect(self.compare_path)
+        self.gallery.compare_requested.connect(self.compare_paths)
         # On the left by default: each edge shows one panel at a time, and
         # Controls has the right.
         self.gallery_dock = self._add_dock("Captures", "gallery_dock", self.gallery,
                                            Qt.DockWidgetArea.LeftDockWidgetArea, "Ctrl+3")
 
     def _build_compare(self):
-        self.compare.open_requested.connect(self.open_compare)
+        self._connect_pane(self.panes[0])
+        self.compare.add_requested.connect(self.open_compare)
         self.compare.save_requested.connect(self.save_compare)
         self.compare.close_requested.connect(lambda: self._show_compare(False))
-        self.compare.view.cursor_moved.connect(self._on_cursor)
+        self.compare.remove_requested.connect(self.remove_compare)
+        self.compare.remove_all_requested.connect(self.remove_all_compare)
 
     def _place_gallery_default(self):
         """Default spot for the Captures panel: the left edge."""
@@ -553,7 +561,6 @@ class MainWindow(QMainWindow):
         for w in (self.cursor_label, self.zoom_label, self.size_label, self.fps_label, self.source_label):
             self.statusBar().addPermanentWidget(w)
         self.view.zoom_changed.connect(lambda z: self.zoom_label.setText(f"{z * 100:.0f}%"))
-        self.view.cursor_moved.connect(self._on_cursor)
 
     # --- settings ---------------------------------------------------------------
 
@@ -817,7 +824,7 @@ class MainWindow(QMainWindow):
         else:
             self.source_label.setText("Live" if self.live else "Frozen")
             self.source_label.setToolTip("")
-        self.compare.set_main_title(self.source_label.text(), self.source_label.toolTip())
+        self.compare.set_title(self.view, self.source_label.text(), self.source_label.toolTip())
 
     def _set_title(self, file_name: str | None = None):
         title = f"CamControl - {file_name or ('live' if self.live else 'frozen')}"
@@ -913,13 +920,12 @@ class MainWindow(QMainWindow):
 
     def _active_source(self) -> str:
         """Name of the active image, for exports."""
-        if self.active == 1 and self.compare.path:
-            return Path(self.compare.path).name
-        return self._source
+        path = self.panes[self.active].path
+        return Path(path).name if path else self._source
 
     def set_active(self, index: int):
-        """Make the panels show (and work on) the left (0) or right (1) image."""
-        if index == self.active or (index == 1 and not self.compare.comparing):
+        """Make the panels show (and work on) image index (0 = the main view)."""
+        if index == self.active or index >= len(self.panes) or (index > 0 and not self.compare.comparing):
             return
         old = self.panes[self.active]
         old.next_id = self.measure_panel.next_id
@@ -931,26 +937,13 @@ class MainWindow(QMainWindow):
         self.measure_panel.set_state(new.measurements, new.next_id)
         self.count_panel.set_counter(new.counter)
         self.fiber_panel.set_axes(new.fiber_axes)
-        self.compare.set_active(index)
-        side = "right" if index else "left"
-        self.statusBar().showMessage(f"Working on the {side} image: {self._active_source()}", 4000)
-
-    def _clear_pane(self, index: int):
-        pane = self.panes[index]
-        pane.measurements.clear()
-        pane.next_id = 1
-        pane.counter.marks.clear()
-        pane.fiber_axes = []
-        pane.view.set_fiber_axes([])
-        if index == self.active:
-            self.measure_panel.set_state(pane.measurements, 1)
-            self.count_panel.set_counter(pane.counter)
-            self.fiber_panel.set_axes([])
-        pane.view.viewport().update()
+        self.compare.set_active(new.view)
+        which = f"image {index + 1}" if index else "the main image"
+        self.statusBar().showMessage(f"Working on {which}: {self._active_source()}", 4000)
 
     def _ask_clear_annotations(self, title: str):
         """Measurements and counts belong to the image they were made on."""
-        self.set_active(0)  # the left image is the one changing
+        self.set_active(0)  # the main image is the one changing
         if not (self.measure_panel.measurements or self.count_panel.counter.marks):
             return
         if QMessageBox.question(
@@ -964,8 +957,8 @@ class MainWindow(QMainWindow):
         image = self._active_view().image
         if image is None:
             return
-        on_right = self.active == 1
-        stem = self._result["short_name"] if self._result and not on_right else "image"
+        on_compare = self.active != 0
+        stem = self._result["short_name"] if self._result and not on_compare else "image"
         default = next_capture_path(Path(self.folder_edit.text()), stem, "tif")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save image", str(default), "TIFF (*.tif);;PNG (*.png);;JPEG (*.jpg)")
@@ -1449,36 +1442,73 @@ class MainWindow(QMainWindow):
             self.set_active(0)
         self.compare_action.setChecked(on)
         self.compare.set_comparing(on)
-        self.compare.set_active(self.active)
+        self.compare.set_active(self._active_view())
+
+    def compare_paths(self, paths: list[str]):
+        """Add images to the compare grid (and show it)."""
+        failed, skipped = [], 0
+        for path in paths:
+            if self.compare.is_full():
+                skipped += 1
+                continue
+            img = load_image_file(path)
+            if img is None:
+                failed.append(Path(path).name)
+                continue
+            view = ImageView()
+            view.set_image(img)
+            pane = Pane(view, [], Counter(names=self.count_panel.counter.names), path=path)
+            self.panes.append(pane)
+            self._connect_pane(pane)
+            self.compare.add_view(view, Path(path).name, path)
+        self._show_compare(True)
+        if failed:
+            QMessageBox.warning(self, "Compare", "Could not read " + ", ".join(failed))
+        if skipped:
+            self.statusBar().showMessage(
+                f"The grid is full: {skipped} image{'s' if skipped != 1 else ''} not added. Remove some first.", 8000)
 
     def compare_path(self, path: str):
-        if not self.compare.load(path):
-            QMessageBox.warning(self, "Compare", f"Could not read {path}")
-            return
-        self._clear_pane(1)  # its measurements and marks were on the previous image
-        self._show_compare(True)
+        self.compare_paths([path])
 
     def open_compare(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open image to compare", self.folder_edit.text(), FILE_FILTER)
-        if path:
-            self.compare_path(path)
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add images to compare", self.folder_edit.text(), FILE_FILTER)
+        if paths:
+            self.compare_paths(paths)
+
+    def remove_compare(self, view: ImageView):
+        """Take an image out of the grid, with its measurements, marks and fiber axes."""
+        index = next(i for i, p in enumerate(self.panes) if p.view is view)
+        if index == 0:
+            return  # the main view stays
+        if index == self.active:
+            self.set_active(0)
+        elif index < self.active:
+            self.active -= 1
+        del self.panes[index]
+        self.compare.remove_view(view)
+        self.compare.set_active(self._active_view())
+
+    def remove_all_compare(self):
+        for pane in self.panes[1:]:
+            self.remove_compare(pane.view)
 
     def save_compare(self):
-        if self.view.image is None or self.compare.view.image is None:
-            QMessageBox.information(self, "Compare", "Open an image to compare first.")
+        panes = [p for p in self.panes if p.view.image is not None]
+        if len(panes) < 2:
+            QMessageBox.information(self, "Compare", "Add an image to compare first.")
             return
-        left_name = self._source if self._source != "live" else "live"
-        right_name = Path(self.compare.path).name
+        names = [Path(p.path).name if p.path else self._source for p in panes]
         default = next_capture_path(Path(self.folder_edit.text()), "compare", "png")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save side by side", str(default), "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)")
+            self, "Save grid", str(default), "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)")
         if not path:
             return
         path = Path(path)
         if path.suffix.lower() not in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
             path = path.with_suffix(".png")
         try:
-            save_image_file(path, side_by_side(self.view.image, self.compare.view.image, left_name, right_name))
+            save_image_file(path, grid_image([p.view.image for p in panes], names))
         except Exception as e:
             QMessageBox.warning(self, "Compare", f"Save failed: {e}")
             return
