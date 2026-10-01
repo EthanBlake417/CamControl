@@ -334,6 +334,7 @@ class MainWindow(QMainWindow):
     def _build_fiber_dock(self):
         panel = self.fiber_panel
         panel.find_requested.connect(self.find_fiber_axes)
+        panel.method_changed.connect(lambda: panel.axes and self.find_fiber_axes(quiet=True))
         panel.changed.connect(lambda: self._active_view().set_fiber_axes(panel.axes, panel.selected()))
         panel.export_requested.connect(self.export_fiber_axes)
         panel.live_changed.connect(lambda on: on and self.find_fiber_axes())
@@ -559,6 +560,8 @@ class MainWindow(QMainWindow):
         self.capture_tabs.setCurrentIndex(int(s.value("capture/tab", 0)))
         self.name_edit.setText(s.value("capture/name", ""))
         self.gallery.set_count(int(s.value("gallery/count", 12)))
+        self.fiber_panel.set_method(s.value("fiber/method", "symmetry"))
+        self.fiber_panel.parts_centre_check.setChecked(s.value("fiber/parts_centre", False, type=bool))
         try:
             self.record_panel.set_state(json.loads(s.value("recording/state", "{}")))
         except (ValueError, TypeError):
@@ -633,6 +636,8 @@ class MainWindow(QMainWindow):
         s.setValue("capture/tab", self.capture_tabs.currentIndex())
         s.setValue("capture/name", self.name_edit.text())
         s.setValue("gallery/count", self.gallery.count)
+        s.setValue("fiber/method", self.fiber_panel.method())
+        s.setValue("fiber/parts_centre", self.fiber_panel.parts_centre_check.isChecked())
         s.setValue("view/grid", self.grid_action.isChecked())
         s.setValue("view/crosshair", self.crosshair_action.isChecked())
         s.setValue("window/geometry", self.saveGeometry())
@@ -1207,7 +1212,8 @@ class MainWindow(QMainWindow):
                 if m.kind == "circle":
                     r = compute(m)
                     circles.append((*r["center_px"], r["radius"]))
-        axes = analyse_fibers(image, circles or None)
+        axes = analyse_fibers(image, circles or None, method=self.fiber_panel.method(),
+                              parts_centre=self.fiber_panel.parts_centre_check.isChecked())
         if index == self.active:
             self.fiber_panel.set_axes(axes)
         else:  # e.g. live updates of the left image while the right one is active

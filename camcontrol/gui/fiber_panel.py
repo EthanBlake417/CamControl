@@ -13,6 +13,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -25,11 +26,20 @@ from PySide6.QtWidgets import (
 
 from camcontrol.gui.measure_draw import Style, draw_label
 from camcontrol.gui.qt_image import to_qimage
-from camcontrol.processing.fiber_axis import FiberAxis
+from camcontrol.processing.fiber_axis import METHODS, FiberAxis
 
 SLOW_COLOR = QColor(255, 0, 200)   # magenta: shows on blue, white and black
 FAST_COLOR = QColor(255, 200, 0)
 LINE_LENGTH = 1.25                 # axis lines reach this many radii from the centre
+
+METHOD_TIPS = {
+    "symmetry": "The line the end face is most mirror-symmetric about (and at 90° to it).\n"
+                "No threshold; lopsided stress parts don't pull it.",
+    "centres": "The line through the centres of the two stress parts (Panda, Bow-tie).\n"
+               "Each part counts the same whatever its shape. Elliptical fibers use Second moments.",
+    "moments": "The principal axis of all stress-part pixels about the fiber centre.\n"
+               "Far pixels count most, so the outer corners of bow-tie wedges decide it.",
+}
 
 HINT = ("Angles: 0° is horizontal, + is turned counter-clockwise, - clockwise (-90° to +90°). Solid magenta line: slow axis (through the "
         "stress rods / wedges / ellipse). Dashed yellow: fast axis. Fibers are found automatically; "
@@ -53,6 +63,7 @@ def draw_fiber_axes(painter: QPainter, axes: list[FiberAxis], to_out, zoom: floa
     """Each fiber's outline, slow axis (solid) and fast axis (dashed), with a label."""
     for i, f in enumerate(axes):
         centre = to_out(QPointF(f.cx, f.cy))
+        pivot = to_out(QPointF(*f.axis_point))
         r = f.radius * zoom
         width = style.line_width * (1.6 if i == selected else 1)
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -63,7 +74,7 @@ def draw_fiber_axes(painter: QPainter, axes: list[FiberAxis], to_out, zoom: floa
             a = math.radians(deg)
             d = QPointF(math.cos(a), -math.sin(a)) * (r * LINE_LENGTH)  # screen y points down
             painter.setPen(QPen(color, width, dash))
-            painter.drawLine(centre - d, centre + d)
+            painter.drawLine(pivot - d, pivot + d)
         # Label above the fiber (draw_label puts the text below-right of the point).
         text = f"{i + 1}: {fmt_angle(f.slow_deg)}°" + ("" if f.clear else " (unclear)")
         above = centre + QPointF(-r * 0.7, -r * LINE_LENGTH - style.font_px * 2.2)
@@ -84,6 +95,7 @@ def render_fiber_axes(image, axes: list[FiberAxis]) -> QImage:
 
 class FiberPanel(QWidget):
     find_requested = Signal()
+    method_changed = Signal()       # method or "about stress parts" changed
     live_changed = Signal(bool)     # "Update live" toggled
     changed = Signal()              # results changed: redraw
     export_requested = Signal()
@@ -103,6 +115,22 @@ class FiberPanel(QWidget):
                                    "e.g. while rotating a fiber to line up its axis.")
         self.live_check.toggled.connect(self.live_changed)
         left.addWidget(self.live_check)
+        self.method_combo = QComboBox()
+        for i, (name, label) in enumerate(METHODS.items()):
+            self.method_combo.addItem(label, name)
+            self.method_combo.setItemData(i, METHOD_TIPS[name], Qt.ItemDataRole.ToolTipRole)
+        self.method_combo.setToolTip("How the axis angle is worked out. Hover over a choice for details.")
+        self.method_combo.currentIndexChanged.connect(self.method_changed)
+        method_row = QHBoxLayout()
+        method_row.addWidget(QLabel("Method:"))
+        method_row.addWidget(self.method_combo, stretch=1)
+        left.addLayout(method_row)
+        self.parts_centre_check = QCheckBox("Turn about stress parts")
+        self.parts_centre_check.setToolTip(
+            "Measure the axis about the centre of the stress parts instead of the fiber centre\n"
+            "(Mirror symmetry and Second moments; for stress parts off the fiber's middle).")
+        self.parts_centre_check.toggled.connect(self.method_changed)
+        left.addWidget(self.parts_centre_check)
         self.use_circles = QCheckBox("Use circle measurements")
         self.use_circles.setChecked(True)
         self.use_circles.setToolTip("If there are Circle measurements, measure the fibers inside them\n"
@@ -119,9 +147,9 @@ class FiberPanel(QWidget):
         layout.addLayout(left)
 
         right = QVBoxLayout()
-        self.table = QTableWidget(0, 7)
-        self.table.setHorizontalHeaderLabels(
-            ["#", "Type", "Slow axis (°)", "Fast axis (°)", "Clarity", "Centre (px)", "Diameter (px)"])
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels(["#", "Type", "Slow axis (°)", "Fast axis (°)", "Clarity", "Method",
+                                              "Centre (px)", "Axis through (px)", "Diameter (px)"])
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -139,6 +167,14 @@ class FiberPanel(QWidget):
         right.addWidget(hint)
         layout.addLayout(right, stretch=1)
 
+    def method(self) -> str:
+        return self.method_combo.currentData()
+
+    def set_method(self, name: str):
+        i = self.method_combo.findData(name)
+        if i >= 0:
+            self.method_combo.setCurrentIndex(i)
+
     def selected(self) -> int | None:
         rows = self.table.selectionModel().selectedRows()
         return rows[0].row() if rows else None
@@ -151,11 +187,11 @@ class FiberPanel(QWidget):
         self.table.setRowCount(len(self.axes))
         for row, f in enumerate(self.axes):
             values = [str(row + 1), f.fiber_type, fmt_angle(f.slow_deg), fmt_angle(f.fast_deg),
-                      f"{f.elongation:.2f}" + ("" if f.clear else " (unclear)"),
-                      f"{f.cx:.1f}, {f.cy:.1f}", f"{2 * f.radius:.1f}"]
+                      f"{f.elongation:.2f}" + ("" if f.clear else " (unclear)"), METHODS[f.method],
+                      f"{f.cx:.1f}, {f.cy:.1f}", "{:.1f}, {:.1f}".format(*f.axis_point), f"{2 * f.radius:.1f}"]
             for col, text in enumerate(values):
                 item = QTableWidgetItem(text)
-                if col in (2, 3, 4, 6):
+                if col in (2, 3, 4, 8):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, col, item)
         if keep is not None and keep < len(self.axes):
@@ -166,6 +202,8 @@ class FiberPanel(QWidget):
     def rows(self, source: str) -> list[dict]:
         return [{"#": i + 1, "Type": f.fiber_type, "Slow axis (deg)": round(signed_angle(f.slow_deg), 2),
                  "Fast axis (deg)": round(signed_angle(f.fast_deg), 2), "Clarity": round(f.elongation, 3),
+                 "Method": METHODS[f.method],
                  "Centre x (px)": round(f.cx, 1), "Centre y (px)": round(f.cy, 1),
+                 "Axis x (px)": round(f.axis_point[0], 1), "Axis y (px)": round(f.axis_point[1], 1),
                  "Diameter (px)": round(2 * f.radius, 1), "Image": source}
                 for i, f in enumerate(self.axes)]

@@ -12,9 +12,23 @@ How it's measured, for each fiber:
    clearly different from the cladding's usual color (Otsu threshold on the
    color distance). The core, in the middle, and the edge of the cladding
    are left out.
-3. Their principal axis (second moments about the fiber centre) is the slow
-   axis. How much longer the spread is along it than across it
-   ("elongation") says how clear the result is; near 1 means no clear axis.
+3. The slow axis through them, by one of three methods (METHODS):
+   - "symmetry": the line the end face is most mirror-symmetric about
+     (with the line at 90 degrees, as both are mirror axes). Uses the color
+     distance map directly, so no threshold, and lopsided stress parts
+     don't pull it. The default.
+   - "centres": the line through the centres of the two stress parts
+     (Panda, Bow-tie). Each part counts the same whatever its shape.
+     A single part (Elliptical) falls back to "moments".
+   - "moments": the principal axis (second moments about the fiber centre)
+     of all stress-part pixels. Pixels count by distance squared, so the
+     far corners of bow-tie wedges weigh most.
+   "symmetry" and "moments" turn about the fiber centre, or with
+   parts_centre=True about the centre of the stress parts (for stress parts
+   that sit off the fiber's middle); the axis lines are drawn through it.
+   How much longer the spread is along the axis than across it
+   ("elongation", from the moments) says how clear the result is; near 1
+   means no clear axis.
 4. Type guess from the stress parts' shape: one region round the core
    (Elliptical), two round blobs (Panda), two other shapes (Bow-tie).
 
@@ -38,6 +52,13 @@ from camcontrol.processing.common import as_bgr
 CORE_FRACTION = 0.12   # inner part of the radius left out (the core)
 EDGE_FRACTION = 0.92   # outer part left out (the cladding edge)
 MIN_ELONGATION = 1.3   # below this the axis isn't clear
+SYMMETRY_SIZE = 200    # radius (px) the fiber is scaled to for the symmetry search
+
+METHODS = {  # name: label in the panel
+    "symmetry": "Mirror symmetry",
+    "centres": "Stress part centres",
+    "moments": "Second moments",
+}
 
 
 @dataclass
@@ -49,6 +70,15 @@ class FiberAxis:
     elongation: float      # spread along / across the axis; >= 1
     fiber_type: str        # "Panda", "Bow-tie", "Elliptical" or "?"
     n_parts: int           # stress regions found
+    method: str = "moments"  # what the angle came from (see METHODS)
+    axis_x: float | None = None  # point the axis goes through; None: the fiber centre
+    axis_y: float | None = None
+
+    @property
+    def axis_point(self) -> tuple[float, float]:
+        if self.axis_x is None:
+            return self.cx, self.cy
+        return self.axis_x, self.axis_y
 
     @property
     def fast_deg(self) -> float:
@@ -119,7 +149,8 @@ def _find_hough_circles(image: np.ndarray, max_fibers: int = 10) -> list[tuple[f
     return found
 
 
-def measure_axis(image: np.ndarray, cx: float, cy: float, radius: float) -> FiberAxis:
+def measure_axis(image: np.ndarray, cx: float, cy: float, radius: float,
+                 method: str = "symmetry", parts_centre: bool = False) -> FiberAxis:
     """The slow axis of the fiber with cladding circle (cx, cy, radius)."""
     img = as_bgr(image)
     h, w = img.shape[:2]
@@ -144,6 +175,10 @@ def measure_axis(image: np.ndarray, cx: float, cy: float, radius: float) -> Fibe
 
     # Principal axis of the stress parts about the fiber centre.
     wx, wy = dx[mask], -dy[mask]  # y flipped: angles as seen on screen
+    px, py = cx, cy  # the point the axis turns about
+    if parts_centre and len(wx):
+        px, py = cx + wx.mean(), cy - wy.mean()
+        wx, wy = wx - wx.mean(), wy - wy.mean()
     if len(wx) < 20:
         return FiberAxis(cx, cy, radius, 0.0, 1.0, "?", 0)
     mu20, mu02, mu11 = (wx * wx).mean(), (wy * wy).mean(), (wx * wy).mean()
@@ -152,15 +187,39 @@ def measure_axis(image: np.ndarray, cx: float, cy: float, radius: float) -> Fibe
     along, across = (mu20 + mu02) / 2 + spread, (mu20 + mu02) / 2 - spread
     elongation = math.sqrt(along / max(across, 1e-9))
 
-    n_parts, fiber_type = _classify(mask.astype(np.uint8), radius)
-    return FiberAxis(cx, cy, radius, angle, elongation, fiber_type, n_parts)
+    parts = _stress_parts(mask.astype(np.uint8), radius)
+    n_parts, fiber_type = _classify(parts)
+    used = "moments"
+    if method == "centres" and len(parts) == 2:
+        (ax, ay), (bx, by) = (_centroid(c) for c in parts)
+        angle = math.degrees(math.atan2(-(by - ay), bx - ax)) % 180  # y flipped
+        used = "centres"
+    elif method == "symmetry":
+        angle = _symmetry_angle(diff, px - x0, py - y0, radius, angle)
+        used = "symmetry"
+    if used == "centres":
+        (ax, ay), (bx, by) = (_centroid(c) for c in parts)
+        px, py = x0 + (ax + bx) / 2, y0 + (ay + by) / 2
+    elif not parts_centre:
+        px = py = None
+    return FiberAxis(cx, cy, radius, angle, elongation, fiber_type, n_parts, used, px, py)
 
 
-def _classify(mask: np.ndarray, radius: float) -> tuple[int, str]:
+def _stress_parts(mask: np.ndarray, radius: float) -> list[np.ndarray]:
+    """Outlines of the stress parts, largest first, specks left out."""
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     min_area = (radius * 0.08) ** 2  # ignore specks
     parts = [c for c in contours if cv2.contourArea(c) >= min_area]
+    return sorted(parts, key=lambda c: -cv2.contourArea(c))
+
+
+def _centroid(contour: np.ndarray) -> tuple[float, float]:
+    m = cv2.moments(contour)
+    return m["m10"] / m["m00"], m["m01"] / m["m00"]
+
+
+def _classify(parts: list[np.ndarray]) -> tuple[int, str]:
     if len(parts) == 1:
         return 1, "Elliptical"
     if len(parts) == 2:
@@ -170,11 +229,38 @@ def _classify(mask: np.ndarray, radius: float) -> tuple[int, str]:
     return len(parts), "?"
 
 
-def analyse(image: np.ndarray, circles: list[tuple[float, float, float]] | None = None) -> list[FiberAxis]:
+def _symmetry_angle(diff: np.ndarray, cx: float, cy: float, radius: float, start_deg: float) -> float:
+    """The axis angle (degrees, 0-180) the map is most mirror-symmetric about,
+    together with the line at 90 degrees to it, searched near start_deg.
+    (cx, cy) is the fiber centre in diff's pixels."""
+    scale = min(1.0, SYMMETRY_SIZE / radius)
+    half = int(radius * EDGE_FRACTION * scale)
+    size = 2 * half + 1  # odd, so the centre is a pixel and flipping keeps it in place
+    yy, xx = np.mgrid[-half:half + 1, -half:half + 1]
+    d = np.hypot(xx, yy)
+    disk = (d < half) & (d > radius * scale * CORE_FRACTION)
+    src = diff.astype(np.float32)
+
+    def error(deg: float) -> float:
+        # Scale and turn the map so the candidate axis is horizontal and the
+        # fiber centre is the middle pixel, then compare with both mirror images.
+        m = cv2.getRotationMatrix2D((cx, cy), -deg, scale)  # -deg: on screen y points down
+        m[0, 2] += half - cx
+        m[1, 2] += half - cy
+        rot = cv2.warpAffine(src, m, (size, size), flags=cv2.INTER_LINEAR)
+        return float((np.abs(rot - rot[::-1]) + np.abs(rot - rot[:, ::-1]))[disk].mean())
+
+    best = min(np.arange(start_deg - 20, start_deg + 20.01, 1.0), key=error)
+    best = min(np.arange(best - 1, best + 1.001, 0.05), key=error)
+    return float(best) % 180
+
+
+def analyse(image: np.ndarray, circles: list[tuple[float, float, float]] | None = None,
+            method: str = "symmetry", parts_centre: bool = False) -> list[FiberAxis]:
     """Axes of the given fibers, or of every fiber found in the image."""
     if not circles:
         circles = find_fibers(image)
-    return [measure_axis(image, *c) for c in circles]
+    return [measure_axis(image, *c, method=method, parts_centre=parts_centre) for c in circles]
 
 
 if __name__ == "__main__":
@@ -183,8 +269,9 @@ if __name__ == "__main__":
     path = sys.argv[1] if len(sys.argv) > 1 else str(Path(__file__).resolve().parents[2] / "Fiber Types.png")
     img = load_image_file(path)
     for f in sorted(analyse(img), key=lambda f: f.cx):
-        print(f"fiber at ({f.cx:.0f}, {f.cy:.0f}) r {f.radius:.0f}: {f.fiber_type:10} slow axis {f.slow_deg:6.1f} deg, "
-              f"fast {f.fast_deg:6.1f} deg, elongation {f.elongation:.2f}, parts {f.n_parts}")
+        others = "  ".join(f"{m} {measure_axis(img, f.cx, f.cy, f.radius, m).slow_deg:6.2f}" for m in METHODS)
+        print(f"fiber at ({f.cx:.0f}, {f.cy:.0f}) r {f.radius:.0f}: {f.fiber_type:10} fast {f.fast_deg:6.1f} deg, "
+              f"elongation {f.elongation:.2f}, parts {f.n_parts}; slow axis by method: {others}")
 
     # Self-test: a drawn Panda fiber rotated to known angles.
     for true_angle in (0, 30, 75, 120):
@@ -194,7 +281,8 @@ if __name__ == "__main__":
         for s in (-1, 1):
             cv2.circle(test, (round(200 + s * 75 * math.cos(a)), round(200 - s * 75 * math.sin(a))), 35, (200, 120, 30), -1)
         cv2.circle(test, (200, 200), 8, (60, 220, 240), -1)
-        f = measure_axis(test, 200, 200, 150)
-        err = min(abs(f.slow_deg - true_angle), 180 - abs(f.slow_deg - true_angle))
-        assert err < 2 and f.fiber_type == "Panda", (true_angle, f)
+        for method in METHODS:
+            f = measure_axis(test, 200, 200, 150, method)
+            err = min(abs(f.slow_deg - true_angle), 180 - abs(f.slow_deg - true_angle))
+            assert err < 2 and f.fiber_type == "Panda" and f.method == method, (true_angle, method, f)
     print("fiber_axis OK")
