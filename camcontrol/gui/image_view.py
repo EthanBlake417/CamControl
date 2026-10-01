@@ -34,6 +34,7 @@ from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
 from camcontrol.calibration import PIXELS, Calibration
 from camcontrol.gui.count_panel import draw_marks
+from camcontrol.gui.fiber_panel import draw_fiber_axes
 from camcontrol.gui.measure_draw import (
     MEASURE_COLOR,
     PREVIEW_COLOR,
@@ -93,6 +94,10 @@ class ImageView(QGraphicsView):
         # being counted (None = not counting).
         self.counter = None
         self.count_class: int | None = None
+
+        # Fiber axes to draw (from the Fiber axis panel) and the selected one.
+        self.fiber_axes = []
+        self.fiber_selected: int | None = None
 
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -227,6 +232,8 @@ class ImageView(QGraphicsView):
             draw_measurement(painter, preview, self.calibration, to_out, self.zoom, PREVIEW_COLOR, style)
         if self.counter is not None:
             draw_marks(painter, self.counter, to_out, MARK_RADIUS_PX)
+        if self.fiber_axes:
+            draw_fiber_axes(painter, self.fiber_axes, to_out, self.zoom, style, self.fiber_selected)
         painter.restore()
 
     def _preview(self) -> Measurement | None:
@@ -248,6 +255,11 @@ class ImageView(QGraphicsView):
         if kind:
             self.count_class = None  # one clicking mode at a time
         self._update_mode()
+
+    def set_fiber_axes(self, axes, selected=None):
+        self.fiber_axes = axes
+        self.fiber_selected = selected
+        self.viewport().update()
 
     def set_counter(self, counter):
         self.counter = counter

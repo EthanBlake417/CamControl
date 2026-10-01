@@ -13,7 +13,7 @@ Shortcuts:
     Ctrl+S      save the image in the view (e.g. a processing result)
     Ctrl+E      export measurements
     Ctrl+K      side-by-side compare (right-click an image in Captures to pick it)
-    Ctrl+1..4   show / hide the Controls / Measurements / Captures / Counting panel
+    Ctrl+1..5   show / hide the Controls / Measurements / Captures / Counting / Fiber axis panel
 
 Processing tools (Process menu, or select images in Captures and right-click)
 show their result in the view, unsaved, until you press Ctrl+S.
@@ -26,6 +26,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
+import pandas as pd
 from PySide6.QtCore import QSettings, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
@@ -56,6 +57,7 @@ from camcontrol import settings_file
 from camcontrol.gui.camera_worker import CameraWorker
 from camcontrol.gui.compare import CompareArea, side_by_side
 from camcontrol.gui.count_panel import CountPanel, render_marks
+from camcontrol.gui.fiber_panel import FiberPanel, render_fiber_axes
 from camcontrol.gui.gallery import GalleryPanel
 from camcontrol.gui.image_view import ImageView
 from camcontrol.gui.jobs import run_job
@@ -74,6 +76,8 @@ from camcontrol.gui.tool_stripes import ToolStripes
 from camcontrol.gui.video_player import VideoPlayer
 from camcontrol.image_io import is_video, load_image_file, save_image_file
 from camcontrol.paths import LOGO
+from camcontrol.measure import compute
+from camcontrol.processing.fiber_axis import analyse as analyse_fibers
 from camcontrol.processing.flatfield import FlatField
 
 AVERAGE_CHOICES = [1, 4, 8, 16, 32]
@@ -83,6 +87,7 @@ SAVE_SIZES = [
 ]
 FORMATS = [("TIFF", "tif"), ("PNG", "png")]
 FLAT_DIR = CAPTURE_DIR.parent / "flats"  # flat-field references taken in the app
+FIBER_LIVE_INTERVAL_S = 0.25  # how often "Update live" re-measures fiber axes
 # Process menu / Captures right-click tools: key -> dialog class.
 PROCESS_DIALOGS = {
     "stack": FocusStackDialog,
@@ -138,6 +143,8 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(centre)
         self.measure_panel = MeasurePanel()
         self.count_panel = CountPanel()
+        self.fiber_panel = FiberPanel()
+        self._fiber_last = 0.0  # when the live view was last measured
         self.gallery = GalleryPanel()
         self.record_panel = RecordPanel(self)  # the Video and Time-lapse tabs in Controls
 
@@ -146,6 +153,7 @@ class MainWindow(QMainWindow):
         self._build_controls()
         self._build_measure_dock()
         self._build_count_dock()
+        self._build_fiber_dock()
         self._build_gallery_dock()
         self._build_compare()
         self._build_status_bar()
@@ -194,6 +202,8 @@ class MainWindow(QMainWindow):
         self.clear_measurements_action = self._action(
             "&Clear measurements", None, lambda: self.measure_panel.clear())
         self.export_counts_action = self._action("Export &counts...", None, self.export_counts)
+        self.find_fibers_action = self._action("Find &fiber axes", None, self.find_fiber_axes)
+        self.export_fibers_action = self._action("Export fiber a&xes...", None, self.export_fiber_axes)
 
         self.process_actions = {
             key: self._action(dialog.title + "...", None, lambda _=False, k=key: self.run_process(k))
@@ -239,6 +249,8 @@ class MainWindow(QMainWindow):
         m.addActions([self.export_action, self.clear_measurements_action])
         m.addSeparator()
         m.addAction(self.export_counts_action)
+        m.addSeparator()
+        m.addActions([self.find_fibers_action, self.export_fibers_action])
 
         m = self.menuBar().addMenu("&Process")
         flat_menu = m.addMenu("&Flat-field correction")
@@ -290,6 +302,16 @@ class MainWindow(QMainWindow):
         self.count_dock = self._add_dock("Counting", "count_dock", panel,
                                          Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+4")
         self.count_dock.hide()  # same edge as Measurements; its stripe button opens it
+
+    def _build_fiber_dock(self):
+        panel = self.fiber_panel
+        panel.find_requested.connect(self.find_fiber_axes)
+        panel.changed.connect(lambda: self.view.set_fiber_axes(panel.axes, panel.selected()))
+        panel.export_requested.connect(self.export_fiber_axes)
+        panel.live_changed.connect(lambda on: on and self.find_fiber_axes())
+        self.fiber_dock = self._add_dock("Fiber axis", "fiber_dock", panel,
+                                         Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+5")
+        self.fiber_dock.hide()  # same edge as Measurements; its stripe button opens it
 
     def _build_gallery_dock(self):
         self.gallery.open_requested.connect(self.open_image_path)
@@ -683,6 +705,10 @@ class MainWindow(QMainWindow):
                 self.fps_label.setText(f"{(len(self._frame_times) - 1) / span:.1f} fps")
         h, w = frame.shape[:2]
         self.size_label.setText(f"{w} x {h}")
+        # Fiber axes on the live view, a few times a second.
+        if self.fiber_panel.live_check.isChecked() and now - self._fiber_last >= FIBER_LIVE_INTERVAL_S:
+            self._fiber_last = now
+            self.find_fiber_axes(quiet=True)
 
     def _on_camera_settings(self, values: dict):
         self._camera_values.update(values)
@@ -1090,6 +1116,64 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(
             f"Exported {len(counter.marks)} marks to {path.name}, {image_path.name} and {marked_path.name}", 8000)
+
+    def find_fiber_axes(self, quiet: bool = False):
+        """Measure the fiber axes in the image in the view."""
+        image = self.view.image
+        if image is None:
+            return
+        circles = None
+        if self.fiber_panel.use_circles.isChecked():
+            # Fibers marked with Circle measurements (in pixels, whatever the calibration).
+            circles = []
+            for m in self.measure_panel.measurements:
+                if m.kind == "circle":
+                    r = compute(m)
+                    circles.append((*r["center_px"], r["radius"]))
+        axes = analyse_fibers(image, circles or None)
+        self.fiber_panel.set_axes(axes)
+        if not quiet:
+            if axes:
+                unclear = sum(not f.clear for f in axes)
+                note = f" ({unclear} unclear)" if unclear else ""
+                self.statusBar().showMessage(f"Found {len(axes)} fiber{'s' if len(axes) != 1 else ''}{note}.", 6000)
+            else:
+                self.statusBar().showMessage(
+                    "No fibers found. Draw a Circle (3 pt) round the fiber in Measurements, then Find axes.", 10000)
+            if self.fiber_dock.isHidden():  # show the results (minimizing the others on its edge)
+                self.fiber_dock.toggleViewAction().trigger()
+
+    def export_fiber_axes(self):
+        """Save the fiber table (Excel or CSV) plus the image and a copy with the axes drawn."""
+        panel = self.fiber_panel
+        if not panel.axes or self.view.image is None:
+            QMessageBox.information(self, "Export fiber axes", "There are no fiber axes to export. Click Find axes first.")
+            return
+        default = Path(self.folder_edit.text()) / f"fiber_axes_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export fiber axes", str(default), "Excel (*.xlsx);;CSV (*.csv)")
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() not in (".xlsx", ".csv"):
+            path = path.with_suffix(".xlsx")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        image = self.view.image
+        try:
+            table = pd.DataFrame(panel.rows(self._source))
+            if path.suffix.lower() == ".xlsx":
+                table.to_excel(path, index=False, sheet_name="Fiber axes")
+            else:
+                table.to_csv(path, index=False, encoding="utf-8-sig")
+            image_path = path.with_name(f"{path.stem}_image.png")
+            drawn_path = path.with_name(f"{path.stem}_axes.png")
+            to_qimage(image).save(str(image_path))
+            render_fiber_axes(image, panel.axes).save(str(drawn_path))
+        except Exception as e:  # e.g. the file is open in Excel
+            QMessageBox.warning(self, "Export fiber axes", f"Export failed: {e}")
+            return
+        self.statusBar().showMessage(
+            f"Exported {len(panel.axes)} fibers to {path.name}, {image_path.name} and {drawn_path.name}", 8000)
 
     def _on_cursor(self, info):
         if info is None:

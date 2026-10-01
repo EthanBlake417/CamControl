@@ -26,7 +26,7 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 | Ctrl+Shift+S | save settings (File → Save settings) |
 | Ctrl+E | export measurements |
 | Ctrl+K | side-by-side compare |
-| Ctrl+1 / 2 / 3 / 4 | show / hide the Controls / Measurements / Captures / Counting panel (also **View → Panels**, or the panel's × button). Side panels always run the full height of the window. |
+| Ctrl+1 / 2 / 3 / 4 / 5 | show / hide the Controls / Measurements / Captures / Counting / Fiber axis panel (also **View → Panels**, or the panel's × button). Side panels always run the full height of the window. |
 
 **Panels** work like PyCharm's tool windows. Each panel has a button with its name on a thin stripe along the edge it's on (left, right or bottom). Each edge shows one panel at a time: clicking a button opens that panel and minimizes the others on the same edge. Click it again, or the panel's **–** button, to minimize it so the image gets its space. Highlighted buttons are open panels. To move a panel, drag its button to another stripe (all three show while dragging, even empty ones), or along its stripe to change the order.
 
@@ -45,6 +45,8 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 **Compare** (View → Compare side by side, Ctrl+K, or right-click an image in Captures → Compare side by side). Shows a saved image next to the main view, which can be live, frozen, a file or a result. Both halves get the same space, each under its own name, with one button bar across the top. With **Link zoom/pan** on, zooming or panning either image does the same to the other. Images of different sizes are matched by position in the picture. **Save both** writes the two images side by side in one file, with their names on them.
 
 **Video and time-lapse** (the Video and Time-lapse tabs in Controls). **Video** records the live view to MP4 (small) or AVI (Motion JPEG: better quality, much larger), optionally stopping after a set time. Frames are repeated or skipped to match the chosen frame rate, so the video plays at real speed even though the camera's rate varies. **Time-lapse** takes a capture every N seconds/minutes/hours, for a set number of images or until stopped. It uses the Photo tab's averaging, size and format, and a `.json` for each image records its number and the interval. Optionally the images are joined into a video at the end. Files are saved to the Output folder with the Output name, continuing its numbering. Flat-field correction applies to both if it's on. Closing the app asks first while either is running.
+
+**Fiber axis** (panel at the bottom, Ctrl+5; also Measure → Find fiber axes). For polarization-maintaining fiber end faces (Panda, Bow-tie, Elliptical-clad), **Find axes** finds each fiber and draws its slow axis (solid magenta, through the stress rods / wedges / ellipse) and fast axis (dashed yellow, at 90°). The table lists the type, both angles (0° = horizontal, + = turned counter-clockwise, − = clockwise, from −90° to +90°), how clear the axis is, the centre and the diameter. Fibers are found automatically as round regions brighter or darker than the background; if one isn't, draw a **Circle (3 pt)** round it in Measurements and click Find axes again (with "Use circle measurements" on, only circled fibers are measured). **Update live** keeps measuring the live view about 4 times a second, e.g. while rotating a fiber into line. **Export** writes the table (Excel/CSV), the image and a copy with the axes drawn. Method: inside the cladding (leaving out the core and edge), pixels whose color clearly differs from the cladding are the stress parts; their principal axis about the fiber centre is the slow axis (`camcontrol/processing/fiber_axis.py`, self-test: `python -m camcontrol.processing.fiber_axis`).
 
 **Processing** (Process menu, or select images in Captures and right-click). Results appear in the view marked "(unsaved)"; **File → Save image as** (Ctrl+S) saves them with a `.json` listing the input files and settings. All tools accept any image files, including full-size 3264x1836 SD card images, but the images in one run must be the same size (except for stitching).
 
@@ -212,6 +214,7 @@ camcontrol/
 │   │   ├── jobs.py          # runs processing in the background
 │   │   ├── compare.py       # side-by-side compare pane
 │   │   ├── record_panel.py  # Video and Time-lapse tabs of the Controls panel
+│   │   ├── fiber_panel.py   # Fiber axis panel and drawing
 │   │   ├── video_player.py  # video playback bar
 │   │   ├── tool_stripes.py  # PyCharm-style panel stripes along the window edges
 │   │   └── camera_worker.py # camera thread (keeps the GUI responsive)
@@ -225,6 +228,7 @@ camcontrol/
 │       ├── hdr.py
 │       ├── stitch.py
 │       ├── count.py         # counting marks and export
+│       ├── fiber_axis.py    # PM fiber slow/fast axis
 │       └── fluorescence.py
 ├── tools/
 │   ├── probe_camera.py  # Phase 0 diagnostic
