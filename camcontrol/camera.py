@@ -34,12 +34,23 @@ Exposure:
   that every time. The camera always reports exposure as "auto", even when
   manual values are clearly in effect, so that flag can't be trusted.
 
+Long exposures (beyond the camera's 1.25 s):
+  The exposure range offered goes EXTRA_EXPOSURE_STEPS past the camera's
+  maximum: -2 ~ 2.5 s, -1 ~ 5 s, 0 ~ 10 s, 1 ~ 20 s. Above -3 the camera
+  stays at its longest exposure and frames are added together in software,
+  2, 4, 8 or 16 of them, which brightens like a real longer exposure. HD2's
+  "10 s" exposures work the same way.
+  - read() (live view, video) returns a running sum of the last N frames,
+    so the picture still updates every 1.25 s.
+  - grab_exposure() (captures) sums N fresh frames: one true long exposure.
+
 Run this file directly for a quick check that the camera opens:
     python -m camcontrol.camera
 """
 
 import os
 import time
+from collections import deque
 
 # Must be set before importing cv2.
 os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
@@ -55,6 +66,15 @@ DEFAULT_HEIGHT = 1080
 
 # Controls the app offers. Order here is the order shown in the GUI.
 ADJUSTABLE = ["exposure", "gain", "contrast", "saturation", "sharpness"]
+# Exposure steps offered past the camera's maximum, done by adding frames
+# (see "Long exposures" above). 4 steps: up to 16 frames, ~20 s.
+EXTRA_EXPOSURE_STEPS = 4
+# The camera's real exposure range (Phase 0), used if it reports a broken one.
+EXPOSURE_RANGE = (-13, -3)
+EXPOSURE_DEFAULT = -6
+# How long to wait for a first frame when opening. Several 1.25 s exposures,
+# some of which time out (see read_raw).
+OPEN_TIMEOUT_S = 6.0
 
 
 def exposure_seconds(value: float) -> float:
@@ -96,7 +116,12 @@ class Camera:
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
-        frame = self.read()
+        # At long exposures (the camera remembers its last setting) the first
+        # reads time out and come back black, so keep trying for a while.
+        frame = None
+        deadline = time.perf_counter() + OPEN_TIMEOUT_S
+        while frame is None and time.perf_counter() < deadline:
+            frame = self.read_raw()
         if frame is None:
             self.close()
             raise RuntimeError(f"Camera {index} opened but returned no frame.")
@@ -108,13 +133,26 @@ class Camera:
         # A second handle on the same device, for its controls.
         self.controls = CameraControls(index)
         self.ranges = {name: self.controls.range(name) for name in ADJUSTABLE}
+        # The camera sometimes reports a nonsense exposure range (e.g. 3..3,
+        # not even containing its current value); use the measured one then.
+        exp = self.ranges.get("exposure")
+        if exp and not (exp["min"] < exp["max"] and exp["min"] <= self.controls.get("exposure")[0] <= exp["max"]):
+            self.ranges["exposure"] = exp = {**exp, "min": EXPOSURE_RANGE[0], "max": EXPOSURE_RANGE[1],
+                                             "default": EXPOSURE_DEFAULT}
+        # Offer longer exposures than the camera can do, by adding frames.
+        self.hw_exposure_max = exp["max"] if exp else None
+        if exp:
+            self.ranges["exposure"] = {**exp, "max": exp["max"] + EXTRA_EXPOSURE_STEPS}
+        self.frames_summed = 1  # 1 = a normal exposure; 2, 4, 8, 16 = long exposure
+        self._recent: deque[np.ndarray] = deque()  # last frames_summed frames, for read()
+        self._sum: np.ndarray | None = None         # their sum (int32)
 
         # Re-apply the current exposure so it's in effect even if HD2 left
         # the camera ignoring manual exposure.
         self.set_exposure(self.exposure)
 
-    def read(self):
-        """Return the next frame, or None if no valid frame arrived.
+    def read_raw(self):
+        """Return the next frame from the camera, or None if no valid frame arrived.
 
         With exposures of ~1 s or longer, OpenCV's DirectShow reader times
         out and hands back an all-black frame. Those are skipped here.
@@ -124,10 +162,56 @@ class Camera:
             return None
         return frame
 
+    def read(self):
+        """The next live frame, or None. During a long exposure: the sum of the
+        last frames_summed frames, updated with every new frame."""
+        frame = self.read_raw()
+        if frame is None or self.frames_summed == 1:
+            return frame
+        if self._sum is None or self._sum.shape != frame.shape:
+            self._reset_sum()
+            self._sum = np.zeros(frame.shape, np.int32)
+        self._recent.append(frame)
+        self._sum += frame
+        if len(self._recent) > self.frames_summed:
+            self._sum -= self._recent.popleft()
+        # Until enough frames have arrived, scale up so brightness is right.
+        scale = self.frames_summed / len(self._recent)
+        return np.clip(self._sum * scale, 0, 255).astype(np.uint8)
+
+    def grab_exposure(self, max_attempts: int | None = None):
+        """One complete exposure from fresh frames (for captures), or None.
+        Long exposures add frames_summed frames; bright parts clip at 255,
+        as they would in a real long exposure."""
+        n = self.frames_summed
+        if n == 1:
+            return self.read_raw()
+        total = None
+        got = 0
+        for _ in range(max_attempts or n * 2 + 3):
+            frame = self.read_raw()
+            if frame is None:
+                continue
+            total = frame.astype(np.int32) if total is None else total + frame
+            got += 1
+            if got == n:
+                break
+        if total is None:
+            return None
+        total = total * (n / got)  # if a frame was missed, scale to the full exposure
+        return np.clip(total, 0, 255).astype(np.uint8)
+
+    def _reset_sum(self):
+        self._recent.clear()
+        self._sum = None
+
     # --- controls ------------------------------------------------------------
 
     def get(self, name: str) -> int:
-        return self.controls.get(name)[0]
+        value = self.controls.get(name)[0]
+        if name == "exposure" and self.frames_summed > 1:
+            value += self.frames_summed.bit_length() - 1  # + log2(frames summed)
+        return value
 
     def set(self, name: str, value: float) -> int:
         """Set a control (clamped to its range). Returns the value read back."""
@@ -135,6 +219,12 @@ class Camera:
         if r is not None:
             value = max(r["min"], min(r["max"], round(value)))
         if name == "exposure":
+            # Past the camera's maximum: longest real exposure, frames added.
+            extra = max(0, value - self.hw_exposure_max) if self.hw_exposure_max is not None else 0
+            if 2 ** extra != self.frames_summed:
+                self.frames_summed = 2 ** extra
+                self._reset_sum()
+            value -= extra
             # Workaround (see module docstring): a no-flags write first.
             self.controls.set(name, value, flags=0)
         self.controls.set(name, value)

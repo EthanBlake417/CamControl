@@ -114,7 +114,7 @@ Measured with `tools/probe_camera.py`, `ffmpeg -list_options`, and timing tests.
 
 | Control | Range | Works? | Notes |
 |---|---|---|---|
-| Exposure | -13 to -3 | Yes | **Real exposure ≈ 10 × 2^value s** (about 1.2 ms to 1.25 s), not the nominal 2^value. Measured from frame timing. |
+| Exposure | -13 to -3 | Yes | **Real exposure ≈ 10 × 2^value s** (about 1.2 ms to 1.25 s), not the nominal 2^value. Measured from frame timing. The app's slider goes on to 1 (≈ 20 s) by adding frames together in software, as HD2 does: -2 ≈ 2.5 s (2 frames), -1 ≈ 5 s, 0 ≈ 10 s, 1 ≈ 20 s (16 frames). Live view shows a running sum, so it still updates every 1.25 s; captures add fresh frames, and their `.json` records `frames_summed_per_exposure`. |
 | Gain | 0 to 63 | Yes | Default 48. |
 | Contrast | 0 to 15 | Yes | |
 | Saturation | 0 to 15 | Yes | |

@@ -42,14 +42,16 @@ def grab_average(cam: Camera, n_frames: int, max_attempts: int | None = None):
     """Grab n_frames valid frames and return their average as uint8.
 
     Frames are summed as float32 so nothing clips before dividing.
-    Black/invalid frames (see Camera.read) are skipped.
+    Black/invalid frames (see Camera.read_raw) are skipped. With a long
+    exposure, each "frame" is itself several camera frames added together
+    (Camera.grab_exposure).
     """
     if max_attempts is None:
         max_attempts = n_frames * 3 + 5
     total = None
     got = 0
     for _ in range(max_attempts):
-        frame = cam.read()
+        frame = cam.grab_exposure()
         if frame is None:
             continue
         if total is None:

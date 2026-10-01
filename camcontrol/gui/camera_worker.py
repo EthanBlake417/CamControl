@@ -170,6 +170,8 @@ class CameraWorker(QThread):
         try:
             image, got = grab_average(cam, n_frames)
             extra = dict(extra or {})
+            if cam.frames_summed > 1:
+                extra["frames_summed_per_exposure"] = cam.frames_summed
             if self._flat is not None:
                 image = self._flat.apply(image)
                 extra["flat_field"] = self._flat.name
