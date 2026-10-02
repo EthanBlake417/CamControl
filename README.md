@@ -48,7 +48,7 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 
 **Fiber axis** (panel at the bottom, Ctrl+5; also Measure → Find fiber axes). For polarization-maintaining fiber end faces (Panda, Bow-tie, Elliptical-clad), **Find axes** finds each fiber and draws its slow axis (solid magenta, through the stress rods / wedges / ellipse) and fast axis (dashed yellow, at 90°). The table lists the type, both angles (0° = horizontal, + = turned counter-clockwise, − = clockwise, from −90° to +90°), how clear the axis is, the centre and the diameter. Fibers are found automatically as round regions brighter or darker than the background; if one isn't, draw a **Circle (3 pt)** or **Circle (centre)** round it in Measurements and click Find axes again (with "Use circle measurements" on, only circled fibers are measured). **Update live** keeps measuring the live view about 4 times a second, e.g. while rotating a fiber into line. **Export** writes the table (Excel/CSV), the image and a copy with the axes drawn. The **Method** box picks the formula for the slow axis (**Mirror symmetry**, the default; **Stress part centres**; or **Second moments**), and **Turn about stress parts** measures about the centre of the stress parts instead of the fiber centre. On a fiber with lopsided stress parts the methods can differ by a few degrees. **Show stress parts** shades the stress parts the axis was measured from, puts a cross at each one's centre and rings the point the axis turns about, so you can see what the result is based on (also in the exported drawing). How each one works: [Fiber axis formulas](#fiber-axis-formulas) (`camcontrol/processing/fiber_axis.py`, self-test: `python -m camcontrol.processing.fiber_axis`).
 
-**Processing** (Process menu, or select images in Captures and right-click). Results appear in the view marked "(unsaved)"; **File → Save image as** (Ctrl+S) saves them with a `.json` listing the input files and settings. All tools accept any image files, including full-size 3264x1836 SD card images, but the images in one run must be the same size (except for stitching).
+**Processing** (Process menu, or select images in Captures and right-click). Results appear in the view marked "(unsaved)"; **File → Save image as** (Ctrl+S) saves them with a `.json` listing the input files and settings. All tools accept any image files, including 3264x1836 HD2 and SD card images, but the images in one run must be the same size (except for stitching).
 
 | Tool | What it does | How to take the images |
 |---|---|---|
@@ -134,7 +134,7 @@ Known camera facts (from the O.C. White MacroZoom spec sheet, 2021):
 | Spec | Value |
 |---|---|
 | Live preview | 1920 x 1080 (2MP) |
-| Still capture (onboard, to SD card) | 3264 x 1836 (6MP) |
+| Still capture (onboard, to SD card) | 3264 x 1836 ("6MP"); really 1080p enlarged in the camera, see below |
 | Video | 30 fps |
 | Exposure range (vendor software) | 2 ms to 10 s |
 | Sensor model / pixel size | **Not published** |
@@ -154,7 +154,7 @@ Measured with `tools/probe_camera.py`, `ffmpeg -list_options`, and timing tests.
 | 1024 x 576 | 30 fps | 20 fps |
 | 800 x 448 | 30 fps | 30 fps |
 
-**1920 x 1080 is the largest size available over USB.** Real 6MP (3264 x 1836) images exist only on the camera's SD card.
+**1920 x 1080 is the largest size available over USB, and it is the camera's real resolution.** The "6MP" SD-card photos are 1080p enlarged too (checked 2026-10-01 on `IMG00000-2.JPG`): they are 3264 x 1840 JPEGs (height rounded up to a multiple of 16) with a strong resampling peak at 0.41 cycles/pixel in both directions, the fingerprint of a ~1.7x stretch from about 1920 x 1080 (across 0.4125, down 0.4138). The camera's own scaler uses a ratio slightly off 1.7, so the pattern drifts rather than repeating exactly every 17 pixels. The camera then sharpens and JPEG-compresses them, and burns in its scale-bar overlay. A native 1920 x 1080 capture over USB (TIFF/PNG) holds all the real detail there is.
 
 **Frames.** Frames come through OpenCV with DirectShow (`cv2.CAP_DSHOW`). Set the frame size **before** the MJPG FOURCC. In the other order, DirectShow silently uses YUY2 at 5.7 fps. With the right order, 1080p runs at about 25 fps. Media Foundation gives 30 fps but can't set controls reliably.
 
@@ -183,6 +183,7 @@ Measured with `tools/probe_camera.py`, `ffmpeg -list_options`, and timing tests.
 HD2 "Advanced Imaging & Measurement" is rebranded **Tucsen** software (`TUCam.dll`, `TSCam*` plugins). It lists this camera by name and drives it through the same standard UVC interface. It sends no vendor-specific commands, so it has no camera access that CamControl lacks.
 
 - **Its 3264 x 1836 files are 1080p frames scaled up on save.** HD2 has separate preview and save resolutions, plus an interpolation setting (`RS_RESOLUTIONSAVE`, `RS_RESOLUTIONINTER` in `CameraCfg.ini`). The pixel statistics of a sample HD2 TIFF match a 1.7x upscale: noise is correlated between neighbouring pixels, which it isn't in a native frame.
+- **How the upscale is done (checked 2026-10-01 in HD2's program files).** The size list in `TSCamPluginsMgr.dll` has `3264x1836` hard-coded as the save size for this camera. Saving goes through `ImageConvert::ResizeTSImg`, which calls OpenCV's ordinary `cv::resize` (HD2 ships OpenCV 2.4.10: `opencv_imgproc2410.dll`). `RS_RESOLUTIONINTER=2` is the interpolation setting; as an OpenCV flag, 2 is `INTER_CUBIC` (bicubic). Two HD2 TIFs (`36879B-00FBB-001/008.tif`) carry the resampling fingerprint: the pixel-to-pixel differences repeat every 17 pixels (10 source pixels become 17) in both directions, about 8 times stronger than at any other period. Their pattern is closest to bicubic, but no plain OpenCV method reproduces it exactly, so HD2 probably also processes the image (its camera profile has software Sharpness 3 and Denoise 5). The TIFs' strongest pattern repeats every 13.6 pixels, which is the camera's 8 x 8 MJPEG blocks stretched 1.7x: more evidence that the source is the 1080p USB frame.
 - **Its long exposures (e.g. "10 s") and low-noise captures come from software frame averaging or integration** (`PROCESS_AVERAGE`, `PROCESS_INTEGRAL`, `PROCESS_TIMEINTEGRAL`).
 - Its bundled Tucsen USB3 driver (`tuusb3.sys`) isn't used by this camera.
 - Settings are stored in `%LOCALAPPDATA%\HD2 Advanced Imaging & Measurement\`.
@@ -196,7 +197,7 @@ HD2 "Advanced Imaging & Measurement" is rebranded **Tucsen** software (`TUCam.dl
 3. Calibrated measurement: lines, polylines, 3-point circles, angles, rectangles, polygons (area and perimeter).
 4. Calibration table: µm-per-pixel for each zoom setting, separate X and Y values, saved to JSON.
 5. Measurement export to CSV and Excel.
-6. Image processing tools, usable on live captures or saved files (including full 6MP images from the SD card):
+6. Image processing tools, usable on live captures or saved files (including the camera's 3264x1836 SD card images):
    - Flat-field correction
    - Extended depth of focus (focus stacking)
    - HDR / exposure fusion
@@ -343,7 +344,7 @@ Results are recorded above under **Phase 0 findings**.
 - New features go into the PySide6 GUI (`camcontrol/gui/`). Camera access stays on the `CameraWorker` thread.
 - Keep modules small and independently runnable (`python -m camcontrol.viewer`), so each tool can be tested alone.
 - Measurements must always use per-axis calibration (µm/px in X and Y), never a single scale, until squareness is confirmed.
-- Processing tools should accept file paths as input, not only live frames, so full-resolution SD card images can be used.
+- Processing tools should accept file paths as input, not only live frames, so HD2 and SD card images can be used.
 - Target Python 3.14+ and use PySide6 (not PyQt) for all GUI code.
 - Prefer clear, commented code over clever code. The user is building this to learn and to own it.
 

@@ -6,7 +6,8 @@ camcontrol/uvc_controls.py):
     standard Microsoft UVC driver (usbvideo.sys). No vendor driver.
   - Largest USB mode is 1920x1080 (MJPG 30 fps, or YUY2 7 fps). There is no
     3264x1836 mode over USB; HD2's 3264x1836 TIFs are 1080p scaled up.
-    Real 6MP stills only come from the camera's SD card.
+    The camera's "6MP" SD-card stills are 1080p enlarged in the camera too,
+    so 1920x1080 is the real resolution.
   - Frames come through OpenCV with DirectShow. DirectShow only picks the
     fast MJPG format if the frame size is set BEFORE the FOURCC (the other
     order silently falls back to 5.7 fps YUY2).
