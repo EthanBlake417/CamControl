@@ -62,7 +62,7 @@ from camcontrol.gui.count_panel import CountPanel, render_marks
 from camcontrol.gui.fiber_panel import FiberPanel, render_fiber_axes
 from camcontrol.gui.gallery import GalleryPanel
 from camcontrol.gui.image_view import ImageView
-from camcontrol.gui.jobs import run_job
+from camcontrol.gui.jobs import Job, run_job
 from camcontrol.gui.measure_draw import render_annotated
 from camcontrol.gui.measure_panel import MeasurePanel
 from camcontrol.gui.process_dialogs import (
@@ -197,6 +197,7 @@ class MainWindow(QMainWindow):
         self.count_panel = CountPanel()
         self.fiber_panel = FiberPanel()
         self._fiber_last = 0.0  # when the live view was last measured
+        self._fiber_job: Job | None = None  # live fiber measuring running in the background
         # The main view first, then any compare images; the panels start on the main view.
         self.panes = [Pane(self.view, self.measure_panel.measurements, self.count_panel.counter)]
         self.active = 0
@@ -907,10 +908,31 @@ class MainWindow(QMainWindow):
                 self.fps_label.setText(f"{(len(self._frame_times) - 1) / span:.1f} fps")
         h, w = frame.shape[:2]
         self.size_label.setText(f"{w} x {h}")
-        # Fiber axes on the live view, a few times a second.
-        if self.fiber_panel.live_check.isChecked() and now - self._fiber_last >= FIBER_LIVE_INTERVAL_S:
+        # Fiber axes on the live view, a few times a second, in the background so
+        # the video doesn't stall. Frames that come while it's busy are skipped.
+        if (self.fiber_panel.live_check.isChecked() and self._fiber_job is None
+                and now - self._fiber_last >= FIBER_LIVE_INTERVAL_S):
             self._fiber_last = now
-            self.find_fiber_axes(quiet=True, pane_index=0)  # the live image is the left one
+            self._measure_live_fibers(frame)
+
+    def _measure_live_fibers(self, frame):
+        analyse = self._fiber_analysis(0)  # the live image is the left one
+        frame = frame.copy()  # the worker may reuse its buffer
+        job = Job(lambda: analyse(frame), self)
+        job.succeeded.connect(self._live_fibers_done)
+        job.failed.connect(lambda msg: self.statusBar().showMessage(f"Fiber axes: {msg}", 6000))
+        job.finished.connect(self._live_fibers_finished)
+        self._fiber_job = job
+        job.start()
+
+    def _live_fibers_done(self, axes):
+        # Skip results that no longer belong to the image shown (frozen, file opened, live update off).
+        if self.live and self.fiber_panel.live_check.isChecked():
+            self._show_fiber_axes(0, axes)
+
+    def _live_fibers_finished(self):
+        self._fiber_job.deleteLater()
+        self._fiber_job = None
 
     def _on_camera_settings(self, values: dict):
         self._camera_values.update(values)
@@ -1352,29 +1374,39 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Exported {len(counter.marks)} marks to {path.name}, {image_path.name} and {marked_path.name}", 8000)
 
-    def find_fiber_axes(self, quiet: bool = False, pane_index: int | None = None):
-        """Measure the fiber axes in the active image (or the given pane's)."""
-        index = self.active if pane_index is None else pane_index
-        pane = self.panes[index]
-        image = pane.view.image
-        if image is None:
-            return
+    def _fiber_analysis(self, index: int):
+        """A function measuring the fiber axes of an image with pane index's circles
+        and the panel's settings as they are now. Safe to call from another thread."""
         circles = None
         if self.fiber_panel.use_circles.isChecked():
             # Fibers marked with Circle measurements (in pixels, whatever the calibration).
             circles = []
-            for m in pane.measurements:
+            for m in self.panes[index].measurements:
                 if m.kind in CIRCLE_KINDS:
                     r = compute(m)
                     circles.append((*r["center_px"], r["radius"]))
-        axes = analyse_fibers(image, circles or None, method=self.fiber_panel.method(),
-                              parts_centre=self.fiber_panel.parts_centre_check.isChecked(),
-                              detection=self.fiber_panel.detection())
+        method = self.fiber_panel.method()
+        parts_centre = self.fiber_panel.parts_centre_check.isChecked()
+        detection = self.fiber_panel.detection()
+        return lambda image: analyse_fibers(image, circles or None, method=method,
+                                            parts_centre=parts_centre, detection=detection)
+
+    def _show_fiber_axes(self, index: int, axes: list):
         if index == self.active:
             self.fiber_panel.set_axes(axes)
         else:  # e.g. live updates of the left image while the right one is active
+            pane = self.panes[index]
             pane.fiber_axes = axes
             pane.view.set_fiber_axes(axes)
+
+    def find_fiber_axes(self, quiet: bool = False, pane_index: int | None = None):
+        """Measure the fiber axes in the active image (or the given pane's)."""
+        index = self.active if pane_index is None else pane_index
+        image = self.panes[index].view.image
+        if image is None:
+            return
+        axes = self._fiber_analysis(index)(image)
+        self._show_fiber_axes(index, axes)
         if not quiet:
             if axes:
                 unclear = sum(not f.clear for f in axes)
@@ -1722,6 +1754,8 @@ class MainWindow(QMainWindow):
             return
         if self._job is not None:
             self._job.wait()  # let a running processing job finish first
+        if self._fiber_job is not None:
+            self._fiber_job.wait()
         self._save_settings()
         self.worker.stop()
         super().closeEvent(event)
