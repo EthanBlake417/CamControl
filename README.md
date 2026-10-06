@@ -30,7 +30,9 @@ The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exp
 
 **Panels** work like PyCharm's tool windows. Each panel has a button with its name on a thin stripe along the edge it's on (left, right or bottom). Each edge shows one panel at a time: clicking a button opens that panel and minimizes the others on the same edge. Click it again, or the panel's **–** button, to minimize it so the image gets its space. Highlighted buttons are open panels. To move a panel, drag its button to another stripe (all three show while dragging, even empty ones), or along its stripe to change the order.
 
-**Controls panel**, top to bottom: **Camera** (connection status, **Reconnect**, sliders); **Output** (folder, name, next file name, flat-field on/off, shared by everything that saves files); then tabs for **Photo** (averaging, save size, format, Capture), **Video** and **Time-lapse**; and **View**. If the camera was off or unplugged when the app started, or it stops sending pictures, turn it on and click **Reconnect** (also **File → Reconnect camera**).
+**Controls panel**, top to bottom: **Camera** (connection status, **Reconnect**, **Device**, **Resolution**, sliders); **Output** (folder, name, next file name, flat-field on/off, shared by everything that saves files); then tabs for **Photo** (averaging, save size, format, Capture), **Video** and **Time-lapse**; and **View**. If the camera was off or unplugged when the app started, or it stops sending pictures, turn it on and click **Reconnect** (also **File → Reconnect camera**).
+
+**Other cameras.** Any standard USB (UVC) camera Windows lists works, e.g. the ETN3000 fiber end-face inspector. Pick it in **Device**; the app remembers it by name and opens it at its largest frame size (change that in **Resolution**, remembered per camera). Sliders for controls a camera doesn't have show "not available". Save size follows the camera: native, or 1.7x upscaled (HD2 size, 3264x1836 for a 1080p camera). The exposure-time estimates (and long exposures past the camera's maximum) were measured on the MC802 and may be off for other cameras. `python -m camcontrol.uvc_controls` lists every camera with its sizes and formats.
 
 **Capturing.** Set a **Name** in the Output box and captures are saved as `name-001.tif`, `name-002.tif`, ..., continuing after the highest number already in the folder (so nothing is overwritten; same style as HD2). Leave it blank for date-and-time names. The line under the field shows the next file name. Each image gets a `.json` with its settings. The **Captures** panel shows thumbnails of the newest N images and videos in the capture folder (N is set in the panel; videos have a play mark). It updates automatically when files change. Double-click a thumbnail to open it, or to play a video; right-click for "Show in Explorer". Ctrl- or Shift-click selects several, and right-clicking them offers the processing tools. **Delete** (right-click, or the Delete key) moves the selected files and their `.json` settings files to the Recycle Bin, after asking. A `.json` shared by two images of the same name (e.g. `name-001.tif` and `name-001.png`) goes when the last of them does.
 
@@ -70,7 +72,7 @@ venv\Scripts\python -m camcontrol.viewer
 | `g` / `b` | gain up / down |
 | Space | capture a still (TIFF + `.json` settings) to `captures/` |
 | `a` | frames averaged per capture: 1, 4, 8, 16, 32 |
-| `r` | save size: native 1920x1080 / HD2-style 3264x1836 (upscaled) |
+| `r` | save size: native / HD2-style 1.7x upscale (1920x1080 becomes 3264x1836) |
 | `x` / `c` | grid / crosshair |
 | `+` / `-` / `0` | zoom in / out / reset (display only) |
 | arrows | pan while zoomed |
@@ -83,11 +85,17 @@ What the Fiber axis panel calculates, step by step (`camcontrol/processing/fiber
 
 **1. Finding the fiber.** The image is blurred and split into bright and dark with Otsu's threshold. The program keeps outlines that are round ($4\pi A / P^2 > 0.75$, where $A$ is the area and $P$ the perimeter), fill their enclosing circle ($A / \pi r_{enc}^2 > 0.8$), are at least 5% of the image's short side in radius and don't touch the image edge. The centre $(c_x, c_y)$ is the centre of the smallest enclosing circle, and the radius is $R = \sqrt{A/\pi}$. If nothing is found this way, circle detection on edges (Hough) is used instead. A Circle measurement replaces this step when **Use circle measurements** is on.
 
-**2. Finding the stress parts.** Only a ring of the fiber is used: $0.12R < d < 0.92R$, where $d$ is the distance from the fiber centre. That leaves out the core and the cladding edge. Each pixel is converted to Lab color, and its difference from the cladding is
+**2. Finding the stress parts.** Only a ring of the fiber is used: $0.12R < d < 0.92R$, where $d$ is the distance from the fiber centre. That leaves out the core and the cladding edge. The image is converted to Lab color and each channel $k$ (L brightness, a and b color) is blurred (σ = smoothing × $R$, default 1%). For each channel a smooth surface is fitted to the cladding only:
 
-$$D = \lVert \mathrm{Lab}_{pixel} - \mathrm{median}(\mathrm{Lab}_{ring}) \rVert$$
+$$S_k(u, v) = c_0 + c_1 u + c_2 v + c_3 (u^2 + v^2), \quad u = x/R,\ v = y/R$$
 
-$D$ is blurred (σ = $R/100$). The stress-part mask is the ring pixels with $D > \max(T_{Otsu}, 8)$: Otsu's threshold splits the ring into "like the cladding" and "not", and the minimum of 8 stops noise being picked up on a plain fiber. The mask works for colored stress parts and for dark gray ones.
+a tilt plus a round bowl, for uneven lighting and vignetting. It has no axis of its own, so it can't fit away a pair of stress parts. The fit starts from the pixels near the channel's commonest value (the cladding covers most of the ring), then is refitted 5 times leaving out pixels more than $2\sigma_k$ off it, where $\sigma_k = 1.4826 \cdot \mathrm{median}|\mathrm{off}|$ (+0.5) is the cladding's noise. The contrast of each pixel, in noise units, is
+
+$$D = \sqrt{\sum_k \left(\frac{\mathrm{Lab}_k - S_k}{\sigma_k}\right)^2}$$
+
+over the channels chosen in **Look at** (brightness and color, brightness only, or color only). Dividing by the noise means a faint brightness-only difference counts as much as a strong color one, and a channel full of texture (e.g. moiré) counts less. The stress-part mask is the ring pixels with $D > T$, where $T$ is Otsu's threshold of $D$ (at least 2.5) or the value set with the **Threshold** slider. Regions smaller than a square of side "Ignore specks" × $R$ (default 8%) are dropped.
+
+**Low contrast.** If the shaded stress parts don't match the image, use the **Stress part detection** box: untick **Auto** and lower **Threshold** to catch fainter parts (the slider starts at the automatic value), raise **Smoothing** for noisy images, try **Brightness only** when color fringes or dirt are being picked up, and raise **Ignore specks** to drop small stray regions. With **Show stress parts** and **Update live** on, the shading follows the sliders. The settings are remembered, and **Defaults** puts them back. Mirror symmetry uses $D$ itself, not the mask, so the threshold only changes the other two methods, the type guess and the Clarity.
 
 **3. The slow axis.** By the **Method** box:
 

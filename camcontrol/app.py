@@ -20,7 +20,8 @@ APP_ID = "GET.CamControl"
 
 def main():
     parser = argparse.ArgumentParser(description="CamControl GUI")
-    parser.add_argument("--index", type=int, default=0, help="camera index (default 0)")
+    parser.add_argument("--index", type=int, default=None,
+                        help="camera index (default: the camera used last, else the first)")
     args = parser.parse_args()
 
     # Without this, Windows groups the app under python.exe and shows the

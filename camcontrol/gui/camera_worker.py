@@ -28,7 +28,7 @@ PROGRESS_EVERY = 0.5  # seconds between recording progress signals
 
 
 class CameraWorker(QThread):
-    opened = Signal(dict)                    # {control name: range dict}
+    opened = Signal(dict)                    # name, size, modes, ranges ({control name: range dict or None})
     open_failed = Signal(str)                # camera not found / couldn't open (thread ends)
     frame_ready = Signal(object)             # numpy BGR frame
     settings_changed = Signal(dict)          # {control name: current value}
@@ -40,9 +40,12 @@ class CameraWorker(QThread):
     timelapse_progress = Signal(int, int, float, str)  # taken, total (0 = no limit), next due (epoch s), last path
     timelapse_finished = Signal(str)         # summary message
 
-    def __init__(self, index: int = 0, parent=None):
+    def __init__(self, index: int | None = 0, size: tuple[int, int] | None = None, parent=None):
+        """size: frame size to ask the camera for; None = its largest.
+        index None: the camera isn't plugged in; the thread just reports that."""
         super().__init__(parent)
         self._index = index
+        self._size = size
         self._commands: queue.Queue = queue.Queue()
         self._running = True
         self._awaiting_ack = False
@@ -57,8 +60,8 @@ class CameraWorker(QThread):
     def set_control(self, name: str, value: float):
         self._commands.put(("control", name, value))
 
-    def capture(self, n_frames: int, save_size: tuple[int, int], fmt: str, folder: Path, name: str = ""):
-        self._commands.put(("capture", n_frames, save_size, fmt, folder, name))
+    def capture(self, n_frames: int, scale: float, fmt: str, folder: Path, name: str = ""):
+        self._commands.put(("capture", n_frames, scale, fmt, folder, name))
 
     def set_flat_field(self, flat):
         """A processing.flatfield.FlatField to apply, or None for raw frames."""
@@ -71,7 +74,7 @@ class CameraWorker(QThread):
         self._commands.put(("record_stop",))
 
     def start_timelapse(self, timelapse: TimeLapse, capture_opts: dict):
-        """capture_opts: n_frames, save_size, fmt, folder, name (as for capture())."""
+        """capture_opts: n_frames, scale, fmt, folder, name (as for capture())."""
         self._commands.put(("timelapse", timelapse, capture_opts))
 
     def stop_timelapse(self):
@@ -88,13 +91,16 @@ class CameraWorker(QThread):
     # --- the thread ----------------------------------------------------------
 
     def run(self):
+        if self._index is None:
+            self.open_failed.emit("Camera not found.")
+            return
         try:
-            cam = Camera(self._index)
+            cam = Camera(self._index, self._size)
         except Exception as e:  # not plugged in, off, or in use by another program
             self.open_failed.emit(str(e))
             return
 
-        self.opened.emit(cam.ranges)
+        self.opened.emit({"name": cam.name, "size": cam.size, "modes": cam.modes, "ranges": cam.ranges})
         self.settings_changed.emit(cam.values())
         try:
             while self._running:
@@ -156,16 +162,17 @@ class CameraWorker(QThread):
         if latest:
             self.settings_changed.emit(cam.values())
 
-        for _, n_frames, save_size, fmt, folder, name in captures:
-            self._capture(cam, n_frames, save_size, fmt, folder, name)
+        for _, n_frames, scale, fmt, folder, name in captures:
+            self._capture(cam, n_frames, scale, fmt, folder, name)
 
     # --- still capture -----------------------------------------------------------
 
-    def _capture(self, cam: Camera, n_frames, save_size, fmt, folder, name,
+    def _capture(self, cam: Camera, n_frames, scale, fmt, folder, name,
                  extra: dict | None = None, prefix: str = "cap", announce: bool = True) -> str | None:
         """Average, correct and save one image. Returns its path, or None on failure."""
         if announce:
-            estimate = n_frames * max(exposure_seconds(cam.exposure), 1 / 25)
+            exposure = cam.exposure
+            estimate = n_frames * max(exposure_seconds(exposure) if exposure is not None else 0, 1 / 25)
             self.capture_started.emit(n_frames, estimate)
         try:
             image, got = grab_average(cam, n_frames)
@@ -180,7 +187,7 @@ class CameraWorker(QThread):
                 exposure=cam.exposure,
                 gain=cam.gain,
                 frames_averaged=got,
-                save_size=save_size,
+                scale=scale,
                 fmt=fmt,
                 folder=folder,
                 name=name,
@@ -236,7 +243,7 @@ class CameraWorker(QThread):
         tl = self._timelapse
         o = self._timelapse_opts
         index = len(tl.paths) + 1
-        path = self._capture(cam, o["n_frames"], o["save_size"], o["fmt"], o["folder"], o["name"],
+        path = self._capture(cam, o["n_frames"], o["scale"], o["fmt"], o["folder"], o["name"],
                              extra={"timelapse": {"index": index, "interval_s": tl.interval}},
                              prefix="tl", announce=False)
         if path is None:  # already reported; stop instead of failing every interval

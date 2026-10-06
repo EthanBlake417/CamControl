@@ -21,14 +21,15 @@ show their result in the view, unsaved, until you press Ctrl+S.
 
 import json
 import os
+import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -51,8 +52,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from camcontrol.camera import ADJUSTABLE, format_exposure
-from camcontrol.capture import CAPTURE_DIR, HD2_SIZE, NATIVE_SIZE, clean_name, next_capture_path
+from camcontrol.camera import ADJUSTABLE, format_exposure, frame_sizes
+from camcontrol.capture import CAPTURE_DIR, HD2_SCALE, clean_name, next_capture_path, scaled_size
 from camcontrol.export import export_table, measurement_rows
 from camcontrol import settings_file
 from camcontrol.gui.camera_worker import CameraWorker
@@ -79,13 +80,17 @@ from camcontrol.image_io import is_video, load_image_file, save_image_file
 from camcontrol.paths import LOGO
 from camcontrol.measure import CIRCLE_KINDS, compute
 from camcontrol.processing.count import Counter
+from camcontrol.processing.fiber_axis import Detection
 from camcontrol.processing.fiber_axis import analyse as analyse_fibers
 from camcontrol.processing.flatfield import FlatField
+from camcontrol.uvc_controls import list_video_devices
 
 AVERAGE_CHOICES = [1, 4, 8, 16, 32]
-SAVE_SIZES = [
-    ("1920 x 1080 (native)", NATIVE_SIZE),
-    ("3264 x 1836 (HD2 size, upscaled)", HD2_SIZE),
+# Save size as a scale of the camera's frame size. Labels get the real sizes
+# when the camera opens (_update_save_sizes).
+SAVE_SCALES = [
+    ("Native (camera size)", 1.0),
+    ("HD2 size (1.7x upscaled)", HD2_SCALE),
 ]
 FORMATS = [("TIFF", "tif"), ("PNG", "png")]
 FLAT_DIR = CAPTURE_DIR.parent / "flats"  # flat-field references taken in the app
@@ -112,8 +117,38 @@ class Pane:
     path: str | None = None  # compare images: the file shown
 
 
+def camera_list() -> list[tuple[str, int]]:
+    """The cameras Windows lists, as (name, n): n tells apart cameras with the
+    same name (0 for the first). Position in the list = OpenCV camera index."""
+    devices = []
+    for name, _ in list_video_devices():
+        devices.append((name, sum(1 for d in devices if d[0] == name)))
+    return devices
+
+
+def camera_label(key: tuple[str, int]) -> str:
+    name, n = key
+    return name if n == 0 else f"{name} ({n + 1})"
+
+
+def find_item(combo: QComboBox, value) -> int:
+    """Index of the item whose data equals value, or -1. (QComboBox.findData
+    compares Python tuples by identity, not by value.)"""
+    return next((i for i in range(combo.count()) if combo.itemData(i) == value), -1)
+
+
+class _DeviceCombo(QComboBox):
+    """A combo box that says when its list is about to open (to refresh it)."""
+    about_to_show = Signal()
+
+    def showPopup(self):
+        self.about_to_show.emit()
+        super().showPopup()
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, camera_index: int = 0):
+    def __init__(self, camera_index: int | None = None):
+        """camera_index: open this camera; None = the one used last (else the first)."""
         super().__init__()
         self.settings = QSettings("CamControl", "CamControl")
         self.live = True
@@ -130,7 +165,9 @@ class MainWindow(QMainWindow):
         self._camera_values: dict = {}             # latest values the camera reported
         self.settings_path: str | None = None      # settings file opened or saved last
 
-        self.camera_index = camera_index
+        self._cli_index = camera_index  # used once, when the camera list is first read
+        self.camera_key: tuple[str, int] | None = None  # the camera to use (see camera_list)
+        self._frame_size: tuple[int, int] | None = None  # the open camera's frame size
         self.camera_open = False
 
         self._set_corners()
@@ -436,6 +473,22 @@ class MainWindow(QMainWindow):
         reconnect.clicked.connect(self.reconnect_camera)
         status_row.addWidget(reconnect)
         cam_layout.addLayout(status_row)
+        device_form = QFormLayout()
+        device_form.setContentsMargins(0, 0, 0, 0)
+        self.camera_combo = _DeviceCombo()
+        self.camera_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.camera_combo.setMinimumContentsLength(12)
+        self.camera_combo.setToolTip("The camera to use. Any USB camera Windows lists will work.")
+        self.camera_combo.about_to_show.connect(self._fill_camera_combo)
+        self.camera_combo.activated.connect(self._on_camera_chosen)
+        device_form.addRow("Device", self.camera_combo)
+        self.resolution_combo = QComboBox()
+        self.resolution_combo.setToolTip("Frame size from the camera. The largest has the most detail;\n"
+                                         "a smaller one may give more frames per second.")
+        self.resolution_combo.setEnabled(False)  # until the camera opens
+        self.resolution_combo.activated.connect(self._on_resolution_chosen)
+        device_form.addRow("Resolution", self.resolution_combo)
+        cam_layout.addLayout(device_form)
         self.slider_box = QWidget()
         form = QFormLayout(self.slider_box)
         form.setContentsMargins(0, 0, 0, 0)
@@ -498,11 +551,12 @@ class MainWindow(QMainWindow):
         form.addRow("Average", self.average_combo)
 
         self.size_combo = QComboBox()
-        for text, size in SAVE_SIZES:
-            self.size_combo.addItem(text, size)
+        for text, scale in SAVE_SCALES:
+            self.size_combo.addItem(text, scale)
         self.size_combo.setToolTip(
-            "The camera sends 1920x1080 at most. 3264x1836 is scaled up to match\n"
-            "HD2 files: more pixels, no extra detail, and a different µm/px."
+            "Native saves frames at the size the camera sends. The HD2 size is\n"
+            "scaled up 1.7x to match HD2 files (1920x1080 becomes 3264x1836):\n"
+            "more pixels, no extra detail, and a different µm/px."
         )
         form.addRow("Save size", self.size_combo)
 
@@ -566,6 +620,8 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self):
         s = self.settings
+        if s.value("camera/name", ""):
+            self.camera_key = (s.value("camera/name"), int(s.value("camera/n", 0)))
         self.folder_edit.setText(s.value("capture/folder", str(CAPTURE_DIR)))
         self.average_combo.setCurrentIndex(int(s.value("capture/average_idx", 0)))
         self.size_combo.setCurrentIndex(int(s.value("capture/size_idx", 0)))
@@ -576,6 +632,10 @@ class MainWindow(QMainWindow):
         self.fiber_panel.set_method(s.value("fiber/method", "symmetry"))
         self.fiber_panel.parts_centre_check.setChecked(s.value("fiber/parts_centre", False, type=bool))
         self.fiber_panel.show_parts_check.setChecked(s.value("fiber/show_parts", True, type=bool))
+        try:
+            self.fiber_panel.set_detection(Detection(**json.loads(s.value("fiber/detection", "{}"))))
+        except (ValueError, TypeError):
+            pass
         try:
             self.record_panel.set_state(json.loads(s.value("recording/state", "{}")))
         except (ValueError, TypeError):
@@ -643,6 +703,9 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self):
         s = self.settings
+        if self.camera_key:
+            s.setValue("camera/name", self.camera_key[0])
+            s.setValue("camera/n", self.camera_key[1])
         s.setValue("capture/folder", self.folder_edit.text())
         s.setValue("capture/average_idx", self.average_combo.currentIndex())
         s.setValue("capture/size_idx", self.size_combo.currentIndex())
@@ -653,6 +716,7 @@ class MainWindow(QMainWindow):
         s.setValue("fiber/method", self.fiber_panel.method())
         s.setValue("fiber/parts_centre", self.fiber_panel.parts_centre_check.isChecked())
         s.setValue("fiber/show_parts", self.fiber_panel.show_parts_check.isChecked())
+        s.setValue("fiber/detection", json.dumps(asdict(self.fiber_panel.detection())))
         s.setValue("view/grid", self.grid_action.isChecked())
         s.setValue("view/crosshair", self.crosshair_action.isChecked())
         s.setValue("window/geometry", self.saveGeometry())
@@ -669,9 +733,21 @@ class MainWindow(QMainWindow):
     # --- camera connection --------------------------------------------------------
 
     def _start_worker(self):
-        """Open the camera on a new background thread."""
+        """Open the camera (self.camera_key) on a new background thread."""
         self._set_camera_status("Connecting...")
-        w = CameraWorker(self.camera_index)
+        devices = self._fill_camera_combo()
+        if self._cli_index is not None:  # main.py --index
+            if self._cli_index < len(devices):
+                self.camera_key = devices[self._cli_index]
+            self._cli_index = None
+        if self.camera_key is None and devices:
+            self.camera_key = devices[0]
+            self._fill_camera_combo()
+        if self.camera_key in devices:
+            index = devices.index(self.camera_key)
+            w = CameraWorker(index, self._saved_resolution())
+        else:  # not plugged in (or no camera at all): the worker just reports that
+            w = CameraWorker(None)
         w.opened.connect(self._on_camera_opened)
         w.open_failed.connect(self._on_open_failed)
         w.frame_ready.connect(self._on_frame)
@@ -693,25 +769,96 @@ class MainWindow(QMainWindow):
         self.camera_status.setStyleSheet(style)
         self.camera_status.setToolTip(tooltip)
 
+    def _fill_camera_combo(self) -> list[tuple[str, int]]:
+        """List the cameras in the Device box (plus the chosen one if it isn't
+        plugged in). Returns camera_list()."""
+        devices = camera_list()
+        combo = self.camera_combo
+        combo.blockSignals(True)
+        combo.clear()
+        for key in devices:
+            combo.addItem(camera_label(key), key)
+        if self.camera_key is not None and self.camera_key not in devices:
+            combo.addItem(f"{camera_label(self.camera_key)} (not connected)", self.camera_key)
+        if self.camera_key is not None:
+            combo.setCurrentIndex(find_item(combo, self.camera_key))
+        combo.blockSignals(False)
+        return devices
+
+    def _on_camera_chosen(self, _index: int):
+        key = self.camera_combo.currentData()
+        if key is None or tuple(key) == self.camera_key:
+            return
+        previous = self.camera_key
+        self.camera_key = tuple(key)
+        if not self.reconnect_camera():
+            self.camera_key = previous  # the user chose to keep recording
+            self._fill_camera_combo()
+
+    def _resolution_setting(self) -> str:
+        name, n = self.camera_key
+        return "camera/resolution/" + re.sub(r"[^\w.-]", "_", f"{name}_{n}")
+
+    def _saved_resolution(self) -> tuple[int, int] | None:
+        """The frame size chosen for this camera, or None for its largest."""
+        m = re.fullmatch(r"(\d+)x(\d+)", str(self.settings.value(self._resolution_setting(), "")))
+        return (int(m[1]), int(m[2])) if m else None
+
+    def _on_resolution_chosen(self, _index: int):
+        size = self.resolution_combo.currentData()
+        if size is None or tuple(size) == self._frame_size:
+            return
+        self.settings.setValue(self._resolution_setting(), f"{size[0]}x{size[1]}")
+        if not self.reconnect_camera():
+            self._fill_resolution_combo([])
+
+    def _fill_resolution_combo(self, modes: list[dict]):
+        """List the camera's frame sizes in the Resolution box, the open one selected."""
+        combo = self.resolution_combo
+        combo.blockSignals(True)
+        combo.clear()
+        sizes = frame_sizes(modes)
+        if self._frame_size and self._frame_size not in [s[:2] for s in sizes]:
+            sizes.append((*self._frame_size, None))
+        for w, h, fps in sizes:
+            combo.addItem(f"{w} x {h}" + (f"  ({fps:g} fps)" if fps else ""), (w, h))
+        if self._frame_size:
+            combo.setCurrentIndex(find_item(combo, self._frame_size))
+        combo.setEnabled(self.camera_open and len(sizes) > 1)
+        combo.blockSignals(False)
+
+    def _update_save_sizes(self):
+        """Show the real save sizes for the open camera in the Save size box."""
+        for i, (text, scale) in enumerate(SAVE_SCALES):
+            if self._frame_size:
+                w, h = scaled_size(*self._frame_size, scale)
+                text = f"{w} x {h} (native)" if scale == 1 else f"{w} x {h} (HD2 size, 1.7x upscaled)"
+            self.size_combo.setItemText(i, text)
+
     def _on_open_failed(self, message: str):
         self.camera_open = False
+        self._frame_size = None
+        self._fill_resolution_combo([])
         self._set_camera_status("Not connected", "color: #c00; font-weight: bold;", message)
         self.statusBar().showMessage(f"{message} Turn the camera on, then click Reconnect.")
 
-    def reconnect_camera(self):
-        """Close the camera (if open) and open it again."""
+    def reconnect_camera(self) -> bool:
+        """Close the camera (if open) and open self.camera_key again. False if
+        the user chose not to stop a recording."""
         busy = self._busy_recording()
         if busy and QMessageBox.question(
             self, "Reconnect camera", f"{' and '.join(busy).capitalize()}. Stop it and reconnect?"
         ) != QMessageBox.StandardButton.Yes:
-            return
+            return False
         self.statusBar().showMessage("Reconnecting to the camera...")
         self.worker.stop()  # closes the camera; a recording is finished and saved
         self.camera_open = False
         self.slider_box.setEnabled(False)
         self.capture_action.setEnabled(False)
         self.record_panel.set_enabled(False)
+        self.resolution_combo.setEnabled(False)
         self._start_worker()
+        return True
 
     def _busy_recording(self) -> list[str]:
         return [what for what, on in (("a video is recording", self.record_panel.record_button.isChecked()),
@@ -719,17 +866,24 @@ class MainWindow(QMainWindow):
 
     # --- camera events ------------------------------------------------------------
 
-    def _on_camera_opened(self, ranges: dict):
+    def _on_camera_opened(self, info: dict):
+        """info: name, size, modes and ranges (see CameraWorker.opened)."""
+        ranges = info["ranges"]
+        self._camera_values = {}  # values from a camera used before belong to that one
         for name, slider in self.sliders.items():
             r = ranges.get(name)
             slider.setEnabled(r is not None)
             if r is None:
+                self.value_labels[name].setText("not available")
                 continue
             slider.blockSignals(True)
             slider.setRange(r["min"], r["max"])
             slider.blockSignals(False)
         self.camera_open = True
-        self._set_camera_status("Connected", "color: green;")
+        self._frame_size = tuple(info["size"])
+        self._fill_resolution_combo(info["modes"])
+        self._update_save_sizes()
+        self._set_camera_status("Connected", "color: green;", info["name"])
         self.slider_box.setEnabled(True)
         self.capture_action.setEnabled(True)
         self.record_panel.set_enabled(True)
@@ -1214,7 +1368,8 @@ class MainWindow(QMainWindow):
                     r = compute(m)
                     circles.append((*r["center_px"], r["radius"]))
         axes = analyse_fibers(image, circles or None, method=self.fiber_panel.method(),
-                              parts_centre=self.fiber_panel.parts_centre_check.isChecked())
+                              parts_centre=self.fiber_panel.parts_centre_check.isChecked(),
+                              detection=self.fiber_panel.detection())
         if index == self.active:
             self.fiber_panel.set_axes(axes)
         else:  # e.g. live updates of the left image while the right one is active
@@ -1292,7 +1447,7 @@ class MainWindow(QMainWindow):
         data = {
             "capture": {
                 "average": self.average_combo.currentData(),
-                "save_size": list(self.size_combo.currentData()),
+                "save_scale": self.size_combo.currentData(),
                 "format": self.format_combo.currentData(),
             },
             "output": {"folder": self.folder_edit.text(), "name": self.name_edit.text()},
@@ -1392,8 +1547,11 @@ class MainWindow(QMainWindow):
                 problems.append("Camera settings will be applied when the camera opens.")
 
         cap = data.get("capture", {})
+        scale = cap.get("save_scale")
+        if scale is None and "save_size" in cap:  # files saved before 2026-10-06 held a size
+            scale = HD2_SCALE if tuple(cap["save_size"]) == (3264, 1836) else 1.0
         for combo, value in ((self.average_combo, cap.get("average")),
-                             (self.size_combo, tuple(cap["save_size"]) if "save_size" in cap else None),
+                             (self.size_combo, scale),
                              (self.format_combo, cap.get("format"))):
             i = combo.findData(value) if value is not None else -1
             if i >= 0:
@@ -1537,7 +1695,7 @@ class MainWindow(QMainWindow):
             return
         opts = {
             "n_frames": self.average_combo.currentData(),
-            "save_size": self.size_combo.currentData(),
+            "scale": self.size_combo.currentData(),
             "fmt": self.format_combo.currentData(),
             "folder": Path(self.folder_edit.text()),
             "name": clean_name(self.name_edit.text()),

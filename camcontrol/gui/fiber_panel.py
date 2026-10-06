@@ -8,16 +8,19 @@ the image in the view and exports.
 
 import math
 
-from PySide6.QtCore import QPointF, Qt, Signal
+from PySide6.QtCore import QPointF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QPushButton,
+    QSlider,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -26,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from camcontrol.gui.measure_draw import Style, draw_label
 from camcontrol.gui.qt_image import to_qimage
-from camcontrol.processing.fiber_axis import METHODS, FiberAxis
+from camcontrol.processing.fiber_axis import LOOK_AT, METHODS, Detection, FiberAxis
 
 SLOW_COLOR = QColor(255, 0, 200)   # magenta: shows on blue, white and black
 FAST_COLOR = QColor(255, 200, 0)
@@ -39,6 +42,17 @@ METHOD_TIPS = {
                "Each part counts the same whatever its shape. Elliptical fibers use Second moments.",
     "moments": "The principal axis of all stress-part pixels about the fiber centre.\n"
                "Far pixels count most, so the outer corners of bow-tie wedges decide it.",
+}
+
+THRESHOLD_STEP = 0.5   # threshold slider: noise units per step
+SMOOTHING_STEP = 0.25  # smoothing slider: % of the radius per step
+TUNE_DELAY_MS = 150    # re-measure this long after a slider stops moving
+
+LOOK_AT_TIPS = {
+    "both": "Stress parts differ from the cladding in brightness, color or both.",
+    "brightness": "Only brightness counts. For gray stress parts, or when color fringes\n"
+                  "(e.g. moiré, dirt, colored light) get mistaken for stress parts.",
+    "color": "Only color counts. For colored stress parts under uneven brightness.",
 }
 
 HINT = ("Angles: 0° is horizontal, + is turned counter-clockwise, - clockwise (-90° to +90°). Solid magenta line: slow axis (through the "
@@ -175,6 +189,7 @@ class FiberPanel(QWidget):
         left.addWidget(export)
         left.addStretch()
         layout.addLayout(left)
+        layout.addWidget(self._build_detection())
 
         right = QVBoxLayout()
         self.table = QTableWidget(0, 9)
@@ -196,6 +211,111 @@ class FiberPanel(QWidget):
         hint.setStyleSheet("color: gray;")
         right.addWidget(hint)
         layout.addLayout(right, stretch=1)
+
+    def _build_detection(self) -> QGroupBox:
+        """Controls for telling stress parts from the cladding, for low-contrast images."""
+        box = QGroupBox("Stress part detection")
+        box.setToolTip("Tune these when the shaded stress parts don't match what you see\n"
+                       "(turn on Show stress parts and Update live to watch them change).")
+        form = QFormLayout(box)
+        self._tune_timer = QTimer(self, singleShot=True, interval=TUNE_DELAY_MS)
+        self._tune_timer.timeout.connect(self.method_changed)
+
+        self.look_combo = QComboBox()
+        for i, (name, (label, _)) in enumerate(LOOK_AT.items()):
+            self.look_combo.addItem(label, name)
+            self.look_combo.setItemData(i, LOOK_AT_TIPS[name], Qt.ItemDataRole.ToolTipRole)
+        self.look_combo.setToolTip("What makes a stress part different from the cladding. Hover over a choice for details.")
+        self.look_combo.currentIndexChanged.connect(self.method_changed)
+        form.addRow("Look at:", self.look_combo)
+
+        self.auto_check = QCheckBox("Auto")
+        self.auto_check.setChecked(True)
+        self.auto_check.setToolTip("Pick the threshold automatically (Otsu's method).\n"
+                                   "Untick to set it yourself, starting from the automatic value.")
+        self.auto_check.toggled.connect(self._auto_toggled)
+        self.threshold_slider, self.threshold_label = self._slider(1, 80, 12, lambda v: f"{v * THRESHOLD_STEP:.1f}")
+        self.threshold_slider.setToolTip(
+            "How different from the cladding a pixel must be to count as stress part,\n"
+            "in multiples of the cladding's own noise. Lower finds fainter parts, but also noise.")
+        self.threshold_slider.setEnabled(False)
+        row = QHBoxLayout()
+        row.addWidget(self.auto_check)
+        row.addWidget(self.threshold_slider, stretch=1)
+        row.addWidget(self.threshold_label)
+        form.addRow("Threshold:", row)
+
+        self.smoothing_slider, label = self._slider(0, 20, 4, lambda v: f"{v * SMOOTHING_STEP:.2f}%")
+        self.smoothing_slider.setToolTip("Blur before comparing, as % of the fiber radius.\n"
+                                         "More smooths out noise and fine texture, but rounds off small parts.")
+        form.addRow("Smoothing:", self._row(self.smoothing_slider, label))
+
+        self.min_size_slider, label = self._slider(1, 40, 8, lambda v: f"{v}%")
+        self.min_size_slider.setToolTip("Leave out regions smaller than a square this wide (% of the fiber radius):\n"
+                                        "dust, scratches, noise.")
+        form.addRow("Ignore specks:", self._row(self.min_size_slider, label))
+
+        defaults = QPushButton("Defaults")
+        defaults.setToolTip("Back to the standard detection settings.")
+        defaults.clicked.connect(lambda: self.set_detection(Detection()))
+        form.addRow(defaults)
+        return box
+
+    def _slider(self, low: int, high: int, value: int, text) -> tuple[QSlider, QLabel]:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(low, high)
+        slider.setValue(value)
+        slider.setMinimumWidth(100)
+        label = QLabel(text(value))
+        label.setMinimumWidth(label.fontMetrics().horizontalAdvance("00.00%"))
+        slider.valueChanged.connect(lambda v: label.setText(text(v)))
+        slider.valueChanged.connect(lambda: self._tune_timer.start())
+        return slider, label
+
+    @staticmethod
+    def _row(slider: QSlider, label: QLabel) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addWidget(slider, stretch=1)
+        row.addWidget(label)
+        return row
+
+    def _auto_toggled(self, auto: bool):
+        self.threshold_slider.setEnabled(not auto)
+        self.method_changed.emit()
+
+    def detection(self) -> Detection:
+        return Detection(
+            threshold=None if self.auto_check.isChecked() else self.threshold_slider.value() * THRESHOLD_STEP,
+            smoothing=self.smoothing_slider.value() * SMOOTHING_STEP,
+            look_at=self.look_combo.currentData(),
+            min_size=float(self.min_size_slider.value()))
+
+    def set_detection(self, d: Detection):
+        """Show d's settings (one re-measure, not one per control)."""
+        widgets = (self.look_combo, self.auto_check, self.threshold_slider, self.smoothing_slider, self.min_size_slider)
+        for w in widgets:
+            w.blockSignals(True)
+        i = self.look_combo.findData(d.look_at)
+        self.look_combo.setCurrentIndex(max(i, 0))
+        self.auto_check.setChecked(d.threshold is None)
+        self.threshold_slider.setEnabled(d.threshold is not None)
+        if d.threshold is not None:
+            self._show_threshold(d.threshold)
+        self.smoothing_slider.setValue(round(d.smoothing / SMOOTHING_STEP))
+        self.min_size_slider.setValue(round(d.min_size))
+        for w in widgets:
+            w.blockSignals(False)
+        self.smoothing_slider.valueChanged.emit(self.smoothing_slider.value())  # update the labels
+        self.min_size_slider.valueChanged.emit(self.min_size_slider.value())
+        self._tune_timer.stop()  # started by those emits
+        self.method_changed.emit()
+
+    def _show_threshold(self, value: float):
+        """Put the slider at value without re-measuring."""
+        self.threshold_slider.blockSignals(True)
+        self.threshold_slider.setValue(round(value / THRESHOLD_STEP))
+        self.threshold_slider.blockSignals(False)
+        self.threshold_label.setText(f"{self.threshold_slider.value() * THRESHOLD_STEP:.1f}")
 
     def method(self) -> str:
         return self.method_combo.currentData()
@@ -227,12 +347,14 @@ class FiberPanel(QWidget):
         if keep is not None and keep < len(self.axes):
             self.table.selectRow(keep)
         self.table.blockSignals(False)
+        if self.auto_check.isChecked() and self.axes:  # show the automatic threshold, to start from
+            self._show_threshold(self.axes[keep if keep is not None and keep < len(self.axes) else 0].threshold)
         self.changed.emit()
 
     def rows(self, source: str) -> list[dict]:
         return [{"#": i + 1, "Type": f.fiber_type, "Slow axis (deg)": round(signed_angle(f.slow_deg), 2),
                  "Fast axis (deg)": round(signed_angle(f.fast_deg), 2), "Clarity": round(f.elongation, 3),
-                 "Method": METHODS[f.method],
+                 "Method": METHODS[f.method], "Threshold (noise x)": round(f.threshold, 2),
                  "Centre x (px)": round(f.cx, 1), "Centre y (px)": round(f.cy, 1),
                  "Axis x (px)": round(f.axis_point[0], 1), "Axis y (px)": round(f.axis_point[1], 1),
                  "Diameter (px)": round(2 * f.radius, 1), "Image": source}

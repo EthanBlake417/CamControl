@@ -11,10 +11,15 @@ Why this exists:
   each control's range, current value and auto/manual flag, and set
   values in manual mode.
 
-It opens its own handle on the device, separate from OpenCV's, so it can be
-used while the camera is streaming.
+  It also lists the cameras (list_video_devices) and the frame sizes and
+  formats each one offers (list_modes, through IAMStreamConfig), which
+  OpenCV can't do.
 
-Run directly to print every control the camera reports:
+It opens its own handle on the device, separate from OpenCV's, so it can be
+used while the camera is streaming. Cameras differ in which controls they
+have: range() returns None for any the camera doesn't support.
+
+Run directly to print every camera, its sizes and the first one's controls:
     python -m camcontrol.uvc_controls
 """
 
@@ -96,6 +101,64 @@ class IAMVideoProcAmp(IUnknown):
     _methods_ = _control_methods()
 
 
+class AM_MEDIA_TYPE(ctypes.Structure):
+    _fields_ = [
+        ("majortype", GUID),
+        ("subtype", GUID),
+        ("bFixedSizeSamples", ctypes.c_int),
+        ("bTemporalCompression", ctypes.c_int),
+        ("lSampleSize", ULONG),
+        ("formattype", GUID),
+        ("pUnk", c_void_p),
+        ("cbFormat", ULONG),
+        ("pbFormat", c_void_p),
+    ]
+
+
+class IAMStreamConfig(IUnknown):
+    _iid_ = GUID("{C6E13340-30AC-11d0-A18C-00A0C9118956}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "SetFormat", (["in"], POINTER(AM_MEDIA_TYPE))),
+        COMMETHOD([], HRESULT, "GetFormat", (["out"], POINTER(POINTER(AM_MEDIA_TYPE)))),
+        COMMETHOD([], HRESULT, "GetNumberOfCapabilities",
+                  (["out"], POINTER(ctypes.c_int)), (["out"], POINTER(ctypes.c_int))),
+        COMMETHOD([], HRESULT, "GetStreamCaps",
+                  (["in"], ctypes.c_int), (["out"], POINTER(POINTER(AM_MEDIA_TYPE))), (["in"], c_void_p)),
+    ]
+
+
+class IPin(IUnknown):
+    _iid_ = GUID("{56A86891-0AD4-11CE-B03A-0020AF0BA770}")
+
+
+class IEnumPins(IUnknown):
+    _iid_ = GUID("{56A86892-0AD4-11CE-B03A-0020AF0BA770}")
+    _methods_ = [
+        COMMETHOD([], HRESULT, "Next",
+                  (["in"], ULONG), (["out"], POINTER(POINTER(IPin))), (["out"], POINTER(ULONG))),
+    ]
+
+
+class IBaseFilter(IUnknown):
+    _iid_ = IID_IBaseFilter
+    _methods_ = [
+        COMMETHOD([], HRESULT, "GetClassID", (["out"], POINTER(GUID))),   # IPersist
+        COMMETHOD([], HRESULT, "Stop"),                                   # IMediaFilter
+        COMMETHOD([], HRESULT, "Pause"),
+        COMMETHOD([], HRESULT, "Run", (["in"], ctypes.c_longlong)),
+        COMMETHOD([], HRESULT, "GetState", (["in"], DWORD), (["out"], POINTER(ctypes.c_int))),
+        COMMETHOD([], HRESULT, "SetSyncSource", (["in"], c_void_p)),
+        COMMETHOD([], HRESULT, "GetSyncSource", (["out"], POINTER(c_void_p))),
+        COMMETHOD([], HRESULT, "EnumPins", (["out"], POINTER(POINTER(IEnumPins)))),  # IBaseFilter
+    ]
+
+
+FORMAT_VideoInfo = GUID("{05589F80-C356-11CE-BF01-00AA0055595A}")
+FORMAT_VideoInfo2 = GUID("{F72A76A0-EB0A-11D0-ACE4-0000C0CC16BA}")
+# Where the BITMAPINFOHEADER starts in each format block.
+_BMI_OFFSET = {str(FORMAT_VideoInfo): 48, str(FORMAT_VideoInfo2): 72}
+_AVG_TIME_OFFSET = 40  # AvgTimePerFrame (100 ns units), same place in both
+
 FLAG_AUTO = 0x1
 FLAG_MANUAL = 0x2
 
@@ -152,6 +215,61 @@ def list_video_devices() -> list[tuple[str, "IMoniker"]]:
     return devices
 
 
+def _fourcc(subtype: GUID) -> str:
+    """'MJPG', 'YUY2', 'NV12', ... from a video subtype GUID (its first 4 bytes),
+    or 'RGB' etc. for the few subtypes that aren't FOURCCs."""
+    code = bytes(subtype)[:4]
+    if all(32 <= b < 127 for b in code):
+        return code.decode("ascii").strip()
+    return "other"
+
+
+def list_modes(index: int) -> list[dict]:
+    """Frame sizes and formats camera `index` offers:
+    [{'width', 'height', 'fourcc', 'fps'}, ...], fps being the fastest it
+    allows at that size and format. Empty if the camera won't say."""
+    devices = list_video_devices()
+    if index >= len(devices):
+        return []
+    try:
+        base = devices[index][1].BindToObject(None, None, byref(IID_IBaseFilter)).QueryInterface(IBaseFilter)
+        pins = base.EnumPins()
+        config = None
+        # The first pin with formats to offer is the capture pin.
+        while config is None:
+            pin, fetched = pins.Next(1)
+            if not fetched:
+                return []
+            try:
+                config = pin.QueryInterface(IAMStreamConfig)
+            except comtypes.COMError:
+                pass
+        count, size = config.GetNumberOfCapabilities()
+        caps = ctypes.create_string_buffer(max(size, 128))
+        modes = []
+        for i in range(count):
+            pmt = config.GetStreamCaps(i, ctypes.addressof(caps))
+            mt = pmt.contents
+            try:
+                offset = _BMI_OFFSET.get(str(mt.formattype))
+                if offset is None or not mt.pbFormat or mt.cbFormat < offset + 12:
+                    continue
+                frame_time = ctypes.c_longlong.from_address(mt.pbFormat + _AVG_TIME_OFFSET).value
+                width = ctypes.c_long.from_address(mt.pbFormat + offset + 4).value
+                height = abs(ctypes.c_long.from_address(mt.pbFormat + offset + 8).value)
+                modes.append({
+                    "width": width, "height": height, "fourcc": _fourcc(mt.subtype),
+                    "fps": round(1e7 / frame_time, 1) if frame_time > 0 else None,
+                })
+            finally:
+                if mt.pbFormat:
+                    ctypes.windll.ole32.CoTaskMemFree(c_void_p(mt.pbFormat))
+                ctypes.windll.ole32.CoTaskMemFree(pmt)
+        return modes
+    except comtypes.COMError:
+        return []
+
+
 class CameraControls:
     """Read and set one camera's controls.
 
@@ -188,6 +306,8 @@ class CameraControls:
 
     def range(self, name) -> dict | None:
         """{'min', 'max', 'step', 'default', 'can_auto', 'can_manual'}, or None if unsupported."""
+        if self._ifaces[CONTROLS[name][0]] is None:
+            return None  # the camera has none of this kind of control
         iface, prop = self._lookup(name)
         try:
             lo, hi, step, default, caps = iface.GetRange(prop)
@@ -219,6 +339,8 @@ class CameraControls:
 if __name__ == "__main__":
     for i, (name, _) in enumerate(list_video_devices()):
         print(f"[{i}] {name}")
+        for m in list_modes(i):
+            print(f"      {m['width']} x {m['height']}  {m['fourcc']:5} {m['fps']} fps")
     ctl = CameraControls(0)
     print(f"\nControls for [0] {ctl.name}:")
     for name in CONTROLS:

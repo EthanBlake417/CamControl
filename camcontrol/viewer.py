@@ -10,7 +10,7 @@ Keys:
     g / b      gain up / down
     Space      capture a still to captures/ (image + .json settings)
     a          cycle frames averaged per capture (1, 4, 8, 16, 32)
-    r          toggle save size: native 1920x1080 / HD2-style 3264x1836
+    r          toggle save size: native / HD2-style 1.7x upscale
     x          toggle grid
     c          toggle crosshair (marks the centre of the camera frame)
     + / -      zoom in / out (display only; captures are never zoomed)
@@ -26,7 +26,7 @@ import time
 import cv2
 
 from camcontrol.camera import Camera, exposure_seconds, format_exposure
-from camcontrol.capture import HD2_SIZE, NATIVE_SIZE, grab_average, save_capture
+from camcontrol.capture import HD2_SCALE, grab_average, save_capture, scaled_size
 from camcontrol.overlays import View, draw_crosshair, draw_grid
 
 WINDOW = "CamControl"
@@ -64,7 +64,7 @@ def main():
     fps = 0.0
     last = time.perf_counter()
     average_idx = 0
-    save_size = NATIVE_SIZE
+    scale = 1.0
     message, message_until = "", 0.0
 
     while True:
@@ -88,13 +88,15 @@ def main():
                 draw_crosshair(shown, view)
 
             if show_info:
-                exp = cam.exposure
+                exp, gain = cam.exposure, cam.gain
                 n_avg = AVERAGE_CHOICES[average_idx]
-                size_note = " (upscaled)" if save_size != NATIVE_SIZE else ""
+                save_w, save_h = scaled_size(w, h, scale)
+                size_note = " (upscaled)" if scale != 1 else ""
                 lines = [
                     f"{w}x{h}  {fps:4.1f} fps",
-                    f"exposure {exp:g} (~{format_exposure(exp)})   gain {cam.gain:g}",
-                    f"capture: avg {n_avg}  save {save_size[0]}x{save_size[1]}{size_note}",
+                    (f"exposure {exp:g} (~{format_exposure(exp)})" if exp is not None else "exposure -")
+                    + (f"   gain {gain:g}" if gain is not None else ""),
+                    f"capture: avg {n_avg}  save {save_w}x{save_h}{size_note}",
                 ]
                 if view.zoom != 1:
                     lines.append(f"zoom {view.zoom:g}x")
@@ -113,18 +115,18 @@ def main():
             break
         elif key == ord("f"):
             show_info = not show_info
-        elif key == ord("e"):
+        elif key == ord("e") and cam.exposure is not None:
             cam.set_exposure(cam.exposure + 1)
-        elif key == ord("d"):
+        elif key == ord("d") and cam.exposure is not None:
             cam.set_exposure(cam.exposure - 1)
-        elif key == ord("g"):
+        elif key == ord("g") and cam.gain is not None:
             cam.set_gain(cam.gain + GAIN_STEP)
-        elif key == ord("b"):
+        elif key == ord("b") and cam.gain is not None:
             cam.set_gain(cam.gain - GAIN_STEP)
         elif key == ord("a"):
             average_idx = (average_idx + 1) % len(AVERAGE_CHOICES)
         elif key == ord("r"):
-            save_size = HD2_SIZE if save_size == NATIVE_SIZE else NATIVE_SIZE
+            scale = HD2_SCALE if scale == 1 else 1.0
         elif key == ord("x"):
             show_grid = not show_grid
         elif key == ord("c"):
@@ -137,7 +139,7 @@ def main():
             view.reset()
         elif key == ord(" "):
             n_avg = AVERAGE_CHOICES[average_idx]
-            est = n_avg * max(exposure_seconds(cam.exposure), 1 / 30)
+            est = n_avg * max(exposure_seconds(cam.exposure) if cam.exposure is not None else 0, 1 / 30)
             print(f"Capturing {n_avg} frame(s), about {est:.1f} s...")
             image, got = grab_average(cam, n_avg)
             path = save_capture(
@@ -145,7 +147,7 @@ def main():
                 exposure=cam.exposure,
                 gain=cam.gain,
                 frames_averaged=got,
-                save_size=save_size,
+                scale=scale,
             )
             print(f"Saved {path}")
             message, message_until = f"saved {path.name}", time.perf_counter() + MESSAGE_SECONDS

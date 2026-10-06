@@ -1,5 +1,11 @@
 """Open the microscope camera, grab frames, and set exposure / gain / etc.
 
+Works with any standard USB (UVC) camera Windows lists. Camera(index) opens
+the camera at its largest frame size (from uvc_controls.list_modes), or the
+size asked for. Cameras differ in which controls they have: ranges[name] is
+None for any the camera doesn't support, and values() leaves those out.
+The notes below are about the camera this was written for (the MC802).
+
 Findings from Phase 0 (tools/probe_camera.py, ffmpeg -list_options, and
 camcontrol/uvc_controls.py):
   - Windows name: "MC802 USB2.0 Camera", index 0 on this PC, using the
@@ -59,9 +65,10 @@ os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 
-from camcontrol.uvc_controls import CameraControls  # noqa: E402
+from camcontrol.uvc_controls import CameraControls, list_modes  # noqa: E402
 
 DEFAULT_INDEX = 0
+# Asked for when the camera won't list its sizes.
 DEFAULT_WIDTH = 1920
 DEFAULT_HEIGHT = 1080
 
@@ -89,6 +96,18 @@ def format_exposure(value: float) -> str:
     return f"{s:.2f} s" if s >= 1 else f"{s * 1000:.0f} ms"
 
 
+def frame_sizes(modes: list[dict]) -> list[tuple[int, int, float | None]]:
+    """The distinct frame sizes in modes (from uvc_controls.list_modes), largest
+    first, as (width, height, fastest fps at that size in any format)."""
+    best: dict[tuple[int, int], float | None] = {}
+    for m in modes:
+        key = (m["width"], m["height"])
+        fps = m["fps"]
+        if key not in best or (fps or 0) > (best[key] or 0):
+            best[key] = fps
+    return sorted(((w, h, fps) for (w, h), fps in best.items()), key=lambda s: (-s[0] * s[1], -s[0]))
+
+
 class Camera:
     """The microscope camera: frames from OpenCV, controls from uvc_controls.
 
@@ -100,22 +119,29 @@ class Camera:
         cam.close()
     """
 
-    def __init__(
-        self,
-        index: int = DEFAULT_INDEX,
-        width: int = DEFAULT_WIDTH,
-        height: int = DEFAULT_HEIGHT,
-    ):
+    def __init__(self, index: int = DEFAULT_INDEX, size: tuple[int, int] | None = None):
+        """size: (width, height) to ask for; None = the largest the camera offers."""
+        # Sizes and formats the camera offers (empty if it won't say).
+        self.modes = list_modes(index)
+        sizes = frame_sizes(self.modes)
+        if size is None:
+            size = sizes[0][:2] if sizes else (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+        width, height = size
+
         self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if not self.cap.isOpened():
             raise RuntimeError(
                 f"Could not open camera {index}. Close HD2 / OBS and try again."
             )
 
-        # Order matters: size first, then MJPG (see module docstring).
+        # Order matters: size first, then MJPG (see module docstring). MJPG is
+        # usually the fast format, but only ask for it if the camera has it at
+        # this size (or won't say).
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        if not self.modes or any(m["fourcc"] == "MJPG" and (m["width"], m["height"]) == (width, height)
+                                 for m in self.modes):
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
         # At long exposures (the camera remembers its last setting) the first
         # reads time out and come back black, so keep trying for a while.
@@ -130,10 +156,12 @@ class Camera:
         actual_h, actual_w = frame.shape[:2]
         if (actual_w, actual_h) != (width, height):
             print(f"Note: asked for {width}x{height}, camera gave {actual_w}x{actual_h}")
+        self.size = (actual_w, actual_h)
 
         # A second handle on the same device, for its controls.
         self.controls = CameraControls(index)
-        self.ranges = {name: self.controls.range(name) for name in ADJUSTABLE}
+        self.name = self.controls.name
+        self.ranges = {name: self._probe(name) for name in ADJUSTABLE}
         # The camera sometimes reports a nonsense exposure range (e.g. 3..3,
         # not even containing its current value); use the measured one then.
         exp = self.ranges.get("exposure")
@@ -150,7 +178,19 @@ class Camera:
 
         # Re-apply the current exposure so it's in effect even if HD2 left
         # the camera ignoring manual exposure.
-        self.set_exposure(self.exposure)
+        if exp:
+            self.set_exposure(self.exposure)
+
+    def _probe(self, name: str) -> dict | None:
+        """A control's range, or None if the camera doesn't have it (or
+        reports a range but can't be read)."""
+        try:
+            r = self.controls.range(name)
+            if r is not None:
+                self.controls.get(name)
+            return r
+        except Exception:
+            return None
 
     def read_raw(self):
         """Return the next frame from the camera, or None if no valid frame arrived.
@@ -209,6 +249,8 @@ class Camera:
     # --- controls ------------------------------------------------------------
 
     def get(self, name: str) -> int:
+        if self.ranges.get(name) is None:
+            raise RuntimeError(f"This camera has no {name} control")
         value = self.controls.get(name)[0]
         if name == "exposure" and self.frames_summed > 1:
             value += self.frames_summed.bit_length() - 1  # + log2(frames summed)
@@ -217,8 +259,9 @@ class Camera:
     def set(self, name: str, value: float) -> int:
         """Set a control (clamped to its range). Returns the value read back."""
         r = self.ranges.get(name)
-        if r is not None:
-            value = max(r["min"], min(r["max"], round(value)))
+        if r is None:
+            raise RuntimeError(f"This camera has no {name} control")
+        value = max(r["min"], min(r["max"], round(value)))
         if name == "exposure":
             # Past the camera's maximum: longest real exposure, frames added.
             extra = max(0, value - self.hw_exposure_max) if self.hw_exposure_max is not None else 0
@@ -232,20 +275,20 @@ class Camera:
         return self.get(name)
 
     def values(self) -> dict[str, int]:
-        """Current value of every adjustable control."""
-        return {name: self.get(name) for name in ADJUSTABLE}
+        """Current value of every adjustable control the camera has."""
+        return {name: self.get(name) for name in ADJUSTABLE if self.ranges.get(name) is not None}
 
-    # Shortcuts for the two used most.
+    # Shortcuts for the two used most. None if the camera doesn't have them.
     @property
-    def exposure(self) -> int:
-        return self.get("exposure")
+    def exposure(self) -> int | None:
+        return self.get("exposure") if self.ranges.get("exposure") else None
 
     def set_exposure(self, value: float) -> int:
         return self.set("exposure", value)
 
     @property
-    def gain(self) -> int:
-        return self.get("gain")
+    def gain(self) -> int | None:
+        return self.get("gain") if self.ranges.get("gain") else None
 
     def set_gain(self, value: float) -> int:
         return self.set("gain", value)
@@ -262,7 +305,7 @@ if __name__ == "__main__":
         frame = cam.read()
     elapsed = time.perf_counter() - t0
     h, w = frame.shape[:2]
-    print(f"Camera OK: {w}x{h}, {n / elapsed:.1f} fps")
+    print(f"Camera OK: {cam.name}, {w}x{h}, {n / elapsed:.1f} fps")
     for name, value in cam.values().items():
         r = cam.ranges[name]
         extra = f"  (~{format_exposure(value)})" if name == "exposure" else ""

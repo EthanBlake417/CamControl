@@ -9,9 +9,9 @@ How HD2 does it (from its config files and DLLs, 2026-09-24):
 
 So capture here works the same way:
   - Average N frames (reduces noise; N=1 is a plain snapshot).
-  - Save at the native 1920x1080, or scaled up to 3264x1836 to match HD2
-    files. Scaling up adds pixels, not detail, and changes the µm/px scale,
-    so the save size is recorded in the metadata.
+  - Save at the camera's own size, or scaled up 1.7x to match HD2 files
+    (1920x1080 becomes 3264x1836). Scaling up adds pixels, not detail, and
+    changes the µm/px scale, so the save size is recorded in the metadata.
 
 Each capture writes an image plus a .json sidecar with the settings used.
 Files are named name-001.tif, name-002.tif, ... when a name is given, or
@@ -34,8 +34,13 @@ from camcontrol.image_io import save_image_file
 
 CAPTURE_DIR = Path(__file__).resolve().parent.parent / "captures"
 
-NATIVE_SIZE = (1920, 1080)
-HD2_SIZE = (3264, 1836)
+# HD2 saves the MC802's 1920x1080 frames at 3264x1836: 1.7x larger.
+HD2_SCALE = 3264 / 1920
+
+
+def scaled_size(width: int, height: int, scale: float) -> tuple[int, int]:
+    """Frame size after scaling (1.0 = unchanged)."""
+    return round(width * scale), round(height * scale)
 
 
 def grab_average(cam: Camera, n_frames: int, max_attempts: int | None = None):
@@ -106,14 +111,14 @@ def save_capture(
     exposure: float,
     gain: float,
     frames_averaged: int,
-    save_size: tuple[int, int] = NATIVE_SIZE,
+    scale: float = 1.0,
     fmt: str = "tif",
     folder: Path = CAPTURE_DIR,
     name: str = "",
     prefix: str = "cap",
     extra: dict | None = None,
 ) -> Path:
-    """Save an image (resized to save_size if needed) plus a JSON sidecar.
+    """Save an image (scaled up by scale, if not 1) plus a JSON sidecar.
 
     extra: more entries for the sidecar (e.g. the flat-field used).
 
@@ -125,6 +130,7 @@ def save_capture(
     path = next_capture_path(folder, name, fmt, prefix)
 
     src_h, src_w = image.shape[:2]
+    save_size = scaled_size(src_w, src_h, scale)
     if (src_w, src_h) != save_size:
         # Bicubic is a good general-purpose choice for scaling up.
         image = cv2.resize(image, save_size, interpolation=cv2.INTER_CUBIC)
@@ -137,7 +143,7 @@ def save_capture(
         "saved_size": list(save_size),
         "upscaled": save_size != (src_w, src_h),
         "exposure_value": exposure,
-        "exposure_seconds_approx": exposure_seconds(exposure),
+        "exposure_seconds_approx": exposure_seconds(exposure) if exposure is not None else None,
         "gain": gain,
         "frames_averaged": frames_averaged,
         # Filled in once calibration (Phase 2) exists.
