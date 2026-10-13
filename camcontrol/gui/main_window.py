@@ -641,7 +641,9 @@ class MainWindow(QMainWindow):
             self.record_panel.set_state(json.loads(s.value("recording/state", "{}")))
         except (ValueError, TypeError):
             pass  # unreadable saved state: keep the defaults
-        self.gallery.set_folder(self.folder_edit.text())
+        self.gallery.set_output_folder(self.folder_edit.text())
+        self.gallery.set_follow_output(s.value("gallery/follow_output", True, type=bool),
+                                       s.value("gallery/folder", ""))
         self._update_next_name()
         flat_path = s.value("flatfield/path", "")
         if flat_path and Path(flat_path).is_file():
@@ -714,6 +716,8 @@ class MainWindow(QMainWindow):
         s.setValue("capture/tab", self.capture_tabs.currentIndex())
         s.setValue("capture/name", self.name_edit.text())
         s.setValue("gallery/count", self.gallery.count)
+        s.setValue("gallery/follow_output", self.gallery.follows_output)
+        s.setValue("gallery/folder", str(self.gallery.folder or ""))
         s.setValue("fiber/method", self.fiber_panel.method())
         s.setValue("fiber/parts_centre", self.fiber_panel.parts_centre_check.isChecked())
         s.setValue("fiber/show_parts", self.fiber_panel.show_parts_check.isChecked())
@@ -1029,7 +1033,7 @@ class MainWindow(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "Output folder", self.folder_edit.text())
         if folder:
             self.folder_edit.setText(folder)
-            self.gallery.set_folder(folder)
+            self.gallery.set_output_folder(folder)
             self._update_next_name()
 
     def open_capture_folder(self):
@@ -1606,7 +1610,7 @@ class MainWindow(QMainWindow):
         out = data.get("output", {})
         if out.get("folder"):
             self.folder_edit.setText(out["folder"])
-            self.gallery.set_folder(out["folder"])
+            self.gallery.set_output_folder(out["folder"])
         if "name" in out:
             self.name_edit.setText(out["name"])
         self._update_next_name()

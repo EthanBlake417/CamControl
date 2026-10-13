@@ -1,7 +1,10 @@
 """Captures panel: thumbnails of the most recent images and videos in the
-capture folder.
+capture folder, or in another folder chosen in the panel.
 
 - Shows the newest N images (N chosen by the user), newest first.
+- "Same as output folder" (on by default) follows the Output box folder.
+  Choosing a folder with "..." turns it off; turning it back on returns
+  to the output folder.
 - Updates by itself when files in the folder change (new captures, files
   copied in or deleted), using QFileSystemWatcher.
 - Double-click a thumbnail to open it in the main view (videos play there).
@@ -23,8 +26,11 @@ from PySide6.QtCore import QFile, QFileSystemWatcher, QPointF, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListView,
     QListWidget,
     QListWidgetItem,
@@ -89,7 +95,8 @@ class GalleryPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.folder: Path | None = None
+        self.folder: Path | None = None         # the folder shown
+        self.output_folder: Path | None = None  # the Output box folder, shown when following it
         self._cache: dict[tuple[str, float], QIcon] = {}  # (path, mtime) -> thumbnail
         self._queue: list[str] = []                       # paths still to load
         self._shown: list[tuple[str, float]] = []         # what the list shows now
@@ -107,6 +114,23 @@ class GalleryPanel(QWidget):
         refresh.clicked.connect(lambda: self.refresh(force=True))
         top.addWidget(refresh)
         layout.addLayout(top)
+
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(QLabel("Folder"))
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setReadOnly(True)
+        folder_row.addWidget(self.folder_edit, 1)
+        browse = QPushButton("...")
+        browse.setFixedWidth(30)
+        browse.setToolTip("Choose the folder to show")
+        browse.clicked.connect(self._choose_folder)
+        folder_row.addWidget(browse)
+        layout.addLayout(folder_row)
+        self.follow_check = QCheckBox("Same as output folder")
+        self.follow_check.setChecked(True)
+        self.follow_check.setToolTip("Show the folder captures are saved to")
+        self.follow_check.toggled.connect(self._on_follow_toggled)
+        layout.addWidget(self.follow_check)
 
         self.list = QListWidget()
         self.list.setViewMode(QListView.ViewMode.IconMode)
@@ -169,8 +193,30 @@ class GalleryPanel(QWidget):
         rows = sorted((self.list.row(i), i.data(PATH_ROLE)) for i in self.list.selectedItems())
         return [path for _, path in reversed(rows)]  # the list shows newest first
 
+    @property
+    def follows_output(self) -> bool:
+        return self.follow_check.isChecked()
+
+    def set_output_folder(self, folder):
+        """The Output box folder changed. Shown if "Same as output folder" is on."""
+        self.output_folder = Path(folder)
+        if self.follows_output:
+            self.set_folder(folder)
+
+    def set_follow_output(self, follow: bool, folder=None):
+        """Restore the panel's state: follow the output folder, or show `folder`."""
+        if not follow and folder:
+            self.follow_check.blockSignals(True)
+            self.follow_check.setChecked(False)
+            self.follow_check.blockSignals(False)
+            self.set_folder(folder)
+        else:
+            self.follow_check.setChecked(True)
+
     def set_folder(self, folder):
         self.folder = Path(folder)
+        self.folder_edit.setText(str(self.folder))
+        self.folder_edit.setToolTip(str(self.folder))
         if self._watcher.directories():
             self._watcher.removePaths(self._watcher.directories())
         if self.folder.is_dir():
@@ -211,6 +257,21 @@ class GalleryPanel(QWidget):
             self._loader.start()
 
     # --- internals -----------------------------------------------------------------
+
+    def _choose_folder(self):
+        start = str(self.folder) if self.folder else ""
+        folder = QFileDialog.getExistingDirectory(self, "Folder to show", start)
+        if not folder:
+            return
+        self.follow_check.blockSignals(True)
+        self.follow_check.setChecked(self.output_folder is not None
+                                     and os.path.normcase(Path(folder)) == os.path.normcase(self.output_folder))
+        self.follow_check.blockSignals(False)
+        self.set_folder(folder)
+
+    def _on_follow_toggled(self, follow: bool):
+        if follow and self.output_folder is not None:
+            self.set_folder(self.output_folder)
 
     def _on_folder_changed(self):
         self.refresh()
