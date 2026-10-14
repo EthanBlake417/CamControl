@@ -36,6 +36,10 @@ FAST_COLOR = QColor(255, 200, 0)
 LINE_LENGTH = 1.25                 # axis lines reach this many radii from the centre
 
 METHOD_TIPS = {
+    "rods": "For Panda fibers: finds the round outlines of the two stress rods and takes\n"
+            "the line through their centres. Uses only edges, so shading and dark patches\n"
+            "don't matter, and needs no detection settings. Unclear if the outlines are faint\n"
+            "or not round (e.g. Bow-tie fibers: use Mirror symmetry for those).",
     "symmetry": "The line the end face is most mirror-symmetric about (and at 90° to it).\n"
                 "No threshold; lopsided stress parts don't pull it.",
     "centres": "The line through the centres of the two stress parts (Panda, Bow-tie).\n"
@@ -70,6 +74,12 @@ def signed_angle(deg: float) -> float:
 def fmt_angle(deg: float) -> str:
     a = round(signed_angle(deg), 1)
     return f"{0.0 if a == 0 else a:+.1f}"  # no "-0.0"
+
+
+def clarity_text(f: FiberAxis) -> str:
+    if f.coverage is not None:  # "rods": how much of the rod outlines was found
+        return f"{f.coverage:.0%} outline"
+    return f"{f.elongation:.2f}"
 
 
 def draw_fiber_axes(painter: QPainter, axes: list[FiberAxis], to_out, zoom: float, style: Style,
@@ -175,6 +185,12 @@ class FiberPanel(QWidget):
             "Shade the stress parts the axis was measured from, with a cross at each one's centre,\n"
             "and ring the point the axis turns about. Also used for the exported drawing.")
         left.addWidget(self.show_parts_check)
+        self.centre_only_check = QCheckBox("Only the centre fiber")
+        self.centre_only_check.setToolTip(
+            "Of the fibers found automatically, measure only the one nearest the middle of the image\n"
+            "(e.g. the lit fiber in a V-groove, with its neighbours ignored). Faster for Update live.")
+        self.centre_only_check.toggled.connect(self.method_changed)
+        left.addWidget(self.centre_only_check)
         self.use_circles = QCheckBox("Use circle measurements")
         self.use_circles.setChecked(True)
         self.use_circles.setToolTip("If there are Circle measurements, measure the fibers inside them\n"
@@ -189,7 +205,10 @@ class FiberPanel(QWidget):
         left.addWidget(export)
         left.addStretch()
         layout.addLayout(left)
-        layout.addWidget(self._build_detection())
+        self.detection_box = self._build_detection()
+        layout.addWidget(self.detection_box)
+        self.method_combo.currentIndexChanged.connect(self._update_detection_enabled)
+        self._update_detection_enabled()
 
         right = QVBoxLayout()
         self.table = QTableWidget(0, 9)
@@ -204,7 +223,9 @@ class FiberPanel(QWidget):
         self.table.itemSelectionChanged.connect(self.changed)
         self.table.horizontalHeaderItem(4).setToolTip(
             "How much longer the stress parts spread along the slow axis than across it.\n"
-            "Below 1.3 the axis isn't clear (e.g. a plain round fiber, or poor contrast).")
+            "Below 1.3 the axis isn't clear (e.g. a plain round fiber, or poor contrast).\n"
+            "Panda rod outlines: how much of the rods' outlines was found;\n"
+            "below 75% (or with faint outlines) the axis isn't clear.")
         right.addWidget(self.table)
         hint = QLabel(HINT)
         hint.setWordWrap(True)
@@ -260,6 +281,11 @@ class FiberPanel(QWidget):
         defaults.clicked.connect(lambda: self.set_detection(Detection()))
         form.addRow(defaults)
         return box
+
+    def _update_detection_enabled(self):
+        # "Panda rod outlines" works on edges: the detection settings don't apply.
+        self.detection_box.setEnabled(self.method() != "rods")
+        self.parts_centre_check.setEnabled(self.method() != "rods")  # its axis always goes through the rods
 
     def _slider(self, low: int, high: int, value: int, text) -> tuple[QSlider, QLabel]:
         slider = QSlider(Qt.Orientation.Horizontal)
@@ -337,7 +363,7 @@ class FiberPanel(QWidget):
         self.table.setRowCount(len(self.axes))
         for row, f in enumerate(self.axes):
             values = [str(row + 1), f.fiber_type, fmt_angle(f.slow_deg), fmt_angle(f.fast_deg),
-                      f"{f.elongation:.2f}" + ("" if f.clear else " (unclear)"), METHODS[f.method],
+                      clarity_text(f) + ("" if f.clear else " (unclear)"), METHODS[f.method],
                       f"{f.cx:.1f}, {f.cy:.1f}", "{:.1f}, {:.1f}".format(*f.axis_point), f"{2 * f.radius:.1f}"]
             for col, text in enumerate(values):
                 item = QTableWidgetItem(text)
@@ -354,7 +380,9 @@ class FiberPanel(QWidget):
     def rows(self, source: str) -> list[dict]:
         return [{"#": i + 1, "Type": f.fiber_type, "Slow axis (deg)": round(signed_angle(f.slow_deg), 2),
                  "Fast axis (deg)": round(signed_angle(f.fast_deg), 2), "Clarity": round(f.elongation, 3),
-                 "Method": METHODS[f.method], "Threshold (noise x)": round(f.threshold, 2),
+                 "Method": METHODS[f.method], "Clear": f.clear,
+                 "Threshold (noise x)": None if f.method == "rods" else round(f.threshold, 2),
+                 "Rod outline found": None if f.coverage is None else round(f.coverage, 3),
                  "Centre x (px)": round(f.cx, 1), "Centre y (px)": round(f.cy, 1),
                  "Axis x (px)": round(f.axis_point[0], 1), "Axis y (px)": round(f.axis_point[1], 1),
                  "Diameter (px)": round(2 * f.radius, 1), "Image": source}

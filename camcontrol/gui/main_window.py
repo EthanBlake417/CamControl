@@ -630,7 +630,8 @@ class MainWindow(QMainWindow):
         self.capture_tabs.setCurrentIndex(int(s.value("capture/tab", 0)))
         self.name_edit.setText(s.value("capture/name", ""))
         self.gallery.set_count(int(s.value("gallery/count", 12)))
-        self.fiber_panel.set_method(s.value("fiber/method", "symmetry"))
+        self.fiber_panel.set_method(s.value("fiber/method", "rods"))
+        self.fiber_panel.centre_only_check.setChecked(s.value("fiber/centre_only", False, type=bool))
         self.fiber_panel.parts_centre_check.setChecked(s.value("fiber/parts_centre", False, type=bool))
         self.fiber_panel.show_parts_check.setChecked(s.value("fiber/show_parts", True, type=bool))
         try:
@@ -719,6 +720,7 @@ class MainWindow(QMainWindow):
         s.setValue("gallery/follow_output", self.gallery.follows_output)
         s.setValue("gallery/folder", str(self.gallery.folder or ""))
         s.setValue("fiber/method", self.fiber_panel.method())
+        s.setValue("fiber/centre_only", self.fiber_panel.centre_only_check.isChecked())
         s.setValue("fiber/parts_centre", self.fiber_panel.parts_centre_check.isChecked())
         s.setValue("fiber/show_parts", self.fiber_panel.show_parts_check.isChecked())
         s.setValue("fiber/detection", json.dumps(asdict(self.fiber_panel.detection())))
@@ -1392,8 +1394,9 @@ class MainWindow(QMainWindow):
         method = self.fiber_panel.method()
         parts_centre = self.fiber_panel.parts_centre_check.isChecked()
         detection = self.fiber_panel.detection()
-        return lambda image: analyse_fibers(image, circles or None, method=method,
-                                            parts_centre=parts_centre, detection=detection)
+        centre_only = self.fiber_panel.centre_only_check.isChecked()
+        return lambda image: analyse_fibers(image, circles or None, method=method, parts_centre=parts_centre,
+                                            detection=detection, centre_only=centre_only)
 
     def _show_fiber_axes(self, index: int, axes: list):
         if index == self.active:
