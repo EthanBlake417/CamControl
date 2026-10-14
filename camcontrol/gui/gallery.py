@@ -8,6 +8,8 @@ capture folder, or in another folder chosen in the panel.
 - Updates by itself when files in the folder change (new captures, files
   copied in or deleted), using QFileSystemWatcher.
 - Double-click a thumbnail to open it in the main view (videos play there).
+  Then the arrow keys (also Home/End/Page Up/Down) step to the next or
+  previous one and open it; with Shift or Ctrl held they only select.
 - Select several (Ctrl/Shift-click) and right-click to focus stack, HDR,
   stitch or combine them (see PROCESS_TOOLS).
 - Delete (right-click or the Delete key) moves the selected images, and
@@ -87,6 +89,19 @@ def draw_play_mark(pixmap: QPixmap):
     painter.end()
 
 
+class _ThumbnailList(QListWidget):
+    """The thumbnails; tells when the keyboard moved to another one."""
+    stepped = Signal(QListWidgetItem)  # moved to this item with a key, no Shift/Ctrl
+
+    def keyPressEvent(self, event):
+        before = self.currentItem()
+        super().keyPressEvent(event)
+        selecting = event.modifiers() & (Qt.KeyboardModifier.ShiftModifier | Qt.KeyboardModifier.ControlModifier)
+        current = self.currentItem()
+        if current is not None and current is not before and not selecting:
+            self.stepped.emit(current)
+
+
 class GalleryPanel(QWidget):
     open_requested = Signal(str)  # image path
     folder_changed = Signal()     # files in the folder were added, removed or changed
@@ -132,7 +147,7 @@ class GalleryPanel(QWidget):
         self.follow_check.toggled.connect(self._on_follow_toggled)
         layout.addWidget(self.follow_check)
 
-        self.list = QListWidget()
+        self.list = _ThumbnailList()
         self.list.setViewMode(QListView.ViewMode.IconMode)
         self.list.setIconSize(THUMB_SIZE)
         self.list.setResizeMode(QListView.ResizeMode.Adjust)
@@ -142,6 +157,7 @@ class GalleryPanel(QWidget):
         self.list.setSpacing(4)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list.itemDoubleClicked.connect(lambda item: self.open_requested.emit(item.data(PATH_ROLE)))
+        self.list.stepped.connect(lambda item: self.open_requested.emit(item.data(PATH_ROLE)))
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.list.customContextMenuRequested.connect(self._context_menu)
         # Delete key, only while the thumbnail list has focus.
@@ -152,7 +168,7 @@ class GalleryPanel(QWidget):
         self.list.addAction(self.delete_action)
         layout.addWidget(self.list)
 
-        hint = QLabel("Double-click to open. Ctrl/Shift-click to select several, "
+        hint = QLabel("Double-click to open, then the arrow keys step through. Ctrl/Shift-click to select several, "
                       "right-click for tools. Delete moves to the Recycle Bin.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
