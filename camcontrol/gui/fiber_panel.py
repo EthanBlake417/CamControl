@@ -36,6 +36,8 @@ FAST_COLOR = QColor(255, 200, 0)
 LINE_LENGTH = 1.25                 # axis lines reach this many radii from the centre
 
 METHOD_TIPS = {
+    "auto": "Works out the fiber type and uses the best method for it: Panda rod outlines\n"
+            "for Panda fibers, Mirror symmetry for Bow-tie and Elliptical ones.",
     "rods": "For Panda fibers: finds the round outlines of the two stress rods and takes\n"
             "the line through their centres. Uses only edges, so shading and dark patches\n"
             "don't matter, and needs no detection settings. Unclear if the outlines are faint\n"
@@ -59,7 +61,8 @@ LOOK_AT_TIPS = {
     "color": "Only color counts. For colored stress parts under uneven brightness.",
 }
 
-HINT = ("Angles: 0° is horizontal, + is turned counter-clockwise, - clockwise (-90° to +90°). Solid magenta line: slow axis (through the "
+HINT = ("Clarity: how sure the result is; \"(unclear)\" means check it by eye. "
+        "Angles: 0° is horizontal, + is turned counter-clockwise, - clockwise (-90° to +90°). Solid magenta line: slow axis (through the "
         "stress rods / wedges / ellipse). Dashed yellow: fast axis. Fibers are found automatically; "
         "for one that isn't, draw a Circle (3 pt or centre) round it in Measurements, then Find axes.")
 
@@ -160,7 +163,8 @@ class FiberPanel(QWidget):
         left.addWidget(find)
         self.live_check = QCheckBox("Update live")
         self.live_check.setToolTip("Keep measuring the live view (a few times a second),\n"
-                                   "e.g. while rotating a fiber to line up its axis.")
+                                   "e.g. while rotating a fiber to line up its axis,\n"
+                                   "and measure each saved image as it's opened.")
         self.live_check.toggled.connect(self.live_changed)
         left.addWidget(self.live_check)
         self.method_combo = QComboBox()
@@ -169,16 +173,19 @@ class FiberPanel(QWidget):
             self.method_combo.setItemData(i, METHOD_TIPS[name], Qt.ItemDataRole.ToolTipRole)
         self.method_combo.setToolTip("How the axis angle is worked out. Hover over a choice for details.")
         self.method_combo.currentIndexChanged.connect(self.method_changed)
+        self.advanced = QWidget()  # shown with "Show advanced settings"
+        advanced = QVBoxLayout(self.advanced)
+        advanced.setContentsMargins(0, 0, 0, 0)
         method_row = QHBoxLayout()
         method_row.addWidget(QLabel("Method:"))
         method_row.addWidget(self.method_combo, stretch=1)
-        left.addLayout(method_row)
+        advanced.addLayout(method_row)
         self.parts_centre_check = QCheckBox("Turn about stress parts")
         self.parts_centre_check.setToolTip(
             "Measure the axis about the centre of the stress parts instead of the fiber centre\n"
             "(Mirror symmetry and Second moments; for stress parts off the fiber's middle).")
         self.parts_centre_check.toggled.connect(self.method_changed)
-        left.addWidget(self.parts_centre_check)
+        advanced.addWidget(self.parts_centre_check)
         self.show_parts_check = QCheckBox("Show stress parts")
         self.show_parts_check.setChecked(True)
         self.show_parts_check.setToolTip(
@@ -203,12 +210,19 @@ class FiberPanel(QWidget):
         export.clicked.connect(self.export_requested)
         left.addWidget(clear)
         left.addWidget(export)
+        self.advanced_check = QCheckBox("Show advanced settings")
+        self.advanced_check.setToolTip("The method and the stress part detection settings.\n"
+                                       "Not needed normally: Automatic picks the method for each fiber.")
+        self.advanced_check.toggled.connect(self._show_advanced)
+        left.addWidget(self.advanced_check)
+        left.addWidget(self.advanced)
         left.addStretch()
         layout.addLayout(left)
         self.detection_box = self._build_detection()
         layout.addWidget(self.detection_box)
         self.method_combo.currentIndexChanged.connect(self._update_detection_enabled)
         self._update_detection_enabled()
+        self._show_advanced(False)
 
         right = QVBoxLayout()
         self.table = QTableWidget(0, 9)
@@ -225,7 +239,7 @@ class FiberPanel(QWidget):
             "How much longer the stress parts spread along the slow axis than across it.\n"
             "Below 1.3 the axis isn't clear (e.g. a plain round fiber, or poor contrast).\n"
             "Panda rod outlines: how much of the rods' outlines was found;\n"
-            "below 75% (or with faint outlines) the axis isn't clear.")
+            "below 50% (or with faint outlines) the axis isn't clear.")
         right.addWidget(self.table)
         hint = QLabel(HINT)
         hint.setWordWrap(True)
@@ -281,6 +295,10 @@ class FiberPanel(QWidget):
         defaults.clicked.connect(lambda: self.set_detection(Detection()))
         form.addRow(defaults)
         return box
+
+    def _show_advanced(self, on: bool):
+        self.advanced.setVisible(on)
+        self.detection_box.setVisible(on)
 
     def _update_detection_enabled(self):
         # "Panda rod outlines" works on edges: the detection settings don't apply.

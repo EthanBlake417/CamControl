@@ -198,6 +198,8 @@ class MainWindow(QMainWindow):
         self.fiber_panel = FiberPanel()
         self._fiber_last = 0.0  # when the live view was last measured
         self._fiber_job: Job | None = None  # live fiber measuring running in the background
+        self._still_fiber_job: Job | None = None  # measuring an opened image (Update live on)
+        self._still_fiber_next = None  # image opened while that was busy: measured next
         # The main view first, then any compare images; the panels start on the main view.
         self.panes = [Pane(self.view, self.measure_panel.measurements, self.count_panel.counter)]
         self.active = 0
@@ -630,7 +632,8 @@ class MainWindow(QMainWindow):
         self.capture_tabs.setCurrentIndex(int(s.value("capture/tab", 0)))
         self.name_edit.setText(s.value("capture/name", ""))
         self.gallery.set_count(int(s.value("gallery/count", 12)))
-        self.fiber_panel.set_method(s.value("fiber/method", "rods"))
+        self.fiber_panel.set_method(s.value("fiber/method_v2", "auto"))
+        self.fiber_panel.advanced_check.setChecked(s.value("fiber/advanced", False, type=bool))
         self.fiber_panel.centre_only_check.setChecked(s.value("fiber/centre_only", False, type=bool))
         self.fiber_panel.parts_centre_check.setChecked(s.value("fiber/parts_centre", False, type=bool))
         self.fiber_panel.show_parts_check.setChecked(s.value("fiber/show_parts", True, type=bool))
@@ -719,7 +722,8 @@ class MainWindow(QMainWindow):
         s.setValue("gallery/count", self.gallery.count)
         s.setValue("gallery/follow_output", self.gallery.follows_output)
         s.setValue("gallery/folder", str(self.gallery.folder or ""))
-        s.setValue("fiber/method", self.fiber_panel.method())
+        s.setValue("fiber/method_v2", self.fiber_panel.method())
+        s.setValue("fiber/advanced", self.fiber_panel.advanced_check.isChecked())
         s.setValue("fiber/centre_only", self.fiber_panel.centre_only_check.isChecked())
         s.setValue("fiber/parts_centre", self.fiber_panel.parts_centre_check.isChecked())
         s.setValue("fiber/show_parts", self.fiber_panel.show_parts_check.isChecked())
@@ -940,6 +944,39 @@ class MainWindow(QMainWindow):
         self._fiber_job.deleteLater()
         self._fiber_job = None
 
+    def _measure_opened_image(self):
+        """A new image (a file, a result) was opened: clear the old axes, and with
+        Update live on measure it, in the background, so clicking through images keeps the axes
+        up to date. One at a time: an image opened meanwhile is measured next,
+        and only the newest image's result is shown."""
+        if self.live or self.view.image is None:
+            return
+        self._show_fiber_axes(0, [])  # the old image's axes don't belong to this one
+        if not self.fiber_panel.live_check.isChecked():
+            return
+        image = self.view.image
+        if self._still_fiber_job is not None:
+            self._still_fiber_next = image
+            return
+        analyse = self._fiber_analysis(0)
+        job = Job(lambda: analyse(image), self)
+        job.succeeded.connect(lambda axes: self._opened_fibers_done(image, axes))
+        job.failed.connect(lambda msg: self.statusBar().showMessage(f"Fiber axes: {msg}", 6000))
+        job.finished.connect(self._opened_fibers_finished)
+        self._still_fiber_job = job
+        job.start()
+
+    def _opened_fibers_done(self, image, axes):
+        if not self.live and self.view.image is image and self.fiber_panel.live_check.isChecked():
+            self._show_fiber_axes(0, axes)
+
+    def _opened_fibers_finished(self):
+        self._still_fiber_job.deleteLater()
+        self._still_fiber_job = None
+        if self._still_fiber_next is not None:
+            self._still_fiber_next = None
+            self._measure_opened_image()  # the image shown now
+
     def _on_camera_settings(self, values: dict):
         self._camera_values.update(values)
         for name, value in values.items():
@@ -1070,6 +1107,7 @@ class MainWindow(QMainWindow):
         self._result = None
         self._set_title(self._source)
         self._show_source(path)
+        self._measure_opened_image()
 
     def open_video_path(self, path: str):
         """Open a video under the player bar, paused on its first frame."""
@@ -1190,6 +1228,7 @@ class MainWindow(QMainWindow):
         self._set_title(f"{title} (unsaved)")
         self._show_source()
         self.statusBar().showMessage(f"{title} done. File > Save image as (Ctrl+S) to keep it.", 8000)
+        self._measure_opened_image()
 
     def run_process(self, key: str, paths: list | None = None):
         """Open a processing dialog, then run it in the background.
@@ -1761,8 +1800,9 @@ class MainWindow(QMainWindow):
             return
         if self._job is not None:
             self._job.wait()  # let a running processing job finish first
-        if self._fiber_job is not None:
-            self._fiber_job.wait()
+        for job in (self._fiber_job, self._still_fiber_job):
+            if job is not None:
+                job.wait()
         self._save_settings()
         self.worker.stop()
         super().closeEvent(event)
