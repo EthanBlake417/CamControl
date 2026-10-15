@@ -12,7 +12,7 @@ Early development. Done: camera probe (Phase 0), live view and capture (Phase 1)
 venv\Scripts\python main.py
 ```
 
-The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exposure, gain, contrast, saturation and sharpness; capture with frame averaging, save size, format and folder; grid and crosshair overlays; freeze; opening image files; and a pixel readout (x, y, RGB) in the status bar. Settings are remembered between runs.
+The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exposure, gain, contrast, saturation and sharpness; capture with frame averaging, save size, format and folder; grid and crosshair overlays (**View → Grid settings...** sets the grid's columns and rows, or square cells, line width, style, color and opacity, and the grid follows as you change them); freeze; opening image files; and a pixel readout (x, y, RGB) in the status bar. Settings are remembered between runs.
 
 | Key | Action |
 |---|---|
@@ -282,9 +282,10 @@ camcontrol/
 │   ├── gui/
 │   │   ├── main_window.py   # window, controls panel, menus, status bar
 │   │   ├── image_view.py    # zoom/pan image view, grid, crosshair, measurement tools
+│   │   ├── grid_settings.py # Grid settings window (divisions, line width, style, color, opacity)
 │   │   ├── measure_panel.py # tool buttons, results table, delete/clear/export
 │   │   ├── measure_draw.py  # draws measurements (on screen and for the annotated export)
-│   │   ├── qt_image.py      # numpy -> QImage
+│   │   ├── qt_image.py      # numpy -> QImage / QPixmap
 │   │   ├── gallery.py       # Captures panel: recent-image thumbnails
 │   │   ├── count_panel.py   # Counting panel, drawing marks
 │   │   ├── process_dialogs.py # dialogs for focus stack, HDR, stitch, fluorescence

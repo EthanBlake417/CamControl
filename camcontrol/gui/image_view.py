@@ -36,6 +36,7 @@ from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 from camcontrol.calibration import PIXELS, Calibration
 from camcontrol.gui.count_panel import draw_marks
 from camcontrol.gui.fiber_panel import draw_fiber_axes
+from camcontrol.gui.grid_settings import GridStyle
 from camcontrol.gui.measure_draw import (
     MEASURE_COLOR,
     PREVIEW_COLOR,
@@ -46,7 +47,7 @@ from camcontrol.gui.measure_draw import (
 from camcontrol.gui.qt_image import to_pixmap
 from camcontrol.measure import KINDS, Measurement
 
-GRID_COLOR = QColor(255, 255, 0)
+GRID_PEN_STYLES = {"solid": Qt.PenStyle.SolidLine, "dash": Qt.PenStyle.DashLine, "dot": Qt.PenStyle.DotLine}
 CROSSHAIR_COLOR = QColor(255, 0, 0)
 CROSSHAIR_RADIUS_PX = 20  # on screen, whatever the zoom
 MARK_RADIUS_PX = 6        # counting marks, on screen
@@ -80,7 +81,7 @@ class ImageView(QGraphicsView):
         self._fit_mode = True  # keep refitting on window resize until the user zooms
         self.show_grid = False
         self.show_crosshair = False
-        self.grid_divisions = 8
+        self.grid_style = GridStyle()
 
         # Measurements to draw (owned by the measurement panel).
         self.measurements: list[Measurement] = []
@@ -179,6 +180,10 @@ class ImageView(QGraphicsView):
         self.show_grid = on
         self.viewport().update()
 
+    def set_grid_style(self, style: GridStyle):
+        self.grid_style = style
+        self.viewport().update()
+
     def set_show_crosshair(self, on: bool):
         self.show_crosshair = on
         self.viewport().update()
@@ -201,15 +206,15 @@ class ImageView(QGraphicsView):
 
         # Grid and crosshair: drawn in image-pixel coordinates.
         if self.show_grid:
-            pen = QPen(GRID_COLOR, 1)
-            pen.setCosmetic(True)  # 1 screen pixel wide at any zoom
+            g = self.grid_style
+            pen = QPen(g.qcolor(), g.width, GRID_PEN_STYLES.get(g.line, Qt.PenStyle.SolidLine))
+            pen.setCosmetic(True)  # the same width on screen at any zoom
             painter.setPen(pen)
-            n = self.grid_divisions
-            for i in range(1, n):
-                x = w * i / n
-                y = h * i / n
-                painter.drawLine(QPointF(x, 0), QPointF(x, h))
-                painter.drawLine(QPointF(0, y), QPointF(w, y))
+            cols, rows = g.columns, g.rows_for(w, h)
+            for i in range(1, cols):
+                painter.drawLine(QPointF(w * i / cols, 0), QPointF(w * i / cols, h))
+            for i in range(1, rows):
+                painter.drawLine(QPointF(0, h * i / rows), QPointF(w, h * i / rows))
 
         if self.show_crosshair:
             pen = QPen(CROSSHAIR_COLOR, 2)
