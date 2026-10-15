@@ -30,7 +30,7 @@ import math
 
 import numpy as np
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
 from camcontrol.calibration import PIXELS, Calibration
@@ -43,7 +43,7 @@ from camcontrol.gui.measure_draw import (
     Style,
     draw_measurement,
 )
-from camcontrol.gui.qt_image import to_qimage
+from camcontrol.gui.qt_image import to_pixmap
 from camcontrol.measure import KINDS, Measurement
 
 GRID_COLOR = QColor(255, 255, 0)
@@ -123,7 +123,7 @@ class ImageView(QGraphicsView):
     def set_image(self, image: np.ndarray):
         new_size = self._image is None or image.shape[:2] != self._image.shape[:2]
         self._image = image
-        self._pixmap_item.setPixmap(QPixmap.fromImage(to_qimage(image)))
+        self._pixmap_item.setPixmap(to_pixmap(image))
         if new_size:
             self._scene.setSceneRect(QRectF(self._pixmap_item.boundingRect()))
             self.fit()

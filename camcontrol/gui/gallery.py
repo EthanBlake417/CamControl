@@ -8,26 +8,30 @@ capture folder, or in another folder chosen in the panel.
 - Updates by itself when files in the folder change (new captures, files
   copied in or deleted), using QFileSystemWatcher.
 - Double-click a thumbnail to open it in the main view (videos play there).
+  The image open in the main view has an orange frame; selected ones are blue.
   Then the arrow keys (also Home/End/Page Up/Down) step to the next or
   previous one and open it; with Shift or Ctrl held they only select.
 - Select several (Ctrl/Shift-click) and right-click to focus stack, HDR,
   stitch or combine them (see PROCESS_TOOLS).
 - Delete (right-click or the Delete key) moves the selected images, and
   their .json settings files, to the Recycle Bin.
-- Thumbnails load one at a time in the background of the event loop, so a
-  big folder doesn't freeze the window. They're cached until the file changes.
+- Thumbnails are read and shrunk on background threads, so a big folder (or
+  a slow network drive) doesn't freeze the window. They're cached until the
+  file changes.
 """
 
 import os
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QFile, QFileSystemWatcher, QPointF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPixmap, QPolygonF
+from PySide6.QtCore import QFile, QFileSystemWatcher, QObject, QPointF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygonF
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QFileDialog,
     QHBoxLayout,
@@ -40,6 +44,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QVBoxLayout,
     QWidget,
 )
@@ -59,19 +66,45 @@ PROCESS_TOOLS = [
 ]
 
 
-def make_thumbnail(path: Path) -> QIcon | None:
-    video = is_video(path)
-    img = load_video_frame(path) if video else load_image_file(path)
+def thumbnail_image(path: Path):
+    """The file's image (a video's first frame) shrunk to fit THUMB_SIZE, as
+    numpy; None if unreadable. Safe to call off the GUI thread."""
+    img = load_video_frame(path) if is_video(path) else load_image_file(path)
     if img is None:
         return None
     h, w = img.shape[:2]
     scale = min(THUMB_SIZE.width() / w, THUMB_SIZE.height() / h)
-    small = cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))),
-                       interpolation=cv2.INTER_AREA)
+    return cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))), interpolation=cv2.INTER_AREA)
+
+
+def thumbnail_icon(path: Path, small) -> QIcon:
+    """thumbnail_image's result as an icon, videos marked. GUI thread only."""
     pixmap = QPixmap.fromImage(to_qimage(small))
-    if video:
+    if is_video(path):
         draw_play_mark(pixmap)
     return QIcon(pixmap)
+
+
+class _ThumbnailLoader(QObject):
+    """Reads thumbnails on background threads; loaded is emitted on the GUI thread."""
+    loaded = Signal(str, float, object)  # path, mtime, small image (None: unreadable)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pool = ThreadPoolExecutor(2, thread_name_prefix="thumbnails")
+        self._generation = 0  # bumped by cancel(): older work is skipped
+
+    def load(self, path: str, mtime: float):
+        generation = self._generation
+
+        def work():
+            if generation == self._generation:  # not cancelled while waiting
+                self.loaded.emit(path, mtime, thumbnail_image(Path(path)))
+        self._pool.submit(work)
+
+    def cancel(self):
+        """Skip everything not started yet (e.g. another folder is shown)."""
+        self._generation += 1
 
 
 def draw_play_mark(pixmap: QPixmap):
@@ -87,6 +120,51 @@ def draw_play_mark(pixmap: QPixmap):
     k = r * 0.5
     painter.drawPolygon(QPolygonF([c + QPointF(-k * 0.7, -k), c + QPointF(-k * 0.7, k), c + QPointF(k, 0)]))
     painter.end()
+
+
+OPEN_COLOR = QColor(255, 140, 0)      # frame round the image open in the main view
+SELECTED_COLOR = QColor(0, 120, 215)  # selected thumbnails (also while the list isn't focused)
+
+
+class _ThumbnailDelegate(QStyledItemDelegate):
+    """Draws selection plainly (a blue fill and frame, focused or not) and an
+    orange frame, with the name in bold, round the image open in the main view."""
+
+    def __init__(self, panel: "GalleryPanel"):
+        super().__init__(panel)
+        self._panel = panel
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        is_open = self._panel.is_open(index.data(PATH_ROLE))
+        rect = option.rect.adjusted(1, 1, -1, -1)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if selected:
+            fill = QColor(SELECTED_COLOR)
+            fill.setAlpha(70)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(fill)
+            painter.drawRoundedRect(rect, 4, 4)
+        painter.restore()
+        # The thumbnail and name as usual, minus the style's own (faint) selection.
+        plain = QStyleOptionViewItem(option)
+        self.initStyleOption(plain, index)
+        plain.state &= ~(QStyle.StateFlag.State_Selected | QStyle.StateFlag.State_HasFocus)
+        if is_open:
+            plain.font.setBold(True)
+        style = plain.widget.style() if plain.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, plain, painter, plain.widget)
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if is_open:
+            painter.setPen(QPen(OPEN_COLOR, 3))
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4, 4)
+        elif selected:
+            painter.setPen(QPen(SELECTED_COLOR, 2))
+            painter.drawRoundedRect(rect, 4, 4)
+        painter.restore()
 
 
 class _ThumbnailList(QListWidget):
@@ -113,8 +191,8 @@ class GalleryPanel(QWidget):
         self.folder: Path | None = None         # the folder shown
         self.output_folder: Path | None = None  # the Output box folder, shown when following it
         self._cache: dict[tuple[str, float], QIcon] = {}  # (path, mtime) -> thumbnail
-        self._queue: list[str] = []                       # paths still to load
         self._shown: list[tuple[str, float]] = []         # what the list shows now
+        self._open: str | None = None                     # normcase path of the image open in the main view
 
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
@@ -156,6 +234,7 @@ class GalleryPanel(QWidget):
         self.list.setWordWrap(True)
         self.list.setSpacing(4)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.list.setItemDelegate(_ThumbnailDelegate(self))
         self.list.itemDoubleClicked.connect(lambda item: self.open_requested.emit(item.data(PATH_ROLE)))
         self.list.stepped.connect(lambda item: self.open_requested.emit(item.data(PATH_ROLE)))
         self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -168,8 +247,8 @@ class GalleryPanel(QWidget):
         self.list.addAction(self.delete_action)
         layout.addWidget(self.list)
 
-        hint = QLabel("Double-click to open, then the arrow keys step through. Ctrl/Shift-click to select several, "
-                      "right-click for tools. Delete moves to the Recycle Bin.")
+        hint = QLabel("Double-click to open (orange frame), then the arrow keys step through. Ctrl/Shift-click to "
+                      "select several (blue), right-click for tools. Delete moves to the Recycle Bin.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
         layout.addWidget(hint)
@@ -187,9 +266,8 @@ class GalleryPanel(QWidget):
         self._debounce.setInterval(300)
         self._debounce.timeout.connect(self._on_folder_changed)
 
-        self._loader = QTimer(self)
-        self._loader.setInterval(0)  # one thumbnail per trip through the event loop
-        self._loader.timeout.connect(self._load_next)
+        self._loader = _ThumbnailLoader(self)
+        self._loader.loaded.connect(self._on_thumbnail)
 
     def sizeHint(self) -> QSize:
         # Default size when the panel first appears: two thumbnails wide.
@@ -208,6 +286,14 @@ class GalleryPanel(QWidget):
         """Selected images, oldest first (the order they were taken)."""
         rows = sorted((self.list.row(i), i.data(PATH_ROLE)) for i in self.list.selectedItems())
         return [path for _, path in reversed(rows)]  # the list shows newest first
+
+    def set_open_path(self, path: str | None):
+        """The image now shown in the main view (None: live, or not a file): framed in orange."""
+        self._open = os.path.normcase(os.path.abspath(path)) if path else None
+        self.list.viewport().update()
+
+    def is_open(self, path: str | None) -> bool:
+        return path is not None and self._open is not None and os.path.normcase(os.path.abspath(path)) == self._open
 
     @property
     def follows_output(self) -> bool:
@@ -254,7 +340,7 @@ class GalleryPanel(QWidget):
 
         self._shown = files
         self.list.clear()
-        self._queue = []
+        self._loader.cancel()
         for path, mtime in files:
             p = Path(path)
             item = QListWidgetItem(self._cache.get((path, mtime), self._placeholder), p.name)
@@ -266,11 +352,9 @@ class GalleryPanel(QWidget):
             item.setToolTip(f"{p.name}\n{datetime.fromtimestamp(mtime):%Y-%m-%d %H:%M:%S}{size}")
             self.list.addItem(item)
             if (path, mtime) not in self._cache:
-                self._queue.append(path)
+                self._loader.load(path, mtime)
         if select:
             self._select(select)
-        if self._queue:
-            self._loader.start()
 
     # --- internals -----------------------------------------------------------------
 
@@ -311,18 +395,13 @@ class GalleryPanel(QWidget):
                 self.list.scrollToItem(item)
                 return
 
-    def _load_next(self):
-        if not self._queue:
-            self._loader.stop()
-            return
-        path = self._queue.pop(0)
-        mtimes = dict(self._shown)
-        if path not in mtimes:
-            return  # no longer shown
-        icon = make_thumbnail(Path(path))
-        if icon is None:
+    def _on_thumbnail(self, path: str, mtime: float, small):
+        if small is None:
             return  # unreadable (maybe still being written); placeholder stays
-        self._cache[(path, mtimes[path])] = icon
+        icon = thumbnail_icon(Path(path), small)
+        self._cache[(path, mtime)] = icon
+        if (path, mtime) not in self._shown:
+            return  # no longer shown (kept for when it is again)
         for i in range(self.list.count()):
             item = self.list.item(i)
             if item.data(PATH_ROLE) == path:

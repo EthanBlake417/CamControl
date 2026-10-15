@@ -24,7 +24,7 @@ Run directly to print every camera, its sizes and the first one's controls:
 """
 
 import ctypes
-from ctypes import POINTER, byref, c_long, c_ulong, c_void_p
+from ctypes import POINTER, byref, c_long, c_void_p
 from ctypes.wintypes import DWORD, ULONG
 
 import comtypes

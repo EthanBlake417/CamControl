@@ -1066,6 +1066,7 @@ class MainWindow(QMainWindow):
             self.source_label.setText("Live" if self.live else "Frozen")
             self.source_label.setToolTip("")
         self.compare.set_title(self.view, self.source_label.text(), self.source_label.toolTip())
+        self.gallery.set_open_path(path)  # framed in Captures
 
     def _set_title(self, file_name: str | None = None):
         title = f"CamControl - {file_name or ('live' if self.live else 'frozen')}"
