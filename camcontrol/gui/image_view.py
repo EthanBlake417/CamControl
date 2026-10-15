@@ -36,7 +36,7 @@ from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 from camcontrol.calibration import PIXELS, Calibration
 from camcontrol.gui.count_panel import draw_marks
 from camcontrol.gui.fiber_panel import draw_fiber_axes
-from camcontrol.gui.grid_settings import GridStyle
+from camcontrol.gui.overlay_settings import CrosshairStyle, GridStyle
 from camcontrol.gui.measure_draw import (
     MEASURE_COLOR,
     PREVIEW_COLOR,
@@ -47,9 +47,6 @@ from camcontrol.gui.measure_draw import (
 from camcontrol.gui.qt_image import to_pixmap
 from camcontrol.measure import KINDS, Measurement
 
-GRID_PEN_STYLES = {"solid": Qt.PenStyle.SolidLine, "dash": Qt.PenStyle.DashLine, "dot": Qt.PenStyle.DotLine}
-CROSSHAIR_COLOR = QColor(255, 0, 0)
-CROSSHAIR_RADIUS_PX = 20  # on screen, whatever the zoom
 MARK_RADIUS_PX = 6        # counting marks, on screen
 REMOVE_RADIUS_PX = 15     # right-click removes a mark within this distance, on screen
 DRAG_MIN_PX = 6           # a press-release further apart than this (on screen) is a drag
@@ -82,6 +79,7 @@ class ImageView(QGraphicsView):
         self.show_grid = False
         self.show_crosshair = False
         self.grid_style = GridStyle()
+        self.crosshair_style = CrosshairStyle()
 
         # Measurements to draw (owned by the measurement panel).
         self.measurements: list[Measurement] = []
@@ -176,16 +174,10 @@ class ImageView(QGraphicsView):
 
     # --- overlays and measurements ------------------------------------------------
 
-    def set_show_grid(self, on: bool):
-        self.show_grid = on
-        self.viewport().update()
-
-    def set_grid_style(self, style: GridStyle):
-        self.grid_style = style
-        self.viewport().update()
-
-    def set_show_crosshair(self, on: bool):
-        self.show_crosshair = on
+    def set_overlays(self, show_grid: bool, grid: GridStyle, show_crosshair: bool, crosshair: CrosshairStyle):
+        """Grid and crosshair: whether to show them, and how they look."""
+        self.show_grid, self.grid_style = show_grid, grid
+        self.show_crosshair, self.crosshair_style = show_crosshair, crosshair
         self.viewport().update()
 
     def set_measurements(self, measurements, calibration, selected_id=None):
@@ -204,10 +196,10 @@ class ImageView(QGraphicsView):
             return
         h, w = self._image.shape[:2]
 
-        # Grid and crosshair: drawn in image-pixel coordinates.
+        # Grid, and a crosshair on the image centre: drawn in image-pixel coordinates.
         if self.show_grid:
             g = self.grid_style
-            pen = QPen(g.qcolor(), g.width, GRID_PEN_STYLES.get(g.line, Qt.PenStyle.SolidLine))
+            pen = QPen(g.qcolor(), g.width, g.pen_style())
             pen.setCosmetic(True)  # the same width on screen at any zoom
             painter.setPen(pen)
             cols, rows = g.columns, g.rows_for(w, h)
@@ -216,16 +208,9 @@ class ImageView(QGraphicsView):
             for i in range(1, rows):
                 painter.drawLine(QPointF(0, h * i / rows), QPointF(w, h * i / rows))
 
-        if self.show_crosshair:
-            pen = QPen(CROSSHAIR_COLOR, 2)
-            pen.setCosmetic(True)
-            painter.setPen(pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            cx, cy = w / 2, h / 2
-            painter.drawLine(QPointF(cx, 0), QPointF(cx, h))
-            painter.drawLine(QPointF(0, cy), QPointF(w, cy))
-            r = CROSSHAIR_RADIUS_PX / self.zoom
-            painter.drawEllipse(QPointF(cx, cy), r, r)
+        c = self.crosshair_style
+        if self.show_crosshair and c.anchor == "image":
+            self._draw_crosshair(painter, QRectF(0, 0, w, h), c.circle / self.zoom)
 
         # Measurements: drawn in window pixels, so lines and text keep the
         # same on-screen size at any zoom.
@@ -245,7 +230,22 @@ class ImageView(QGraphicsView):
         if self.fiber_axes:
             draw_fiber_axes(painter, self.fiber_axes, to_out, self.zoom, style, self.fiber_selected,
                             self.show_fiber_parts)
+        if self.show_crosshair and c.anchor == "window":  # stays put when zooming and panning
+            self._draw_crosshair(painter, QRectF(self.viewport().rect()), c.circle)
         painter.restore()
+
+    def _draw_crosshair(self, painter: QPainter, area: QRectF, ring: float):
+        """Lines through the middle of area, right across it, and a ring of radius ring."""
+        c = self.crosshair_style
+        pen = QPen(c.qcolor(), c.width, c.pen_style())
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        mid = area.center()
+        painter.drawLine(QPointF(mid.x(), area.top()), QPointF(mid.x(), area.bottom()))
+        painter.drawLine(QPointF(area.left(), mid.y()), QPointF(area.right(), mid.y()))
+        if ring > 0:
+            painter.drawEllipse(mid, ring, ring)
 
     def _preview(self) -> Measurement | None:
         """The shape being drawn, including the point under the mouse."""

@@ -60,7 +60,7 @@ from camcontrol.gui.camera_worker import CameraWorker
 from camcontrol.gui.compare import CompareArea, grid_image
 from camcontrol.gui.count_panel import CountPanel, render_marks
 from camcontrol.gui.fiber_panel import FiberPanel, render_fiber_axes
-from camcontrol.gui.grid_settings import GridDialog, GridStyle
+from camcontrol.gui.overlay_settings import CrosshairStyle, GridStyle, OverlayDialog
 from camcontrol.gui.gallery import GalleryPanel
 from camcontrol.gui.image_view import ImageView
 from camcontrol.gui.jobs import Job, run_job
@@ -200,7 +200,8 @@ class MainWindow(QMainWindow):
         self._fiber_last = 0.0  # when the live view was last measured
         self._fiber_job: Job | None = None  # fiber measuring running in the background (one at a time)
         self._fiber_next = None  # request made while it was busy: run next (only the newest is kept)
-        self._grid_dialog: GridDialog | None = None  # Grid settings window, made when first opened
+        self.grid_style, self.crosshair_style = GridStyle(), CrosshairStyle()  # on every image (_apply_overlays)
+        self._overlay_dialog: OverlayDialog | None = None  # Grid and crosshair window, made when first opened
         self._fiber_generation = 0  # counts settings changes: results measured with older settings are dropped
         # The main view first, then any compare images; the panels start on the main view.
         self.panes = [Pane(self.view, self.measure_panel.measurements, self.count_panel.counter)]
@@ -251,9 +252,11 @@ class MainWindow(QMainWindow):
 
         self.live_action = self._action("&Live", "L", self._set_live, checkable=True)
         self.live_action.setChecked(True)
-        self.grid_action = self._action("&Grid", "G", self.view.set_show_grid, checkable=True)
-        self.grid_settings_action = self._action("Grid &settings...", None, self.show_grid_settings)
-        self.crosshair_action = self._action("C&rosshair", "C", self.view.set_show_crosshair, checkable=True)
+        self.grid_action = self._action("&Grid", "G", self._apply_overlays, checkable=True)
+        self.grid_settings_action = self._action("Grid &settings...", None, lambda: self.show_overlay_settings("grid"))
+        self.crosshair_action = self._action("C&rosshair", "C", self._apply_overlays, checkable=True)
+        self.crosshair_settings_action = self._action("Crosshair s&ettings...", None,
+                                                      lambda: self.show_overlay_settings("crosshair"))
         self.fit_action = self._action("&Fit to window", "F", self.view.fit)
         self.actual_action = self._action("&100%", "1", self.view.actual_size)
         self.zoom_in_action = self._action("Zoom &in", "Ctrl+=", self.view.zoom_in)
@@ -297,7 +300,8 @@ class MainWindow(QMainWindow):
         m.addAction(self.quit_action)
 
         m = self.menuBar().addMenu("&View")
-        m.addActions([self.live_action, self.grid_action, self.grid_settings_action, self.crosshair_action])
+        m.addActions([self.live_action, self.grid_action, self.grid_settings_action, self.crosshair_action,
+                      self.crosshair_settings_action])
         m.addSeparator()
         m.addActions([self.fit_action, self.actual_action, self.zoom_in_action, self.zoom_out_action])
         m.addSeparator()
@@ -391,6 +395,8 @@ class MainWindow(QMainWindow):
             if self.view.count_class is not None:
                 view.set_count_class(self.view.count_class)
             view.show_fiber_parts = self.view.show_fiber_parts
+            view.set_overlays(self.grid_action.isChecked(), self.grid_style,
+                              self.crosshair_action.isChecked(), self.crosshair_style)
 
     def _show_fiber_parts(self, on: bool):
         for pane in self.panes:
@@ -657,18 +663,16 @@ class MainWindow(QMainWindow):
             self._use_flat(flat_path, quiet=True)
             if s.value("flatfield/on", False, type=bool):
                 self._set_flat_live(True)
-        # Set the actions, then the view (setChecked doesn't fire triggered).
-        for action, key, setter in (
-            (self.grid_action, "view/grid", self.view.set_show_grid),
-            (self.crosshair_action, "view/crosshair", self.view.set_show_crosshair),
-        ):
-            on = s.value(key, False, type=bool)
-            action.setChecked(on)
-            setter(on)
-        try:
-            self._set_grid_style(GridStyle.from_dict(json.loads(s.value("view/grid_style", "{}"))))
-        except (TypeError, ValueError):
-            pass  # unreadable: keep the default look
+        # Grid and crosshair (setChecked doesn't fire triggered, so the views are set after).
+        self.grid_action.setChecked(s.value("view/grid", False, type=bool))
+        self.crosshair_action.setChecked(s.value("view/crosshair", False, type=bool))
+        for key, kind, name in (("view/grid_style", GridStyle, "grid_style"),
+                                ("view/crosshair_style", CrosshairStyle, "crosshair_style")):
+            try:
+                setattr(self, name, kind.from_dict(json.loads(s.value(key, "{}"))))
+            except (TypeError, ValueError, AttributeError):
+                pass  # unreadable: keep the default look
+        self._apply_overlays()
         # A layout saved while Recording was a tab under Captures (2026-09-28)
         # could be taller than the screen, so it isn't restored; the default
         # layout is used once instead.
@@ -736,7 +740,8 @@ class MainWindow(QMainWindow):
         s.setValue("fiber/show_parts", self.fiber_panel.show_parts_check.isChecked())
         s.setValue("fiber/detection", json.dumps(asdict(self.fiber_panel.detection())))
         s.setValue("view/grid", self.grid_action.isChecked())
-        s.setValue("view/grid_style", json.dumps(self.view.grid_style.to_dict()))
+        s.setValue("view/grid_style", json.dumps(self.grid_style.to_dict()))
+        s.setValue("view/crosshair_style", json.dumps(self.crosshair_style.to_dict()))
         s.setValue("view/crosshair", self.crosshair_action.isChecked())
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("window/state", self.saveState())
@@ -1557,8 +1562,8 @@ class MainWindow(QMainWindow):
             "output": {"folder": self.folder_edit.text(), "name": self.name_edit.text()},
             "flat_field": {"path": self._flat_path, "on": self.flat_live_action.isChecked()},
             "recording": self.record_panel.state(),
-            "view": {"grid": self.grid_action.isChecked(), "grid_style": self.view.grid_style.to_dict(),
-                     "crosshair": self.crosshair_action.isChecked()},
+            "view": {"grid": self.grid_action.isChecked(), "grid_style": self.grid_style.to_dict(),
+                     "crosshair": self.crosshair_action.isChecked(), "crosshair_style": self.crosshair_style.to_dict()},
         }
         # What the camera last reported, or what's waiting to be applied.
         camera = self._camera_values or self._pending_camera
@@ -1685,13 +1690,14 @@ class MainWindow(QMainWindow):
         self._update_next_name()
 
         view = data.get("view", {})
-        for action, key, setter in ((self.grid_action, "grid", self.view.set_show_grid),
-                                    (self.crosshair_action, "crosshair", self.view.set_show_crosshair)):
+        for action, key in ((self.grid_action, "grid"), (self.crosshair_action, "crosshair")):
             if key in view:
                 action.setChecked(bool(view[key]))
-                setter(bool(view[key]))
         if isinstance(view.get("grid_style"), dict):
-            self._set_grid_style(GridStyle.from_dict(view["grid_style"]))
+            self.grid_style = GridStyle.from_dict(view["grid_style"])
+        if isinstance(view.get("crosshair_style"), dict):
+            self.crosshair_style = CrosshairStyle.from_dict(view["crosshair_style"])
+        self._apply_overlays()
         return problems
 
     def _apply_camera_values(self, values: dict):
@@ -1700,26 +1706,33 @@ class MainWindow(QMainWindow):
             if slider is not None and slider.isEnabled():
                 slider.setValue(int(value))  # sends it to the camera via _on_slider
 
-    # --- grid ----------------------------------------------------------------------------
+    # --- grid and crosshair ---------------------------------------------------------------
 
-    def show_grid_settings(self):
-        """The Grid settings window (non-modal; the grid follows its changes). Turns the grid on."""
-        if not self.grid_action.isChecked():
-            self.grid_action.setChecked(True)
-            self.view.set_show_grid(True)
-        if self._grid_dialog is None:
-            self._grid_dialog = GridDialog(self.view.grid_style, self)
-            self._grid_dialog.changed.connect(self._set_grid_style)
-        else:
-            self._grid_dialog.set_style(self.view.grid_style)
-        self._grid_dialog.show()
-        self._grid_dialog.raise_()
-        self._grid_dialog.activateWindow()
+    def show_overlay_settings(self, tab: str = "grid"):
+        """The Grid and crosshair window (non-modal; the overlays follow its changes),
+        on tab "grid" or "crosshair". Turns that overlay on."""
+        (self.crosshair_action if tab == "crosshair" else self.grid_action).setChecked(True)
+        if self._overlay_dialog is None:
+            self._overlay_dialog = OverlayDialog(self.grid_style, self.crosshair_style, self)
+            self._overlay_dialog.changed.connect(self._set_overlay_styles)
+        self._apply_overlays()
+        self._overlay_dialog.show_tab(tab)
+        self._overlay_dialog.show()
+        self._overlay_dialog.raise_()
+        self._overlay_dialog.activateWindow()
 
-    def _set_grid_style(self, style: GridStyle):
-        self.view.set_grid_style(style)
-        if self._grid_dialog is not None and self._grid_dialog.style() != style:  # e.g. a settings file was opened
-            self._grid_dialog.set_style(style)
+    def _set_overlay_styles(self, grid: GridStyle, crosshair: CrosshairStyle):
+        self.grid_style, self.crosshair_style = grid, crosshair
+        self._apply_overlays()
+
+    def _apply_overlays(self):
+        """Grid and crosshair, as the View menu and the settings say, on every image shown."""
+        for pane in self.panes:
+            pane.view.set_overlays(self.grid_action.isChecked(), self.grid_style,
+                                   self.crosshair_action.isChecked(), self.crosshair_style)
+        dialog = self._overlay_dialog
+        if dialog is not None and dialog.styles() != (self.grid_style, self.crosshair_style):
+            dialog.set_styles(self.grid_style, self.crosshair_style)  # e.g. a settings file was opened
 
     # --- compare -------------------------------------------------------------------------
 

@@ -12,7 +12,7 @@ Early development. Done: camera probe (Phase 0), live view and capture (Phase 1)
 venv\Scripts\python main.py
 ```
 
-The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exposure, gain, contrast, saturation and sharpness; capture with frame averaging, save size, format and folder; grid and crosshair overlays (**View → Grid settings...** sets the grid's columns and rows, or square cells, line width, style, color and opacity, and the grid follows as you change them); freeze; opening image files; and a pixel readout (x, y, RGB) in the status bar. Settings are remembered between runs.
+The GUI has a live image with zoom (mouse wheel) and pan (drag); sliders for exposure, gain, contrast, saturation and sharpness; capture with frame averaging, save size, format and folder; grid and crosshair overlays, on every image shown (also the compare images; **View → Grid settings...** / **Crosshair settings...** open a window that sets the grid's columns and rows, or square cells, and for both the line width, style, color and opacity; the crosshair can mark the image centre, e.g. the camera's optical axis for centring a fiber, or stay at the window centre while you zoom and pan, with a ring of any size; the overlays follow as you change them); freeze; opening image files; and a pixel readout (x, y, RGB) in the status bar. Settings are remembered between runs.
 
 | Key | Action |
 |---|---|
@@ -282,7 +282,7 @@ camcontrol/
 │   ├── gui/
 │   │   ├── main_window.py   # window, controls panel, menus, status bar
 │   │   ├── image_view.py    # zoom/pan image view, grid, crosshair, measurement tools
-│   │   ├── grid_settings.py # Grid settings window (divisions, line width, style, color, opacity)
+│   │   ├── overlay_settings.py # grid and crosshair look, and their settings window
 │   │   ├── measure_panel.py # tool buttons, results table, delete/clear/export
 │   │   ├── measure_draw.py  # draws measurements (on screen and for the annotated export)
 │   │   ├── qt_image.py      # numpy -> QImage / QPixmap
