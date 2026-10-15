@@ -5,12 +5,14 @@ File > Open settings / Open recent settings / Save settings / Save settings as.
 The most recently opened or saved file is opened again when the app starts.
 
 A settings file holds (see MainWindow.current_settings):
-    camera       slider values: exposure, gain, contrast, saturation, sharpness
+    cameras      slider values (exposure, gain, contrast, saturation, sharpness) per camera name
+    camera       the same for the camera Controls were on (files from before views had only this)
     capture      frames averaged, save size, file format
     output       folder and file name for captures, videos and time-lapses
     flat_field   reference image path and whether correction is on
     recording    video and time-lapse settings
-    view         grid and crosshair on/off
+    view         grid and crosshair on/off and how they look
+    views        layout, Link views, and each view's camera or image file
 
 Run directly to print a settings file:
     python -m camcontrol.settings_file "settings/brightfield 10x.json"

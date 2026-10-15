@@ -11,8 +11,8 @@ capture folder, or in another folder chosen in the panel.
   The image open in the main view is outlined; selected ones are tinted.
   Then the arrow keys (also Home/End/Page Up/Down) step to the next or
   previous one and open it; with Shift or Ctrl held they only select.
-- Select several (Ctrl/Shift-click) and right-click to focus stack, HDR,
-  stitch or combine them (see PROCESS_TOOLS).
+- Select several (Ctrl/Shift-click) and right-click to open them in new
+  views, or focus stack, HDR, stitch or combine them (see PROCESS_TOOLS).
 - Delete (right-click or the Delete key) moves the selected images, and
   their .json settings files, to the Recycle Bin.
 - Thumbnails are read and shrunk on background threads, so a big folder (or
@@ -213,7 +213,7 @@ class GalleryPanel(QWidget):
     open_requested = Signal(str)  # image path
     folder_changed = Signal()     # files in the folder were added, removed or changed
     process_requested = Signal(str, list)  # tool key (see PROCESS_TOOLS), image paths
-    compare_requested = Signal(list)       # add these images to the compare grid
+    open_views_requested = Signal(list)    # open these images in new views (e.g. to compare them)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -446,9 +446,10 @@ class GalleryPanel(QWidget):
         menu = QMenu(self)
         menu.addAction("Play" if is_video(path) else "Open", lambda: self.open_requested.emit(path))
         n = len(images)
-        compare = menu.addAction(f"Add to compare ({n} image{'s' if n != 1 else ''})",
-                                 lambda: self.compare_requested.emit(images))
-        compare.setEnabled(n > 0)
+        views = menu.addAction(f"Open in new view{'s' if n != 1 else ''} ({n} image{'s' if n != 1 else ''})",
+                               lambda: self.open_views_requested.emit(images))
+        views.setToolTip("Show them next to the main image, e.g. to compare them")
+        views.setEnabled(n > 0)
         menu.addAction("Show in Explorer",
                        lambda: subprocess.Popen(["explorer", "/select,", os.path.normpath(path)]))
         menu.addSeparator()

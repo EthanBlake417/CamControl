@@ -1,5 +1,7 @@
-"""Main window: live image in the middle, controls and captures panels on
-the right, measurements and counting panels at the bottom.
+"""Main window: the views in the middle (one or more, each showing a camera,
+an image file, a video or a processing result), controls and captures
+panels at the sides, measurements, counting and fiber axis panels at the
+bottom.
 
 Shortcuts:
     Space       capture
@@ -9,28 +11,34 @@ Shortcuts:
     F           fit image to window
     1           100% (one image pixel per screen pixel)
     Ctrl+= / -  zoom in / out (or use the mouse wheel)
-    Ctrl+O      open an image file
-    Ctrl+S      save the image in the view (e.g. a processing result)
+    Ctrl+O      open an image file (in the active view)
+    Ctrl+S      save the image in the active view (e.g. a processing result)
     Ctrl+E      export measurements
-    Ctrl+K      compare images in a grid (right-click images in Captures to add them)
+    Ctrl+K      one view / several views
+    Ctrl+Shift+K add a view
     Ctrl+1..5   show / hide the Controls / Measurements / Captures / Counting / Fiber axis panel
 
+Views: each has its own source, live/frozen state, measurements, counting
+marks and fiber axes. The panels work on the active view (the one clicked
+last). Controls work on the camera of the active view, or, if it has none,
+of the camera view used last. With Link views on, Capture, Live/Freeze,
+Fit, 100% and Find fiber axes act on every view.
+
 Processing tools (Process menu, or select images in Captures and right-click)
-show their result in the view, unsaved, until you press Ctrl+S.
+show their result in the active view, unsaved, until you press Ctrl+S.
 """
 
 import json
 import os
 import re
 import time
-from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
@@ -41,6 +49,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -56,8 +65,7 @@ from camcontrol.camera import ADJUSTABLE, format_exposure, frame_sizes
 from camcontrol.capture import CAPTURE_DIR, HD2_SCALE, clean_name, next_capture_path, scaled_size
 from camcontrol.export import export_table, measurement_rows
 from camcontrol import settings_file
-from camcontrol.gui.camera_worker import CameraWorker
-from camcontrol.gui.compare import CompareArea, grid_image
+from camcontrol.gui.camera_link import CameraLink
 from camcontrol.gui.count_panel import CountPanel, render_marks
 from camcontrol.gui.fiber_panel import FiberPanel, render_fiber_axes
 from camcontrol.gui.overlay_settings import CrosshairStyle, GridStyle, OverlayDialog
@@ -77,6 +85,7 @@ from camcontrol.gui.qt_image import to_qimage
 from camcontrol.gui.record_panel import RecordPanel
 from camcontrol.gui.tool_stripes import ToolStripes
 from camcontrol.gui.video_player import VideoPlayer
+from camcontrol.gui.views import LAYOUTS, ViewsArea, grid_image
 from camcontrol.image_io import is_video, load_image_file, save_image_file
 from camcontrol.paths import LOGO
 from camcontrol.measure import CIRCLE_KINDS, compute
@@ -95,7 +104,7 @@ SAVE_SCALES = [
 ]
 FORMATS = [("TIFF", "tif"), ("PNG", "png")]
 FLAT_DIR = CAPTURE_DIR.parent / "flats"  # flat-field references taken in the app
-FIBER_LIVE_INTERVAL_S = 0.25  # how often "Update live" re-measures fiber axes
+FIBER_LIVE_INTERVAL_S = 0.25  # how often "Update live" re-measures fiber axes (each live view)
 # Process menu / Captures right-click tools: key -> dialog class.
 PROCESS_DIALOGS = {
     "stack": FocusStackDialog,
@@ -105,17 +114,21 @@ PROCESS_DIALOGS = {
 }
 
 
-@dataclass
+@dataclass(eq=False)  # compared by identity: each is one view
 class Pane:
-    """One image of the window (the main view, or a compare image) and the
-    measurements, counting marks and fiber axes made on it. The panels show
-    whichever pane is active (the one clicked last)."""
+    """One view of the window: what it shows and the measurements, counting
+    marks and fiber axes made on it. The panels show the active one."""
     view: ImageView
     measurements: list
     counter: Counter
     next_id: int = 1
     fiber_axes: list = field(default_factory=list)
-    path: str | None = None  # compare images: the file shown
+    camera: CameraLink | None = None  # its camera (kept open while it shows a file, so L returns to it)
+    live: bool = False                # showing its camera's frames
+    path: str | None = None           # the file shown
+    title: str = ""                   # what it shows when not live: a file name, a result's title
+    result: dict | None = None        # an unsaved processing result: short_name, meta
+    fiber_last: float = 0.0           # when its live frames were last measured (Update live)
 
 
 def camera_list() -> list[tuple[str, int]]:
@@ -147,29 +160,21 @@ class _DeviceCombo(QComboBox):
         super().showPopup()
 
 
+NO_CAMERA = ("", -1)  # Device box / source menu item: no camera in this view
+
+
 class MainWindow(QMainWindow):
     def __init__(self, camera_index: int | None = None):
-        """camera_index: open this camera; None = the one used last (else the first)."""
+        """camera_index: open this camera in the first view; None = the one used last (else the first)."""
         super().__init__()
         self.settings = QSettings("CamControl", "CamControl")
-        self.live = True
-        self._source = "live"  # what the view shows: "live" or an image file name
-        # Set while the view shows an unsaved processing result: what made it
-        # (saved to the .json sidecar) and a suggested file name.
-        self._result: dict | None = None
-        self._frame_times: deque[float] = deque(maxlen=30)
         self.flat: FlatField | None = None
         self._flat_path: str | None = None
         self._dialogs = {}  # processing dialogs, kept so they remember their files and options
         self._job = None    # background processing job while one runs
-        self._pending_camera: dict | None = None  # settings-file camera values waiting for the camera
-        self._camera_values: dict = {}             # latest values the camera reported
         self.settings_path: str | None = None      # settings file opened or saved last
-
         self._cli_index = camera_index  # used once, when the camera list is first read
-        self.camera_key: tuple[str, int] | None = None  # the camera to use (see camera_list)
-        self._frame_size: tuple[int, int] | None = None  # the open camera's frame size
-        self.camera_open = False
+        self._camera_values: dict = {}  # settings-file values per camera label, applied when each opens
 
         self._set_corners()
         # No Qt tab groups: each edge shows one panel at a time and the stripe
@@ -179,33 +184,32 @@ class MainWindow(QMainWindow):
         # PyCharm-style stripes along the edges: a button per panel to minimize / restore it.
         self.stripes = ToolStripes(self)
 
-        # The main view, with the compare images round it in a grid (when comparing).
-        # Under it, the video player bar (shown while a video is open).
-        self.view = ImageView()
-        self.compare = CompareArea(self.view)
+        # The views, and under them the video player bar (shown while a video is open).
+        self.views = ViewsArea()
         self.player = VideoPlayer()
         self.player.hide()
         self.player.frame_ready.connect(self._on_video_frame)
-        self.player.close_requested.connect(lambda: self._set_live(True))
+        self.player.close_requested.connect(self._close_video_and_resume)
+        self._video_pane: Pane | None = None  # the view the video plays in
         centre = QWidget()
         centre_layout = QVBoxLayout(centre)
         centre_layout.setContentsMargins(0, 0, 0, 0)
         centre_layout.setSpacing(0)
-        centre_layout.addWidget(self.compare, stretch=1)
+        centre_layout.addWidget(self.views, stretch=1)
         centre_layout.addWidget(self.player)
         self.setCentralWidget(centre)
         self.measure_panel = MeasurePanel()
         self.count_panel = CountPanel()
         self.fiber_panel = FiberPanel()
-        self._fiber_last = 0.0  # when the live view was last measured
+        self._capturing: set = set()        # cameras taking a photo now (Capture waits for them)
         self._fiber_job: Job | None = None  # fiber measuring running in the background (one at a time)
-        self._fiber_next = None  # request made while it was busy: run next (only the newest is kept)
-        self.grid_style, self.crosshair_style = GridStyle(), CrosshairStyle()  # on every image (_apply_overlays)
-        self._overlay_dialog: OverlayDialog | None = None  # Grid and crosshair window, made when first opened
+        self._fiber_waiting: dict = {}      # pane -> request made while it was busy (the newest per view)
         self._fiber_generation = 0  # counts settings changes: results measured with older settings are dropped
-        # The main view first, then any compare images; the panels start on the main view.
-        self.panes = [Pane(self.view, self.measure_panel.measurements, self.count_panel.counter)]
-        self.active = 0
+        self.grid_style, self.crosshair_style = GridStyle(), CrosshairStyle()  # on every view (_apply_overlays)
+        self._overlay_dialog: OverlayDialog | None = None  # Grid and crosshair window, made when first opened
+        self.panes: list[Pane] = []
+        self.active: Pane | None = None      # the view the panels work on
+        self.controlled: Pane | None = None  # the view whose camera Controls work on
         self.gallery = GalleryPanel()
         self.record_panel = RecordPanel(self)  # the Video and Time-lapse tabs in Controls
 
@@ -216,13 +220,9 @@ class MainWindow(QMainWindow):
         self._build_count_dock()
         self._build_fiber_dock()
         self._build_gallery_dock()
-        self._build_compare()
         self._build_status_bar()
+        self._build_views()
         self._load_settings()
-        self._set_title()
-        self._show_source()
-
-        self._start_worker()
 
     # --- building the UI ----------------------------------------------------
 
@@ -239,28 +239,37 @@ class MainWindow(QMainWindow):
     def _build_actions(self):
         self.open_action = self._action("&Open image...", "Ctrl+O", self.open_image)
         self.capture_action = self._action("&Capture", "Space", self.capture)
-        self.capture_action.setEnabled(False)  # until the camera opens
+        self.capture_action.setEnabled(False)  # until a camera opens
         self.save_action = self._action("&Save image as...", "Ctrl+S", self.save_image)
         self.open_folder_action = self._action("Open captures &folder", None, self.open_capture_folder)
         self.reconnect_action = self._action("&Reconnect camera", None, self.reconnect_camera)
         self.open_settings_action = self._action("Open se&ttings...", None, self.open_settings)
         self.save_settings_action = self._action("Save setti&ngs", "Ctrl+Shift+S", self.save_settings)
         self.save_settings_as_action = self._action("Save settings &as...", None, self.save_settings_as)
-        self.compare_action = self._action("&Compare images", "Ctrl+K", self._show_compare, checkable=True)
-        self.open_compare_action = self._action("Add images to co&mpare...", None, self.open_compare)
         self.quit_action = self._action("&Quit", "Ctrl+Q", self.close)
 
-        self.live_action = self._action("&Live", "L", self._set_live, checkable=True)
-        self.live_action.setChecked(True)
+        self.live_action = self._action("&Live", "L", self._toggle_live, checkable=True)
         self.grid_action = self._action("&Grid", "G", self._apply_overlays, checkable=True)
         self.grid_settings_action = self._action("Grid &settings...", None, lambda: self.show_overlay_settings("grid"))
         self.crosshair_action = self._action("C&rosshair", "C", self._apply_overlays, checkable=True)
         self.crosshair_settings_action = self._action("Crosshair s&ettings...", None,
                                                       lambda: self.show_overlay_settings("crosshair"))
-        self.fit_action = self._action("&Fit to window", "F", self.view.fit)
-        self.actual_action = self._action("&100%", "1", self.view.actual_size)
-        self.zoom_in_action = self._action("Zoom &in", "Ctrl+=", self.view.zoom_in)
-        self.zoom_out_action = self._action("Zoom &out", "Ctrl+-", self.view.zoom_out)
+        self.fit_action = self._action("&Fit to window", "F", lambda: [p.view.fit() for p in self._targets()])
+        self.actual_action = self._action("&100%", "1", lambda: [p.view.actual_size() for p in self._targets()])
+        self.zoom_in_action = self._action("Zoom &in", "Ctrl+=", lambda: self.active.view.zoom_in())
+        self.zoom_out_action = self._action("Zoom &out", "Ctrl+-", lambda: self.active.view.zoom_out())
+
+        # Views
+        self.multi_action = self._action("&Several views", "Ctrl+K", self._toggle_multi, checkable=True)
+        self.add_view_action = self._action("&Add view", "Ctrl+Shift+K", self._add_view_and_choose)
+        self.open_views_action = self._action("Open images in new &views...", None, self.open_in_new_views)
+        self.remove_view_action = self._action("&Remove this view", None, lambda: self.remove_view(self.active))
+        self.link_action = self._action("&Link views", None, lambda on: self.views.set_linked(on), checkable=True)
+        self.layout_actions = QActionGroup(self)
+        for name, label in LAYOUTS.items():
+            a = self._action(label, None, lambda _=False, n=name: self._set_layout(n), checkable=True)
+            a.setData(name)
+            self.layout_actions.addAction(a)
 
         self.export_action = self._action("&Export measurements...", "Ctrl+E", self.export_measurements)
         self.clear_measurements_action = self._action(
@@ -286,7 +295,7 @@ class MainWindow(QMainWindow):
 
     def _build_menus(self):
         m = self.menuBar().addMenu("&File")
-        m.addActions([self.open_action, self.open_compare_action, self.save_action,
+        m.addActions([self.open_action, self.open_views_action, self.save_action,
                       self.capture_action, self.open_folder_action])
         m.addSeparator()
         # Settings files (camera, capture, output, flat-field, recording, view).
@@ -305,7 +314,12 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addActions([self.fit_action, self.actual_action, self.zoom_in_action, self.zoom_out_action])
         m.addSeparator()
-        m.addAction(self.compare_action)
+        layout_menu = m.addMenu("La&yout")
+        layout_menu.addActions(self.layout_actions.actions())
+        m.addActions([self.multi_action, self.add_view_action, self.open_views_action, self.remove_view_action,
+                      self.link_action])
+        self.source_menu = m.addMenu("Source of this vie&w")
+        self.source_menu.aboutToShow.connect(lambda: self._fill_source_menu(self.active, self.source_menu))
         m.addSeparator()
         # Filled in by _add_dock(), one entry per panel.
         self.panels_menu = m.addMenu("&Panels")
@@ -330,14 +344,14 @@ class MainWindow(QMainWindow):
 
     def _build_measure_dock(self):
         panel = self.measure_panel
-        panel.tool_changed.connect(lambda tool: [p.view.set_tool(tool) for p in self.panes])  # tools work on any image
+        panel.tool_changed.connect(lambda tool: [p.view.set_tool(tool) for p in self.panes])  # tools work on any view
 
         def redraw():
-            for i, pane in enumerate(self.panes):  # calibration may have changed for both
-                selected = panel.selected_id() if i == self.active else None
+            for pane in self.panes:  # calibration may have changed for all
+                selected = panel.selected_id() if pane is self.active else None
                 pane.view.set_measurements(pane.measurements, panel.calibration, selected)
 
-        panel.selection_changed.connect(lambda sel: self._active_view().set_selected(sel))
+        panel.selection_changed.connect(lambda sel: self.active.view.set_selected(sel))
         panel.changed.connect(redraw)
         panel.export_requested.connect(self.export_measurements)
         # Measuring and counting both use clicks, so only one is on at a time.
@@ -356,7 +370,7 @@ class MainWindow(QMainWindow):
                 pane.view.set_count_class(cls)
 
         panel.mode_changed.connect(on_mode)
-        panel.changed.connect(lambda: self._active_view().viewport().update())
+        panel.changed.connect(lambda: self.active.view.viewport().update())
         panel.export_requested.connect(self.export_counts)
 
         self.count_dock = self._add_dock("Counting", "count_dock", panel,
@@ -367,36 +381,13 @@ class MainWindow(QMainWindow):
         panel = self.fiber_panel
         panel.find_requested.connect(self.find_fiber_axes)
         panel.method_changed.connect(self._fiber_settings_changed)
-        panel.changed.connect(lambda: self._active_view().set_fiber_axes(panel.axes, panel.selected()))
+        panel.changed.connect(lambda: self.active.view.set_fiber_axes(panel.axes, panel.selected()))
         panel.export_requested.connect(self.export_fiber_axes)
         panel.live_changed.connect(lambda on: on and self.find_fiber_axes())
         panel.show_parts_check.toggled.connect(self._show_fiber_parts)
         self.fiber_dock = self._add_dock("Fiber axis", "fiber_dock", panel,
                                          Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+5")
         self.fiber_dock.hide()  # same edge as Measurements; its stripe button opens it
-
-    def _connect_pane(self, pane: Pane):
-        """Hook an image's view up to the panels (the main view, or a compare image when added)."""
-        view = pane.view
-        view.set_measurements(pane.measurements, self.measure_panel.calibration)
-        view.activated.connect(lambda p=pane: self.set_active(self.panes.index(p)))
-        view.measurement_drawn.connect(self._on_measurement_drawn)
-        view.tool_exit_requested.connect(lambda: self.measure_panel.set_tool(None))
-        view.set_counter(pane.counter)
-        # The click made this view active first, so the panel holds its marks.
-        view.count_add.connect(self.count_panel.add)
-        view.count_remove.connect(self.count_panel.remove_near)
-        view.count_undo.connect(self.count_panel.undo)
-        view.tool_exit_requested.connect(lambda: self.count_panel.set_counting(False))
-        view.cursor_moved.connect(self._on_cursor)
-        # Join in whatever is going on (a measuring tool or counting picked already).
-        if self.view is not view:
-            view.set_tool(self.view.tool)
-            if self.view.count_class is not None:
-                view.set_count_class(self.view.count_class)
-            view.show_fiber_parts = self.view.show_fiber_parts
-            view.set_overlays(self.grid_action.isChecked(), self.grid_style,
-                              self.crosshair_action.isChecked(), self.crosshair_style)
 
     def _show_fiber_parts(self, on: bool):
         for pane in self.panes:
@@ -407,19 +398,24 @@ class MainWindow(QMainWindow):
         self.gallery.open_requested.connect(self.open_image_path)
         self.gallery.folder_changed.connect(self._update_next_name)
         self.gallery.process_requested.connect(self.run_process)
-        self.gallery.compare_requested.connect(self.compare_paths)
+        self.gallery.open_views_requested.connect(self.open_paths_in_new_views)
         # On the left by default: each edge shows one panel at a time, and
         # Controls has the right.
         self.gallery_dock = self._add_dock("Captures", "gallery_dock", self.gallery,
                                            Qt.DockWidgetArea.LeftDockWidgetArea, "Ctrl+3")
 
-    def _build_compare(self):
-        self._connect_pane(self.panes[0])
-        self.compare.add_requested.connect(self.open_compare)
-        self.compare.save_requested.connect(self.save_compare)
-        self.compare.close_requested.connect(lambda: self._show_compare(False))
-        self.compare.remove_requested.connect(self.remove_compare)
-        self.compare.remove_all_requested.connect(self.remove_all_compare)
+    def _build_views(self):
+        v = self.views
+        v.add_requested.connect(self._add_view_and_choose)
+        v.save_requested.connect(self.save_all_views)
+        v.remove_requested.connect(lambda view: self.remove_view(self._pane_of_view(view)))
+        v.source_menu_requested.connect(lambda view, menu: self._fill_source_menu(self._pane_of_view(view), menu))
+        v.tab_clicked.connect(lambda view: self.set_active(self._pane_of_view(view)))
+        v.layout_changed.connect(self._on_layout_changed)
+        v.linked_changed.connect(self.link_action.setChecked)
+        v.linked_changed.connect(lambda _on: self._update_capture_enabled())
+        self.link_action.setChecked(v.link_check.isChecked())
+        self._on_layout_changed(v.layout_name)
 
     def _place_gallery_default(self):
         """Default spot for the Captures panel: the left edge."""
@@ -474,9 +470,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
 
         # Camera: connection status, then one slider per control. Ranges are
-        # filled in when the camera opens and reports them (_on_camera_opened).
-        cam_box = QGroupBox("Camera")
-        cam_layout = QVBoxLayout(cam_box)
+        # filled in when the camera opens and reports them (_update_controls).
+        self.cam_box = QGroupBox("Camera")
+        cam_layout = QVBoxLayout(self.cam_box)
         status_row = QHBoxLayout()
         self.camera_status = QLabel("Connecting...")
         status_row.addWidget(self.camera_status, stretch=1)
@@ -490,7 +486,8 @@ class MainWindow(QMainWindow):
         self.camera_combo = _DeviceCombo()
         self.camera_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         self.camera_combo.setMinimumContentsLength(12)
-        self.camera_combo.setToolTip("The camera to use. Any USB camera Windows lists will work.")
+        self.camera_combo.setToolTip("The camera this view shows. Any USB camera Windows lists will work;\n"
+                                     "one in use in another view is moved to this one.")
         self.camera_combo.about_to_show.connect(self._fill_camera_combo)
         self.camera_combo.activated.connect(self._on_camera_chosen)
         device_form.addRow("Device", self.camera_combo)
@@ -520,7 +517,7 @@ class MainWindow(QMainWindow):
             self.value_labels[name] = label
         self.slider_box.setEnabled(False)  # until the camera opens
         cam_layout.addWidget(self.slider_box)
-        layout.addWidget(cam_box)
+        layout.addWidget(self.cam_box)
 
         # Output: where photos, videos and time-lapses go (shared by all three).
         out_box = QGroupBox("Output")
@@ -539,7 +536,8 @@ class MainWindow(QMainWindow):
         self.name_edit.setPlaceholderText("blank = date and time")
         self.name_edit.setToolTip(
             "Files are saved as name-001, name-002, ... continuing after the\n"
-            "highest number already in the folder, so nothing is overwritten."
+            "highest number already in the folder, so nothing is overwritten.\n"
+            "Capturing from several cameras at once (Link views) adds _view1, _view2, ..."
         )
         form.addRow("Name", self.name_edit)
         self.next_name_label = QLabel()
@@ -547,7 +545,7 @@ class MainWindow(QMainWindow):
         form.addRow("", self.next_name_label)
 
         flat_button = self._tool_button(self.flat_live_action)
-        flat_button.setToolTip("Correct uneven lighting in the live view, photos, videos and time-lapses.\n"
+        flat_button.setToolTip("Correct uneven lighting in the live views, photos, videos and time-lapses.\n"
                                "Set a flat reference first: Process > Flat-field correction.")
         form.addRow(flat_button)
         layout.addWidget(out_box)
@@ -606,8 +604,12 @@ class MainWindow(QMainWindow):
         row2 = QHBoxLayout()
         for a in (self.fit_action, self.actual_action):
             row2.addWidget(self._tool_button(a))
+        row3 = QHBoxLayout()
+        for a in (self.multi_action, self.add_view_action):
+            row3.addWidget(self._tool_button(a))
         grid.addLayout(row1)
         grid.addLayout(row2)
+        grid.addLayout(row3)
         layout.addWidget(view_box)
 
         layout.addStretch()
@@ -621,19 +623,16 @@ class MainWindow(QMainWindow):
         self.zoom_label = QLabel()
         self.cursor_label = QLabel()
         self.cursor_label.setMinimumWidth(260)
-        # What the view is showing: live, frozen, or which file.
+        # What the active view is showing: live, frozen, or which file.
         self.source_label = QLabel()
         self.source_label.setStyleSheet("font-weight: bold")
         for w in (self.cursor_label, self.zoom_label, self.size_label, self.fps_label, self.source_label):
             self.statusBar().addPermanentWidget(w)
-        self.view.zoom_changed.connect(lambda z: self.zoom_label.setText(f"{z * 100:.0f}%"))
 
     # --- settings ---------------------------------------------------------------
 
     def _load_settings(self):
         s = self.settings
-        if s.value("camera/name", ""):
-            self.camera_key = (s.value("camera/name"), int(s.value("camera/n", 0)))
         self.folder_edit.setText(s.value("capture/folder", str(CAPTURE_DIR)))
         self.average_combo.setCurrentIndex(int(s.value("capture/average_idx", 0)))
         self.size_combo.setCurrentIndex(int(s.value("capture/size_idx", 0)))
@@ -672,7 +671,29 @@ class MainWindow(QMainWindow):
                 setattr(self, name, kind.from_dict(json.loads(s.value(key, "{}"))))
             except (TypeError, ValueError, AttributeError):
                 pass  # unreadable: keep the default look
+
+        # The views and what each showed. Settings from before views existed
+        # hold just the camera (camera/name, camera/n): one view with it.
+        try:
+            specs = json.loads(s.value("views/state", "")) if s.value("views/state", "") else None
+        except (TypeError, ValueError):
+            specs = None
+        if not isinstance(specs, list) or not specs:
+            specs = [{"camera": [s.value("camera/name"), int(s.value("camera/n", 0))]}] if s.value("camera/name", "") \
+                else [{}]
+        devices = self._refresh_devices()
+        if self._cli_index is not None:  # main.py --index: that camera in the first view
+            if self._cli_index < len(devices):
+                specs[0] = {"camera": list(devices[self._cli_index])}
+            self._cli_index = None
+        if not s.value("views/state", "") and not specs[0] and devices:
+            specs[0] = {"camera": list(devices[0])}  # first run: the first camera
+        self.set_active(self._new_pane())
+        self._restore_views(specs)
+        self.views.set_linked(s.value("views/link", True, type=bool))
+        self._set_layout(s.value("views/layout", "single"), add=False)
         self._apply_overlays()
+
         # A layout saved while Recording was a tab under Captures (2026-09-28)
         # could be taller than the screen, so it isn't restored; the default
         # layout is used once instead.
@@ -696,6 +717,8 @@ class MainWindow(QMainWindow):
         recent = self._recent_settings()
         if recent:
             self.open_settings_path(recent[0], quiet=True)
+        self._update_titles()
+        self._update_controls()
 
     def _untabify(self):
         """Take panels out of Qt tab groups (see the dock options in __init__)."""
@@ -721,9 +744,13 @@ class MainWindow(QMainWindow):
 
     def _save_settings(self):
         s = self.settings
-        if self.camera_key:
-            s.setValue("camera/name", self.camera_key[0])
-            s.setValue("camera/n", self.camera_key[1])
+        first = self.panes[0].camera if self.panes else None
+        if first is not None and first.key:  # also read by versions from before views
+            s.setValue("camera/name", first.key[0])
+            s.setValue("camera/n", first.key[1])
+        s.setValue("views/state", json.dumps(self._view_specs()))
+        s.setValue("views/layout", self.views.layout_name)
+        s.setValue("views/link", self.views.link_check.isChecked())
         s.setValue("capture/folder", self.folder_edit.text())
         s.setValue("capture/average_idx", self.average_combo.currentIndex())
         s.setValue("capture/size_idx", self.size_combo.currentIndex())
@@ -754,266 +781,509 @@ class MainWindow(QMainWindow):
         s.setValue("flatfield/path", self._flat_path or "")
         s.setValue("flatfield/on", self.flat_live_action.isChecked())
 
-    # --- camera connection --------------------------------------------------------
+    # --- views ----------------------------------------------------------------------
 
-    def _start_worker(self):
-        """Open the camera (self.camera_key) on a new background thread."""
-        self._set_camera_status("Connecting...")
-        devices = self._fill_camera_combo()
-        if self._cli_index is not None:  # main.py --index
-            if self._cli_index < len(devices):
-                self.camera_key = devices[self._cli_index]
-            self._cli_index = None
-        if self.camera_key is None and devices:
-            self.camera_key = devices[0]
-            self._fill_camera_combo()
-        if self.camera_key in devices:
-            index = devices.index(self.camera_key)
-            w = CameraWorker(index, self._saved_resolution())
-        else:  # not plugged in (or no camera at all): the worker just reports that
-            w = CameraWorker(None)
-        w.opened.connect(self._on_camera_opened)
-        w.open_failed.connect(self._on_open_failed)
-        w.frame_ready.connect(self._on_frame)
-        w.settings_changed.connect(self._on_camera_settings)
-        w.capture_started.connect(self._on_capture_started)
-        w.capture_done.connect(self._on_capture_done)
-        w.error.connect(self._on_error)
-        w.recording_changed.connect(self._on_recording_changed)
-        w.recording_progress.connect(self.record_panel.set_record_progress)
-        w.timelapse_progress.connect(self._on_timelapse_progress)
-        w.timelapse_finished.connect(self._on_timelapse_finished)
-        if self.flat_live_action.isChecked():  # turned on from saved settings or a settings file
-            w.set_flat_field(self.flat)
-        self.worker = w
-        w.start()
+    def _new_pane(self) -> Pane:
+        """A new, empty view at the end."""
+        view = ImageView()
+        pane = Pane(view, [], Counter(names=self.count_panel.counter.names))
+        self.panes.append(pane)
+        self.views.add_view(view)
+        self._connect_pane(pane)
+        self._update_titles()
+        return pane
+
+    def _connect_pane(self, pane: Pane):
+        """Hook a view up to the panels, and have it join in whatever is going on."""
+        view = pane.view
+        view.set_measurements(pane.measurements, self.measure_panel.calibration)
+        view.activated.connect(lambda p=pane: self.set_active(p))
+        view.measurement_drawn.connect(self._on_measurement_drawn)
+        view.tool_exit_requested.connect(lambda: self.measure_panel.set_tool(None))
+        view.set_counter(pane.counter)
+        # The click made this view active first, so the panel holds its marks.
+        view.count_add.connect(self.count_panel.add)
+        view.count_remove.connect(self.count_panel.remove_near)
+        view.count_undo.connect(self.count_panel.undo)
+        view.tool_exit_requested.connect(lambda: self.count_panel.set_counting(False))
+        view.cursor_moved.connect(self._on_cursor)
+        view.zoom_changed.connect(lambda z, p=pane: p is self.active and self.zoom_label.setText(f"{z * 100:.0f}%"))
+        if self.active is not None:  # a measuring tool or counting picked already
+            view.set_tool(self.active.view.tool)
+            if self.active.view.count_class is not None:
+                view.set_count_class(self.active.view.count_class)
+        view.show_fiber_parts = self.fiber_panel.show_parts_check.isChecked()
+        view.set_overlays(self.grid_action.isChecked(), self.grid_style,
+                          self.crosshair_action.isChecked(), self.crosshair_style)
+
+    def _pane_of_view(self, view: ImageView) -> Pane | None:
+        return next((p for p in self.panes if p.view is view), None)
+
+    def _pane_of_link(self, link: CameraLink) -> Pane | None:
+        return next((p for p in self.panes if p.camera is link), None)
+
+    def _number(self, pane: Pane) -> int:
+        return self.panes.index(pane) + 1
+
+    def _targets(self) -> list[Pane]:
+        """The views an action works on: all of them with Link views on, else the active one."""
+        return list(self.panes) if self.views.linked else [self.active]
+
+    def add_view(self) -> Pane | None:
+        """Add an empty view (and make it the active one); its Source menu picks what it shows."""
+        if self.views.is_full():
+            self.statusBar().showMessage("That's as many views as fit. Remove one first.", 6000)
+            return None
+        pane = self._new_pane()
+        if self.views.layout_name == "single":
+            self._set_layout(self.views.multi_layout, add=False)
+        self.set_active(pane)
+        self.statusBar().showMessage(f"View {self._number(pane)} added: choose a camera or an image in its "
+                                     "Source menu (or Controls > Device).", 8000)
+        return pane
+
+    def _add_view_and_choose(self):
+        """Add a view and open its Source menu, to pick its camera or image straight away."""
+        pane = self.add_view()
+        if pane is not None:
+            menu = QMenu(self)
+            self._fill_source_menu(pane, menu)
+            menu.exec(QCursor.pos())
+
+    def open_in_new_views(self):
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open images in new views", self.folder_edit.text(), FILE_FILTER)
+        if paths:
+            self.open_paths_in_new_views(paths)
+
+    def open_paths_in_new_views(self, paths: list[str]):
+        """Each image in a new view (e.g. from Captures, to compare)."""
+        failed, skipped, added = [], 0, []
+        for path in paths:
+            if self.views.is_full():
+                skipped += 1
+                continue
+            img = load_image_file(path)
+            if img is None:
+                failed.append(Path(path).name)
+                continue
+            pane = self._new_pane()
+            self._show_image(pane, img, path=path)
+            added.append(pane)
+        if added and self.views.layout_name == "single":
+            self._set_layout(self.views.multi_layout, add=False)
+        if failed:
+            QMessageBox.warning(self, "Open in new views", "Could not read " + ", ".join(failed))
+        if skipped:
+            self.statusBar().showMessage(
+                f"No room for {skipped} more view{'s' if skipped != 1 else ''}. Remove some first.", 8000)
+
+    def remove_view(self, pane: Pane | None):
+        """Take a view away, with its camera, measurements, marks and fiber axes."""
+        if pane is None or pane not in self.panes:
+            return
+        if len(self.panes) == 1:
+            self.statusBar().showMessage("There's always at least one view.", 5000)
+            return
+        if pane.camera is not None and not self._ok_to_stop(pane.camera, "Remove view"):
+            return
+        if pane is self.active:
+            self.set_active(next(p for p in self.panes if p is not pane))
+        if self._video_pane is pane:
+            self._close_video()
+        self._release_camera(pane)
+        self._fiber_waiting.pop(pane, None)
+        self.panes.remove(pane)
+        self.views.remove_view(pane.view)
+        self._choose_controlled()
+        self._update_titles()
+        self._update_controls()
+
+    def _toggle_multi(self, on: bool):
+        """Ctrl+K: one view / several views."""
+        self._set_layout(self.views.multi_layout if on else "single")
+
+    def _set_layout(self, name: str, add: bool = True):
+        """add: going from one view to several adds an empty second one."""
+        if name != "single" and len(self.panes) < 2 and add:
+            self.views.set_layout(name)
+            self._add_view_and_choose()
+            return
+        self.views.set_layout(name)
+        self._on_layout_changed(self.views.layout_name)
+
+    def _on_layout_changed(self, name: str):
+        for a in self.layout_actions.actions():
+            a.setChecked(a.data() == name)
+        self.multi_action.setChecked(name != "single")
+
+    def save_all_views(self):
+        panes = [p for p in self.panes if p.view.image is not None]
+        if len(panes) < 2:
+            QMessageBox.information(self, "Save all views", "Two or more views need an image first.")
+            return
+        names = [f"{self._number(p)} {self._source_text(p)[0]}" for p in panes]
+        default = next_capture_path(Path(self.folder_edit.text()), "views", "png")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save all views as one image", str(default), "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)")
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() not in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
+            path = path.with_suffix(".png")
+        try:
+            save_image_file(path, grid_image([p.view.image for p in panes], names))
+        except Exception as e:
+            QMessageBox.warning(self, "Save all views", f"Save failed: {e}")
+            return
+        self.statusBar().showMessage(f"Saved {path}", 5000)
+
+    def _view_specs(self) -> list[dict]:
+        """What each view shows, for saving: its camera, or its file."""
+        specs = []
+        for p in self.panes:
+            if p.camera is not None and p.camera.key:
+                specs.append({"camera": list(p.camera.key)})
+            elif p.path and p.result is None and not is_video(p.path):
+                specs.append({"path": os.path.abspath(p.path)})
+            else:
+                specs.append({})
+        return specs
+
+    def _restore_views(self, specs: list[dict]):
+        """Make the views show what specs say (from saved settings or a settings
+        file). Views beyond them are removed if nothing is lost by it."""
+        for i, spec in enumerate(specs[:12]):
+            if not isinstance(spec, dict):
+                continue
+            pane = self.panes[i] if i < len(self.panes) else self._new_pane()
+            key, path = spec.get("camera"), spec.get("path")
+            if isinstance(key, list) and len(key) == 2 and key[0]:
+                key = (str(key[0]), int(key[1]))
+                if pane.camera is None or pane.camera.key != key:
+                    self._set_pane_camera(pane, key, ask=False)
+            elif isinstance(path, str) and path and Path(path).is_file() and pane.path != path:
+                img = load_image_file(path)
+                if img is not None:
+                    self._show_image(pane, img, path=path)
+        for pane in self.panes[len(specs):]:
+            busy = pane.camera is not None and self._busy(pane.camera)
+            if not (busy or pane.measurements or pane.counter.marks or pane.fiber_axes):
+                self.remove_view(pane)
+
+    # --- sources ------------------------------------------------------------------------
+
+    def _refresh_devices(self) -> list[tuple[str, int]]:
+        """Read the camera list from Windows (kept: it takes a moment)."""
+        self._devices = camera_list()
+        return self._devices
+
+    def _camera_owner(self, key) -> Pane | None:
+        return next((p for p in self.panes if p.camera is not None and p.camera.key == key), None)
+
+    def _fill_source_menu(self, pane: Pane | None, menu: QMenu):
+        """A view's Source menu: its camera, No camera, Live, Open image, Remove."""
+        menu.clear()
+        if pane is None:
+            return
+        devices = self._refresh_devices()
+        current = pane.camera.key if pane.camera is not None else None
+        menu.addSection("Camera")
+        for key in devices + ([current] if current and current not in devices else []):
+            text = camera_label(key)
+            owner = self._camera_owner(key)
+            if owner is not None and owner is not pane:
+                text += f"  (in view {self._number(owner)}: move it here)"
+            if key not in devices:
+                text += "  (not connected)"
+            a = menu.addAction(text, lambda k=key: self._set_pane_camera(pane, k))
+            a.setCheckable(True)
+            a.setChecked(key == current)
+        if not devices:
+            menu.addAction("No cameras found").setEnabled(False)
+        a = menu.addAction("No camera", lambda: self._set_pane_camera(pane, None))
+        a.setCheckable(True)
+        a.setChecked(current is None)
+        menu.addSeparator()
+        live = menu.addAction("Live", lambda on: self._set_live(pane, on))
+        live.setCheckable(True)
+        live.setChecked(pane.live)
+        live.setEnabled(pane.camera is not None)
+        menu.addAction("Open image...", lambda: self.open_image(pane))
+        menu.addSeparator()
+        menu.addAction("Remove this view", lambda: self.remove_view(pane)).setEnabled(len(self.panes) > 1)
+
+    def _set_pane_camera(self, pane: Pane, key, ask: bool = True) -> bool:
+        """Show camera key in pane, live (None: no camera). A camera used by
+        another view moves to this one. False if the user chose to keep a
+        recording going instead."""
+        current = pane.camera.key if pane.camera is not None else None
+        if key == current:
+            if pane.camera is not None:
+                self._set_live(pane, True)
+            return True
+        owner = self._camera_owner(key) if key is not None else None
+        for link in (pane.camera, owner.camera if owner else None):
+            if link is not None and ask and not self._ok_to_stop(link, "Change camera"):
+                return False
+        if owner is not None:
+            self._release_camera(owner)
+            self._update_source(owner)
+        self._release_camera(pane)
+        if key is not None:
+            self._attach_camera(pane, key)
+            self._set_live(pane, True)
+        self._choose_controlled()
+        self._update_controls()
+        self._update_source(pane)
+        return True
+
+    def _attach_camera(self, pane: Pane, key: tuple[str, int]):
+        link = CameraLink(key, self)
+        link.opened.connect(self._on_camera_opened)
+        link.open_failed.connect(self._on_open_failed)
+        link.frame_ready.connect(self._on_frame)
+        link.settings_changed.connect(self._on_camera_settings)
+        link.capture_started.connect(self._on_capture_started)
+        link.capture_done.connect(self._on_capture_done)
+        link.error.connect(self._on_error)
+        link.recording_changed.connect(self._on_recording_changed)
+        link.recording_progress.connect(
+            lambda lk, s, f: lk is self._link() and self.record_panel.set_record_progress(s, f))
+        link.timelapse_progress.connect(self._on_timelapse_progress)
+        link.timelapse_finished.connect(self._on_timelapse_finished)
+        pane.camera = link
+        self._start_link(link)
+
+    def _start_link(self, link: CameraLink):
+        devices = self._refresh_devices()
+        index = devices.index(link.key) if link.key in devices else None  # not plugged in: the worker says so
+        link.start(index, self._saved_resolution(link.key), self.flat if self.flat_live_action.isChecked() else None)
+
+    def _release_camera(self, pane: Pane):
+        """Close pane's camera; it keeps showing the last frame."""
+        link = pane.camera
+        if link is None:
+            return
+        pane.camera = None
+        pane.live = False
+        self._capturing.discard(link)
+        link.stop()
+        link.deleteLater()
+        if self.controlled is pane:
+            self.controlled = None
+            self._choose_controlled()
+
+    def _busy(self, link: CameraLink) -> list[str]:
+        return [what for what, on in (("a video is recording", link.recording),
+                                      ("a time-lapse is running", link.timelapse)) if on]
+
+    def _ok_to_stop(self, link: CameraLink, title: str) -> bool:
+        """True if link's camera isn't recording, or the user agrees to stop it."""
+        busy = self._busy(link)
+        return not busy or QMessageBox.question(
+            self, title, f"On {camera_label(link.key)}, {' and '.join(busy)}. Stop it?"
+        ) == QMessageBox.StandardButton.Yes
+
+    # --- which camera Controls work on ----------------------------------------------------
+
+    def _choose_controlled(self):
+        """Controls work on the active view's camera; if it has none, on the
+        camera they had; else on the first view with one."""
+        if self.active is not None and self.active.camera is not None:
+            new = self.active
+        elif self.controlled in self.panes and self.controlled.camera is not None:
+            new = self.controlled
+        else:
+            new = next((p for p in self.panes if p.camera is not None), None)
+        if new is not self.controlled:
+            self.controlled = new
+            self.record_panel.record_status.setText("")
+            self._update_controls()
+
+    def _link(self) -> CameraLink | None:
+        return self.controlled.camera if self.controlled is not None else None
+
+    def _update_controls(self):
+        """Show the controlled camera in the Camera box, Resolution, sliders and recording."""
+        if not hasattr(self, "_devices"):
+            return  # still building the window
+        link = self._link()
+        title = "Camera"
+        if self.controlled is not None and len(self.panes) > 1:
+            title += f" (view {self._number(self.controlled)})"
+        self.cam_box.setTitle(title)
+        if link is None:
+            self._set_camera_status("No camera in this view", "color: gray;",
+                                    "Choose one in Device, or in a view's Source menu.")
+        else:
+            self._set_camera_status(*link.status)
+        self._fill_camera_combo(refresh=False)
+        self._fill_resolution_combo()
+        is_open = link is not None and link.open
+        for name, slider in self.sliders.items():
+            r = link.ranges.get(name) if is_open else None
+            slider.setEnabled(r is not None)
+            if r is None:
+                self.value_labels[name].setText("not available" if is_open else "-")
+                continue
+            slider.blockSignals(True)
+            slider.setRange(r["min"], r["max"])
+            if name in link.values:
+                slider.setValue(link.values[name])
+            slider.blockSignals(False)
+            if name in link.values:
+                self._show_value(name, link.values[name])
+        self.slider_box.setEnabled(is_open)
+        self.record_panel.set_enabled(is_open)
+        recording = link is not None and link.recording
+        if self.record_panel.record_button.isChecked() != recording:
+            self.record_panel.set_recording(recording, "")
+        timelapse = link is not None and link.timelapse
+        if self.record_panel.tl_button.isChecked() != timelapse:
+            self.record_panel.set_timelapse_running(timelapse)
+        self._update_save_sizes()
+        self._update_capture_enabled()
 
     def _set_camera_status(self, text: str, style: str = "", tooltip: str = ""):
         self.camera_status.setText(text)
         self.camera_status.setStyleSheet(style)
         self.camera_status.setToolTip(tooltip)
 
-    def _fill_camera_combo(self) -> list[tuple[str, int]]:
-        """List the cameras in the Device box (plus the chosen one if it isn't
-        plugged in). Returns camera_list()."""
-        devices = camera_list()
+    def _fill_camera_combo(self, refresh: bool = True):
+        """List the cameras in the Device box: the controlled one selected, ones
+        in other views marked, and No camera."""
+        devices = self._refresh_devices() if refresh else self._devices
+        target = self.controlled or self.active
+        current = target.camera.key if target is not None and target.camera is not None else None
         combo = self.camera_combo
         combo.blockSignals(True)
         combo.clear()
-        for key in devices:
-            combo.addItem(camera_label(key), key)
-        if self.camera_key is not None and self.camera_key not in devices:
-            combo.addItem(f"{camera_label(self.camera_key)} (not connected)", self.camera_key)
-        if self.camera_key is not None:
-            combo.setCurrentIndex(find_item(combo, self.camera_key))
+        for key in devices + ([current] if current and current not in devices else []):
+            text = camera_label(key)
+            owner = self._camera_owner(key)
+            if owner is not None and owner is not target:
+                text += f" (view {self._number(owner)})"
+            if key not in devices:
+                text += " (not connected)"
+            combo.addItem(text, key)
+        combo.addItem("No camera", NO_CAMERA)
+        combo.setCurrentIndex(find_item(combo, current if current else NO_CAMERA))
         combo.blockSignals(False)
-        return devices
 
     def _on_camera_chosen(self, _index: int):
         key = self.camera_combo.currentData()
-        if key is None or tuple(key) == self.camera_key:
-            return
-        previous = self.camera_key
-        self.camera_key = tuple(key)
-        if not self.reconnect_camera():
-            self.camera_key = previous  # the user chose to keep recording
-            self._fill_camera_combo()
+        key = None if key is None or tuple(key) == NO_CAMERA else tuple(key)
+        target = self.controlled or self.active
+        if target is None or not self._set_pane_camera(target, key):
+            self._fill_camera_combo(refresh=False)
 
-    def _resolution_setting(self) -> str:
-        name, n = self.camera_key
+    def _resolution_setting(self, key) -> str:
+        name, n = key
         return "camera/resolution/" + re.sub(r"[^\w.-]", "_", f"{name}_{n}")
 
-    def _saved_resolution(self) -> tuple[int, int] | None:
+    def _saved_resolution(self, key) -> tuple[int, int] | None:
         """The frame size chosen for this camera, or None for its largest."""
-        m = re.fullmatch(r"(\d+)x(\d+)", str(self.settings.value(self._resolution_setting(), "")))
+        if not key:
+            return None
+        m = re.fullmatch(r"(\d+)x(\d+)", str(self.settings.value(self._resolution_setting(key), "")))
         return (int(m[1]), int(m[2])) if m else None
 
     def _on_resolution_chosen(self, _index: int):
+        link = self._link()
         size = self.resolution_combo.currentData()
-        if size is None or tuple(size) == self._frame_size:
+        if link is None or size is None or tuple(size) == link.frame_size:
             return
-        self.settings.setValue(self._resolution_setting(), f"{size[0]}x{size[1]}")
+        self.settings.setValue(self._resolution_setting(link.key), f"{size[0]}x{size[1]}")
         if not self.reconnect_camera():
-            self._fill_resolution_combo([])
+            self._fill_resolution_combo()
 
-    def _fill_resolution_combo(self, modes: list[dict]):
-        """List the camera's frame sizes in the Resolution box, the open one selected."""
+    def _fill_resolution_combo(self):
+        """List the controlled camera's frame sizes in the Resolution box, the open one selected."""
+        link = self._link()
         combo = self.resolution_combo
         combo.blockSignals(True)
         combo.clear()
-        sizes = frame_sizes(modes)
-        if self._frame_size and self._frame_size not in [s[:2] for s in sizes]:
-            sizes.append((*self._frame_size, None))
+        sizes = frame_sizes(link.modes) if link is not None else []
+        size = link.frame_size if link is not None else None
+        if size and size not in [s[:2] for s in sizes]:
+            sizes.append((*size, None))
         for w, h, fps in sizes:
             combo.addItem(f"{w} x {h}" + (f"  ({fps:g} fps)" if fps else ""), (w, h))
-        if self._frame_size:
-            combo.setCurrentIndex(find_item(combo, self._frame_size))
-        combo.setEnabled(self.camera_open and len(sizes) > 1)
+        if size:
+            combo.setCurrentIndex(find_item(combo, size))
+        combo.setEnabled(link is not None and link.open and len(sizes) > 1)
         combo.blockSignals(False)
 
     def _update_save_sizes(self):
-        """Show the real save sizes for the open camera in the Save size box."""
+        """Show the real save sizes for the controlled camera in the Save size box."""
+        link = self._link()
+        size = link.frame_size if link is not None else None
         for i, (text, scale) in enumerate(SAVE_SCALES):
-            if self._frame_size:
-                w, h = scaled_size(*self._frame_size, scale)
+            if size:
+                w, h = scaled_size(*size, scale)
                 text = f"{w} x {h} (native)" if scale == 1 else f"{w} x {h} (HD2 size, 1.7x upscaled)"
             self.size_combo.setItemText(i, text)
 
-    def _on_open_failed(self, message: str):
-        self.camera_open = False
-        self._frame_size = None
-        self._fill_resolution_combo([])
-        self._set_camera_status("Not connected", "color: #c00; font-weight: bold;", message)
-        self.statusBar().showMessage(f"{message} Turn the camera on, then click Reconnect.")
-
     def reconnect_camera(self) -> bool:
-        """Close the camera (if open) and open self.camera_key again. False if
+        """Close the controlled camera (if open) and open it again. False if
         the user chose not to stop a recording."""
-        busy = self._busy_recording()
-        if busy and QMessageBox.question(
-            self, "Reconnect camera", f"{' and '.join(busy).capitalize()}. Stop it and reconnect?"
-        ) != QMessageBox.StandardButton.Yes:
+        link = self._link()
+        if link is None:
+            self.statusBar().showMessage("This view has no camera: choose one in Device.", 5000)
+            return False
+        if not self._ok_to_stop(link, "Reconnect camera"):
             return False
         self.statusBar().showMessage("Reconnecting to the camera...")
-        self.worker.stop()  # closes the camera; a recording is finished and saved
-        self.camera_open = False
-        self.slider_box.setEnabled(False)
-        self.capture_action.setEnabled(False)
-        self.record_panel.set_enabled(False)
-        self.resolution_combo.setEnabled(False)
-        self._start_worker()
+        self._capturing.discard(link)
+        self._start_link(link)
+        self._update_controls()
+        self._update_source(self.controlled)
         return True
-
-    def _busy_recording(self) -> list[str]:
-        return [what for what, on in (("a video is recording", self.record_panel.record_button.isChecked()),
-                                      ("a time-lapse is running", self.record_panel.tl_button.isChecked())) if on]
 
     # --- camera events ------------------------------------------------------------
 
-    def _on_camera_opened(self, info: dict):
-        """info: name, size, modes and ranges (see CameraWorker.opened)."""
-        ranges = info["ranges"]
-        self._camera_values = {}  # values from a camera used before belong to that one
-        for name, slider in self.sliders.items():
-            r = ranges.get(name)
-            slider.setEnabled(r is not None)
-            if r is None:
-                self.value_labels[name].setText("not available")
-                continue
-            slider.blockSignals(True)
-            slider.setRange(r["min"], r["max"])
-            slider.blockSignals(False)
-        self.camera_open = True
-        self._frame_size = tuple(info["size"])
-        self._fill_resolution_combo(info["modes"])
-        self._update_save_sizes()
-        self._set_camera_status("Connected", "color: green;", info["name"])
-        self.slider_box.setEnabled(True)
-        self.capture_action.setEnabled(True)
-        self.record_panel.set_enabled(True)
-        self.statusBar().showMessage("Camera open", 3000)
-        if self._pending_camera:
-            self._apply_camera_values(self._pending_camera)
-            self._pending_camera = None
+    def _on_camera_opened(self, link: CameraLink, info: dict):
+        pane = self._pane_of_link(link)
+        if link is self._link():
+            self._update_controls()
+            self.statusBar().showMessage("Camera open", 3000)
+        # Values from a settings file, waiting for this camera.
+        values = self._camera_values.pop(camera_label(link.key), None)
+        if values:
+            self._apply_camera_values(link, values)
+        self._update_capture_enabled()
+        self._update_source(pane)
 
-    def _on_frame(self, frame):
-        # Always acknowledge, so the worker sends the next frame.
-        self.worker.frame_consumed()
-        if not self.live:
+    def _on_open_failed(self, link: CameraLink, message: str):
+        if link is self._link():
+            self._update_controls()
+            self.statusBar().showMessage(f"{message} Turn the camera on, then click Reconnect.")
+        self._update_source(self._pane_of_link(link))
+
+    def _on_frame(self, link: CameraLink, frame):
+        pane = self._pane_of_link(link)
+        if pane is None or not pane.live:
             return
-        self.view.set_image(frame)
+        pane.view.set_image(frame)
+        if pane is self.active:
+            fps = link.fps()
+            if fps:
+                self.fps_label.setText(f"{fps:.1f} fps")
+            h, w = frame.shape[:2]
+            self.size_label.setText(f"{w} x {h}")
+        # Fiber axes of the live views, a few times a second, taking turns, in
+        # the background so the video doesn't stall. Frames that come while
+        # it's busy are skipped.
+        if self.fiber_panel.live_check.isChecked() and self._fiber_job is None:
+            now = time.perf_counter()
+            live = [p for p in self.panes if p.live]
+            if now - pane.fiber_last >= FIBER_LIVE_INTERVAL_S and pane.fiber_last <= min(p.fiber_last for p in live):
+                pane.fiber_last = now
+                self._request_fibers(pane, frame.copy(), "live")  # copy: the worker may reuse its buffer
 
-        now = time.perf_counter()
-        self._frame_times.append(now)
-        if len(self._frame_times) > 1:
-            span = self._frame_times[-1] - self._frame_times[0]
-            if span > 0:
-                self.fps_label.setText(f"{(len(self._frame_times) - 1) / span:.1f} fps")
-        h, w = frame.shape[:2]
-        self.size_label.setText(f"{w} x {h}")
-        # Fiber axes on the live view, a few times a second, in the background so
-        # the video doesn't stall. Frames that come while it's busy are skipped.
-        if (self.fiber_panel.live_check.isChecked() and self._fiber_job is None
-                and now - self._fiber_last >= FIBER_LIVE_INTERVAL_S):
-            self._fiber_last = now
-            self._request_fibers(0, frame.copy(), "live")  # copy: the worker may reuse its buffer
-
-    def _request_fibers(self, index: int, image, kind: str):
-        """Measure the fiber axes of pane index's image in the background, with
-        the panel's settings as they are now. kind: "live" (a camera frame;
-        skipped while another measuring runs), "image" (an image opened, or the
-        settings changed) or "find" (Find axes: say how many were found).
-        One runs at a time; a request made meanwhile runs next, replacing any
-        other waiting one, so the newest image and settings always win."""
-        from_camera = index == 0 and self.live
-        request = (index, image, kind, from_camera, self._fiber_generation, self._fiber_analysis(index))
-        if self._fiber_job is not None:
-            if kind != "live":
-                self._fiber_next = request
+    def _on_camera_settings(self, link: CameraLink, values: dict):
+        if link is not self._link():
             return
-        analyse = request[-1]
-        job = Job(lambda: analyse(image), self)
-        job.succeeded.connect(lambda axes: self._fibers_done(request, axes))
-        job.failed.connect(lambda msg: self.statusBar().showMessage(f"Fiber axes: {msg}", 6000))
-        job.finished.connect(self._fibers_finished)
-        self._fiber_job = job
-        job.start(QThread.Priority.LowPriority)  # the video and the window come first
-
-    def _fibers_done(self, request, axes):
-        index, image, kind, from_camera, generation, _ = request
-        if generation != self._fiber_generation:
-            return  # measured with old settings: the new ones are being measured
-        # Only if the image measured is still the one shown: for a camera frame, while
-        # the camera still shows (and, live updates, while they're on).
-        if from_camera:
-            if not self.live or (kind == "live" and not self.fiber_panel.live_check.isChecked()):
-                return
-        elif index >= len(self.panes) or self.panes[index].view.image is not image or (index == 0 and self.live):
-            return
-        self._show_fiber_axes(index, axes)
-        if kind == "find":
-            if axes:
-                unclear = sum(not f.clear for f in axes)
-                note = f" ({unclear} unclear)" if unclear else ""
-                self.statusBar().showMessage(f"Found {len(axes)} fiber{'s' if len(axes) != 1 else ''}{note}.", 6000)
-            else:
-                self.statusBar().showMessage(
-                    "No fibers found. Draw a Circle (3 pt or centre) round the fiber in Measurements, then Find axes.", 10000)
-
-    def _fibers_finished(self):
-        self._fiber_job.deleteLater()
-        self._fiber_job = None
-        if self._fiber_next is not None:
-            index, image, kind = self._fiber_next[:3]
-            self._fiber_next = None
-            self._request_fibers(index, image, kind)  # with the settings as they are now
-
-    def _fiber_settings_changed(self):
-        """Method or detection settings changed: re-measure what's shown (if it was measured)."""
-        self._fiber_generation += 1
-        index = self.active
-        if index == 0 and self.live:
-            if self.fiber_panel.live_check.isChecked():
-                self._fiber_last = 0.0  # the next frame
-            elif self.fiber_panel.axes and self.view.image is not None:
-                self._request_fibers(0, self.view.image.copy(), "image")
-        elif self.fiber_panel.axes or (index == 0 and self.fiber_panel.live_check.isChecked()):
-            image = self.panes[index].view.image
-            if image is not None:
-                self._request_fibers(index, image, "image")
-
-    def _measure_opened_image(self):
-        """A new image (a file, a result) was opened: clear the old axes, and with
-        Update live on measure it, in the background, so clicking through images
-        keeps the axes up to date."""
-        if self.live or self.view.image is None:
-            return
-        self._show_fiber_axes(0, [])  # the old image's axes don't belong to this one
-        if self.fiber_panel.live_check.isChecked():
-            self._request_fibers(0, self.view.image, "image")
-
-    def _on_camera_settings(self, values: dict):
-        self._camera_values.update(values)
         for name, value in values.items():
             slider = self.sliders.get(name)
             if slider is None:
@@ -1025,21 +1295,21 @@ class MainWindow(QMainWindow):
                 slider.blockSignals(False)
             self._show_value(name, value)
 
-    def _on_capture_started(self, n_frames: int, seconds: float):
-        self.capture_action.setEnabled(False)
+    def _on_capture_started(self, link: CameraLink, n_frames: int, seconds: float):
         self.statusBar().showMessage(f"Capturing {n_frames} frame(s), about {seconds:.1f} s...")
 
-    def _on_capture_done(self, path: str):
-        self.capture_action.setEnabled(True)
+    def _on_capture_done(self, link: CameraLink, path: str):
+        self._capturing.discard(link)
+        self._update_capture_enabled()
         self.last_saved_label.setText(f"Saved {Path(path).name}")
         self.statusBar().showMessage(f"Saved {path}", 5000)
         self._update_next_name()
         # The folder watcher would pick it up too; this also selects it.
         self.gallery.refresh(select=path)
 
-    def _on_error(self, message: str):
-        # Capture stays disabled if the camera never opened.
-        self.capture_action.setEnabled(self.camera_open)
+    def _on_error(self, link: CameraLink, message: str):
+        self._capturing.discard(link)
+        self._update_capture_enabled()
         self.statusBar().showMessage(message)
         QMessageBox.warning(self, "CamControl", message)
 
@@ -1053,48 +1323,100 @@ class MainWindow(QMainWindow):
 
     def _on_slider(self, name: str, value: int):
         self._show_value(name, value)
-        self.worker.set_control(name, value)
+        link = self._link()
+        if link is not None and link.worker is not None:
+            link.worker.set_control(name, value)
 
-    def _set_live(self, on: bool):
-        self.live = on
-        self.live_action.setChecked(on)
+    def _capture_links(self) -> list[CameraLink]:
+        """The cameras Capture takes from: every open one with Link views on, else the controlled one."""
+        if self.views.linked:
+            return [p.camera for p in self.panes if p.camera is not None and p.camera.open]
+        link = self._link()
+        return [link] if link is not None and link.open else []
+
+    def _update_capture_enabled(self):
+        if hasattr(self, "_capturing"):
+            self.capture_action.setEnabled(bool(self._capture_links()) and not self._capturing)
+
+    def capture(self):
+        links = self._capture_links()
+        if not links or self._capturing:
+            return
+        name = clean_name(self.name_edit.text())
+        for link in links:
+            this_name = name
+            if len(links) > 1:  # each camera its own series, so two can't take the same number
+                this_name = f"{name or 'cap'}_view{self._number(self._pane_of_link(link))}"
+            self._capturing.add(link)
+            link.worker.capture(self.average_combo.currentData(), self.size_combo.currentData(),
+                                self.format_combo.currentData(), Path(self.folder_edit.text()), this_name)
+        self._update_capture_enabled()
+
+    # --- live / freeze and what each view shows ------------------------------------------
+
+    def _toggle_live(self, on: bool):
+        """L: live or frozen, for the active view (all of them with Link views on)."""
+        for pane in self._targets():
+            if pane.camera is not None:
+                self._set_live(pane, on)
+        if self.active is not None:
+            self.live_action.setChecked(self.active.live)
+
+    def _set_live(self, pane: Pane, on: bool):
+        on = on and pane.camera is not None
+        pane.live = on
         if on:
-            self._source = "live"
-            self._result = None
-            self._close_video()
-        else:
-            self.fps_label.clear()
-            self._frame_times.clear()
-        self._set_title()
-        self._show_source()
+            pane.path, pane.title, pane.result = None, "", None
+            pane.fiber_last = 0.0
+            if self._video_pane is pane:
+                self._close_video()
+        self._update_source(pane)
 
-    def _show_source(self, path: str | None = None):
-        if path:
-            self.source_label.setText(Path(path).name)
-            self.source_label.setToolTip(str(path))
-        elif self._result is not None:
-            self.source_label.setText(f"{self._source} (unsaved)")
-            self.source_label.setToolTip("Processing result. File > Save image as (Ctrl+S) to keep it.")
-        else:
-            self.source_label.setText("Live" if self.live else "Frozen")
-            self.source_label.setToolTip("")
-        self.compare.set_title(self.view, self.source_label.text(), self.source_label.toolTip())
-        self.gallery.set_open_path(path)  # framed in Captures
+    def _source_text(self, pane: Pane) -> tuple[str, str]:
+        """What pane shows, for its title and the status bar: (text, tooltip)."""
+        cam = camera_label(pane.camera.key) if pane.camera is not None and pane.camera.key else None
+        if pane.live:
+            if pane.camera.open:
+                return f"{cam} · Live", pane.camera.name
+            text, _, tip = pane.camera.status
+            return f"{cam} · {text}", tip
+        if pane.result is not None:
+            return f"{pane.title} (unsaved)", "Processing result. File > Save image as (Ctrl+S) to keep it."
+        if pane.path:
+            return Path(pane.path).name, pane.path
+        if pane.view.image is not None:
+            return "Frozen" + (f" ({cam})" if cam else ""), "L goes back to live." if cam else ""
+        return "Empty: choose a camera or an image in Source", ""
 
-    def _set_title(self, file_name: str | None = None):
-        title = f"CamControl - {file_name or ('live' if self.live else 'frozen')}"
+    def _update_source(self, pane: Pane | None):
+        if pane is None or pane not in self.panes:
+            return
+        text, tip = self._source_text(pane)
+        self.views.set_title(pane.view, text, tip)
+        if pane is not self.active:
+            return
+        self.source_label.setText(text)
+        self.source_label.setToolTip(tip)
+        title = f"CamControl - {text}"
+        if len(self.panes) > 1:
+            title += f"  (view {self._number(pane)})"
         if self.settings_path:
             title += f"   [{Path(self.settings_path).stem}]"
         self.setWindowTitle(title)
+        self.gallery.set_open_path(pane.path)  # framed in Captures
+        self.live_action.setChecked(pane.live)
+        self.live_action.setEnabled(pane.camera is not None)
+        if pane.view.image is not None:
+            h, w = pane.view.image.shape[:2]
+            self.size_label.setText(f"{w} x {h}")
+        else:
+            self.size_label.clear()
+        if not pane.live:
+            self.fps_label.clear()
 
-    def capture(self):
-        self.worker.capture(
-            self.average_combo.currentData(),
-            self.size_combo.currentData(),
-            self.format_combo.currentData(),
-            Path(self.folder_edit.text()),
-            clean_name(self.name_edit.text()),
-        )
+    def _update_titles(self):
+        for pane in self.panes:
+            self._update_source(pane)
 
     def _update_next_name(self):
         path = next_capture_path(Path(self.folder_edit.text()), self.name_edit.text(),
@@ -1116,105 +1438,123 @@ class MainWindow(QMainWindow):
         folder.mkdir(parents=True, exist_ok=True)
         os.startfile(folder)
 
-    def open_image(self):
+    def open_image(self, pane: Pane | None = None):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open image or video", self.folder_edit.text(),
             "Images and videos (*.tif *.tiff *.png *.jpg *.jpeg *.bmp *.mp4 *.avi);;All files (*)",
         )
         if path:
-            self.open_image_path(path)
+            self.open_image_path(path, pane)
 
-    def open_image_path(self, path: str):
-        """Show an image file in the view (freezes the live feed). Videos play."""
+    def open_image_path(self, path: str, pane: Pane | None = None):
+        """Show an image file in the active view (or pane); its camera keeps
+        running for when it goes live again. Videos play."""
+        pane = pane if pane in self.panes else self.active
         if is_video(path):
-            self.open_video_path(path)
+            self.open_video_path(path, pane)
             return
         img = load_image_file(path)
         if img is None:
             QMessageBox.warning(self, "CamControl", f"Could not read {path}")
             return
-        self._ask_clear_annotations("Open image")
-        self._set_live(False)  # stop the camera feed replacing it
-        self._close_video()
-        self.view.set_image(img)
-        h, w = img.shape[:2]
-        self.size_label.setText(f"{w} x {h}")
-        self._source = Path(path).name
-        self._result = None
-        self._set_title(self._source)
-        self._show_source(path)
-        self._measure_opened_image()
+        self._ask_clear_annotations(pane, "Open image")
+        if self._video_pane is pane:
+            self._close_video()
+        self._show_image(pane, img, path=path)
 
-    def open_video_path(self, path: str):
-        """Open a video under the player bar, paused on its first frame."""
-        self._ask_clear_annotations("Open video")
-        self._set_live(False)
+    def _show_image(self, pane: Pane, image, path: str | None = None, title: str = "", result: dict | None = None):
+        """Show an image in pane, frozen: a file (path) or a processing result."""
+        self._set_live(pane, False)
+        pane.view.set_image(image)
+        pane.path, pane.result = path, result
+        pane.title = title or (Path(path).name if path else "")
+        self._update_source(pane)
+        self._measure_opened_image(pane)
+
+    def open_video_path(self, path: str, pane: Pane | None = None):
+        """Open a video in the active view (or pane), with the player bar under the views."""
+        pane = pane if pane in self.panes else self.active
+        self._ask_clear_annotations(pane, "Open video")
+        self._set_live(pane, False)
+        self._close_video()  # one video plays at a time
+        self._video_pane = pane
         if not self.player.open(path):  # shows the first frame via _on_video_frame
             self._close_video()
             QMessageBox.warning(self, "CamControl", f"Could not play {path}")
             return
         self.player.show()
-        self._source = Path(path).name
-        self._result = None
-        self._set_title(self._source)
-        self._show_source(path)
+        pane.path, pane.title, pane.result = path, Path(path).name, None
+        self._update_source(pane)
         self.player.play()
 
     def _on_video_frame(self, frame):
-        self.view.set_image(frame)
-        h, w = frame.shape[:2]
-        self.size_label.setText(f"{w} x {h}")
+        pane = self._video_pane
+        if pane is None or pane not in self.panes:
+            return
+        pane.view.set_image(frame)
+        if pane is self.active:
+            h, w = frame.shape[:2]
+            self.size_label.setText(f"{w} x {h}")
 
     def _close_video(self):
         self.player.close_video()
         self.player.hide()
+        self._video_pane = None
 
-    # --- which image the panels work on --------------------------------------------
+    def _close_video_and_resume(self):
+        """The player's close button: back to the camera, if the view has one."""
+        pane = self._video_pane
+        self._close_video()
+        if pane is not None and pane.camera is not None:
+            self._set_live(pane, True)
 
-    def _active_view(self) -> ImageView:
-        return self.panes[self.active].view
+    # --- which view the panels work on --------------------------------------------
 
     def _active_source(self) -> str:
-        """Name of the active image, for exports."""
-        path = self.panes[self.active].path
-        return Path(path).name if path else self._source
+        """Name of what the active view shows, for exports."""
+        pane = self.active
+        return Path(pane.path).name if pane.path else self._source_text(pane)[0]
 
-    def set_active(self, index: int):
-        """Make the panels show (and work on) image index (0 = the main view)."""
-        if index == self.active or index >= len(self.panes) or (index > 0 and not self.compare.comparing):
+    def set_active(self, pane: Pane | None):
+        """Make the panels show (and work on) this view."""
+        if pane is None or pane is self.active or pane not in self.panes:
             return
-        old = self.panes[self.active]
-        old.next_id = self.measure_panel.next_id
-        old.fiber_axes = self.fiber_panel.axes
-        old.view.set_selected(None)
-        old.view.set_fiber_axes(old.fiber_axes)
-        self.active = index
-        new = self.panes[index]
-        self.measure_panel.set_state(new.measurements, new.next_id)
-        self.count_panel.set_counter(new.counter)
-        self.fiber_panel.set_axes(new.fiber_axes)
-        self.compare.set_active(new.view)
-        which = f"image {index + 1}" if index else "the main image"
-        self.statusBar().showMessage(f"Working on {which}: {self._active_source()}", 4000)
+        old = self.active
+        if old is not None:
+            old.next_id = self.measure_panel.next_id
+            old.fiber_axes = self.fiber_panel.axes
+            old.view.set_selected(None)
+            old.view.set_fiber_axes(old.fiber_axes)
+        self.active = pane
+        self.measure_panel.set_state(pane.measurements, pane.next_id)
+        self.count_panel.set_counter(pane.counter)
+        self.fiber_panel.set_axes(pane.fiber_axes)
+        self.views.set_active(pane.view)
+        self.zoom_label.setText(f"{pane.view.zoom * 100:.0f}%")
+        self._choose_controlled()
+        self._update_source(pane)
+        self._update_capture_enabled()
+        if old is not None and len(self.panes) > 1:
+            self.statusBar().showMessage(f"Working on view {self._number(pane)}: {self._source_text(pane)[0]}", 4000)
 
-    def _ask_clear_annotations(self, title: str):
+    def _ask_clear_annotations(self, pane: Pane, title: str):
         """Measurements and counts belong to the image they were made on."""
-        self.set_active(0)  # the main image is the one changing
+        self.set_active(pane)  # the view whose image is changing
         if not (self.measure_panel.measurements or self.count_panel.counter.marks):
             return
         if QMessageBox.question(
-            self, title, "Clear the current measurements and counts? They were made on a different image."
+            self, title, "Clear this view's measurements and counts? They were made on a different image."
         ) == QMessageBox.StandardButton.Yes:
             self.measure_panel.clear(confirm=False)
             self.count_panel.clear(confirm=False)
 
     def save_image(self):
-        """Save the active image: a processing result, a frozen frame or a copy of a file."""
-        image = self._active_view().image
+        """Save the active view's image: a processing result, a frozen frame or a copy of a file."""
+        pane = self.active
+        image = pane.view.image
         if image is None:
             return
-        on_compare = self.active != 0
-        stem = self._result["short_name"] if self._result and not on_compare else "image"
+        stem = pane.result["short_name"] if pane.result else "image"
         default = next_capture_path(Path(self.folder_edit.text()), stem, "tif")
         path, _ = QFileDialog.getSaveFileName(
             self, "Save image", str(default), "TIFF (*.tif);;PNG (*.png);;JPEG (*.jpg)")
@@ -1225,13 +1565,11 @@ class MainWindow(QMainWindow):
             path = path.with_suffix(".tif")
         meta = {"timestamp": datetime.now().isoformat(timespec="seconds"),
                 "saved_size": [image.shape[1], image.shape[0]]}
-        if on_right:
-            meta["source"] = self._active_source()
-        elif self._result:
-            meta.update(self._result["meta"])
+        if pane.result:
+            meta.update(pane.result["meta"])
         else:
-            meta["source"] = self._source
-            if self.player.is_open:
+            meta["source"] = self._active_source()
+            if self._video_pane is pane and self.player.is_open:
                 self.player.pause()
                 meta["video_frame"] = self.player.position + 1
         try:
@@ -1242,29 +1580,21 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Save image", f"Save failed: {e}")
             return
         self.statusBar().showMessage(f"Saved {path}", 5000)
-        if self._result and not on_right:  # it's a file now
-            self._result = None
-            self._source = path.name
-            self._set_title(self._source)
-            self._show_source(str(path))
+        if pane.result:  # it's a file now
+            pane.result, pane.path, pane.title = None, str(path), path.name
+            self._update_source(pane)
         self.gallery.refresh(select=str(path))
 
     # --- processing -----------------------------------------------------------------
 
     def show_result(self, image, title: str, short_name: str, meta: dict):
-        """Show a processing result in the view, frozen and unsaved."""
-        self._ask_clear_annotations(title)
-        self._set_live(False)
-        self._close_video()
-        self.view.set_image(image)
-        h, w = image.shape[:2]
-        self.size_label.setText(f"{w} x {h}")
-        self._source = title
-        self._result = {"short_name": short_name, "meta": meta}
-        self._set_title(f"{title} (unsaved)")
-        self._show_source()
+        """Show a processing result in the active view, frozen and unsaved."""
+        pane = self.active
+        self._ask_clear_annotations(pane, title)
+        if self._video_pane is pane:
+            self._close_video()
+        self._show_image(pane, image, title=title, result={"short_name": short_name, "meta": meta})
         self.statusBar().showMessage(f"{title} done. File > Save image as (Ctrl+S) to keep it.", 8000)
-        self._measure_opened_image()
 
     def run_process(self, key: str, paths: list | None = None):
         """Open a processing dialog, then run it in the background.
@@ -1314,6 +1644,9 @@ class MainWindow(QMainWindow):
 
     # --- flat-field -----------------------------------------------------------------
 
+    def _links(self) -> list[CameraLink]:
+        return [p.camera for p in self.panes if p.camera is not None]
+
     def _use_flat(self, path: str, quiet: bool = False) -> bool:
         img = load_image_file(path)
         if img is None:
@@ -1323,7 +1656,9 @@ class MainWindow(QMainWindow):
         self.flat = FlatField(img, Path(path).name)
         self._flat_path = str(path)
         if self.flat_live_action.isChecked():
-            self.worker.set_flat_field(self.flat)  # swap in the new reference
+            for link in self._links():  # swap in the new reference
+                if link.worker is not None:
+                    link.worker.set_flat_field(self.flat)
         self._update_flat_actions()
         return True
 
@@ -1337,11 +1672,11 @@ class MainWindow(QMainWindow):
             self.flat_live_action.setChecked(False)
 
     def set_flat_from_view(self):
-        """Save the image in the view as the flat reference and use it."""
-        image = self.view.image
+        """Save the active view's image as the flat reference and use it."""
+        image = self.active.view.image
         if image is None:
             return
-        if self.live and self.flat_live_action.isChecked():
+        if self.active.live and self.flat_live_action.isChecked():
             QMessageBox.information(
                 self, "Flat-field",
                 "The live view is already corrected. Turn off \"Correct live view and captures\" first, "
@@ -1368,21 +1703,24 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Flat reference: {Path(path).name}", 5000)
 
     def _set_flat_live(self, on: bool):
+        """Correct every camera's frames (one reference for all)."""
         on = on and self.flat is not None
         self.flat_live_action.setChecked(on)
-        if hasattr(self, "worker"):  # at startup, __init__ sends it once the worker exists
-            self.worker.set_flat_field(self.flat if on else None)
+        for link in self._links():
+            if link.worker is not None:
+                link.worker.set_flat_field(self.flat if on else None)
 
     def apply_flat_to_view(self):
-        image = self.view.image
+        pane = self.active
+        image = pane.view.image
         if image is None or self.flat is None:
             return
-        if self.live:
+        if pane.live:
             QMessageBox.information(self, "Flat-field",
                                     "This corrects a frozen or opened image. For the live view, "
                                     "turn on \"Correct live view and captures\".")
             return
-        name = self._source
+        name = self._active_source()
         self.show_result(self.flat.apply(image), f"{name} (flat-field corrected)", "flat",
                          {"processing": "Flat-field correction", "inputs": [name],
                           "flat_field": self.flat.name})
@@ -1397,7 +1735,7 @@ class MainWindow(QMainWindow):
     def export_measurements(self):
         """Save the table (Excel or CSV) plus the image and an annotated copy."""
         panel = self.measure_panel
-        if not panel.measurements or self._active_view().image is None:
+        if not panel.measurements or self.active.view.image is None:
             QMessageBox.information(self, "Export", "There are no measurements to export.")
             return
         default = Path(self.folder_edit.text()) / f"measurements_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1411,7 +1749,7 @@ class MainWindow(QMainWindow):
         path.parent.mkdir(parents=True, exist_ok=True)
 
         cal = panel.calibration
-        image = self._active_view().image
+        image = self.active.view.image
         source = self._active_source()
         try:
             export_table(measurement_rows(panel.measurements, cal, source), path, cal, source)
@@ -1430,7 +1768,7 @@ class MainWindow(QMainWindow):
     def export_counts(self):
         """Save the counts (Excel or CSV) plus the image and a copy with the marks."""
         counter = self.count_panel.counter
-        if not counter.marks or self._active_view().image is None:
+        if not counter.marks or self.active.view.image is None:
             QMessageBox.information(self, "Export counts", "There are no counts to export.")
             return
         default = Path(self.folder_edit.text()) / f"counts_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1442,7 +1780,7 @@ class MainWindow(QMainWindow):
         if path.suffix.lower() not in (".xlsx", ".csv"):
             path = path.with_suffix(".xlsx")
         path.parent.mkdir(parents=True, exist_ok=True)
-        image = self._active_view().image
+        image = self.active.view.image
         try:
             counter.export(path, self._active_source())
             image_path = path.with_name(f"{path.stem}_image.png")
@@ -1455,14 +1793,91 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"Exported {len(counter.marks)} marks to {path.name}, {image_path.name} and {marked_path.name}", 8000)
 
-    def _fiber_analysis(self, index: int):
-        """A function measuring the fiber axes of an image with pane index's circles
+    # --- fiber axes -----------------------------------------------------------------
+
+    def _request_fibers(self, pane: Pane, image, kind: str):
+        """Measure the fiber axes of pane's image in the background, with the
+        panel's settings as they are now. kind: "live" (a camera frame;
+        skipped while another measuring runs), "image" (an image opened, or the
+        settings changed) or "find" (Find axes: say how many were found).
+        One runs at a time; a request made meanwhile waits, replacing any other
+        waiting one for the same view, so the newest image and settings win."""
+        request = (pane, image, kind, pane.live, self._fiber_generation, self._fiber_analysis(pane))
+        if self._fiber_job is not None:
+            if kind != "live":
+                self._fiber_waiting[pane] = request
+            return
+        analyse = request[-1]
+        job = Job(lambda: analyse(image), self)
+        job.succeeded.connect(lambda axes: self._fibers_done(request, axes))
+        job.failed.connect(lambda msg: self.statusBar().showMessage(f"Fiber axes: {msg}", 6000))
+        job.finished.connect(self._fibers_finished)
+        self._fiber_job = job
+        job.start(QThread.Priority.LowPriority)  # the video and the window come first
+
+    def _fibers_done(self, request, axes):
+        pane, image, kind, from_camera, generation, _ = request
+        if generation != self._fiber_generation or pane not in self.panes:
+            return  # measured with old settings (the new ones are being measured), or the view is gone
+        # Only if the image measured is still the one shown: for a camera frame, while
+        # the camera still shows (and, live updates, while they're on).
+        if from_camera:
+            if not pane.live or (kind == "live" and not self.fiber_panel.live_check.isChecked()):
+                return
+        elif pane.view.image is not image or pane.live:
+            return
+        self._show_fiber_axes(pane, axes)
+        if kind == "find":
+            if axes:
+                unclear = sum(not f.clear for f in axes)
+                note = f" ({unclear} unclear)" if unclear else ""
+                self.statusBar().showMessage(f"Found {len(axes)} fiber{'s' if len(axes) != 1 else ''}{note}.", 6000)
+            else:
+                self.statusBar().showMessage(
+                    "No fibers found. Draw a Circle (3 pt or centre) round the fiber in Measurements, then Find axes.", 10000)
+
+    def _fibers_finished(self):
+        self._fiber_job.deleteLater()
+        self._fiber_job = None
+        if self._fiber_waiting:
+            pane = next(iter(self._fiber_waiting))
+            _, image, kind = self._fiber_waiting.pop(pane)[:3]
+            if pane in self.panes:
+                self._request_fibers(pane, image, kind)  # with the settings as they are now
+
+    def _fiber_settings_changed(self):
+        """Method or detection settings changed: re-measure what's shown (where it was measured)."""
+        self._fiber_generation += 1
+        live_updates = self.fiber_panel.live_check.isChecked()
+        for pane in self.panes:
+            has_axes = self.fiber_panel.axes if pane is self.active else pane.fiber_axes
+            image = pane.view.image
+            if pane.live:
+                if live_updates:
+                    pane.fiber_last = 0.0  # its next frame
+                elif has_axes and image is not None:
+                    self._request_fibers(pane, image.copy(), "image")
+            elif (has_axes or live_updates) and image is not None:
+                self._request_fibers(pane, image, "image")
+
+    def _measure_opened_image(self, pane: Pane):
+        """A new image (a file, a result) was opened in pane: clear the old axes,
+        and with Update live on measure it, in the background, so clicking
+        through images keeps the axes up to date."""
+        if pane.live or pane.view.image is None:
+            return
+        self._show_fiber_axes(pane, [])  # the old image's axes don't belong to this one
+        if self.fiber_panel.live_check.isChecked():
+            self._request_fibers(pane, pane.view.image, "image")
+
+    def _fiber_analysis(self, pane: Pane):
+        """A function measuring the fiber axes of an image with pane's circles
         and the panel's settings as they are now. Safe to call from another thread."""
         circles = None
         if self.fiber_panel.use_circles.isChecked():
             # Fibers marked with Circle measurements (in pixels, whatever the calibration).
             circles = []
-            for m in self.panes[index].measurements:
+            for m in pane.measurements:
                 if m.kind in CIRCLE_KINDS:
                     r = compute(m)
                     circles.append((*r["center_px"], r["radius"]))
@@ -1473,24 +1888,25 @@ class MainWindow(QMainWindow):
         return lambda image: analyse_fibers(image, circles or None, method=method, parts_centre=parts_centre,
                                             detection=detection, centre_only=centre_only)
 
-    def _show_fiber_axes(self, index: int, axes: list):
-        if index == self.active:
+    def _show_fiber_axes(self, pane: Pane, axes: list):
+        if pane is self.active:
             self.fiber_panel.set_axes(axes)
-        else:  # e.g. live updates of the left image while the right one is active
-            pane = self.panes[index]
+        else:  # e.g. live updates of one view while another is active
             pane.fiber_axes = axes
             pane.view.set_fiber_axes(axes)
 
-    def find_fiber_axes(self, quiet: bool = False, pane_index: int | None = None):
-        """Measure the fiber axes in the active image (or the given pane's)."""
-        index = self.active if pane_index is None else pane_index
-        image = self.panes[index].view.image
-        if image is None:
-            return
-        if index == 0 and self.live:
-            image = image.copy()  # the camera worker may reuse the frame's buffer
-        self._request_fibers(index, image, "image" if quiet else "find")  # in the background
-        if not quiet:
+    def find_fiber_axes(self, quiet: bool = False):
+        """Measure the fiber axes in the active view (every view with Link views on)."""
+        found_any = False
+        for pane in self._targets():
+            image = pane.view.image
+            if image is None:
+                continue
+            if pane.live:
+                image = image.copy()  # the camera worker may reuse the frame's buffer
+            self._request_fibers(pane, image, "find" if pane is self.active and not quiet else "image")
+            found_any = True
+        if found_any and not quiet:
             self.statusBar().showMessage("Finding fiber axes...")
             if self.fiber_dock.isHidden():  # show the results (minimizing the others on its edge)
                 self.fiber_dock.toggleViewAction().trigger()
@@ -1498,7 +1914,7 @@ class MainWindow(QMainWindow):
     def export_fiber_axes(self):
         """Save the fiber table (Excel or CSV) plus the image and a copy with the axes drawn."""
         panel = self.fiber_panel
-        if not panel.axes or self._active_view().image is None:
+        if not panel.axes or self.active.view.image is None:
             QMessageBox.information(self, "Export fiber axes", "There are no fiber axes to export. Click Find axes first.")
             return
         default = Path(self.folder_edit.text()) / f"fiber_axes_{time.strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -1510,7 +1926,7 @@ class MainWindow(QMainWindow):
         if path.suffix.lower() not in (".xlsx", ".csv"):
             path = path.with_suffix(".xlsx")
         path.parent.mkdir(parents=True, exist_ok=True)
-        image = self._active_view().image
+        image = self.active.view.image
         try:
             table = pd.DataFrame(panel.rows(self._active_source()))
             if path.suffix.lower() == ".xlsx":
@@ -1564,11 +1980,19 @@ class MainWindow(QMainWindow):
             "recording": self.record_panel.state(),
             "view": {"grid": self.grid_action.isChecked(), "grid_style": self.grid_style.to_dict(),
                      "crosshair": self.crosshair_action.isChecked(), "crosshair_style": self.crosshair_style.to_dict()},
+            "views": {"layout": self.views.layout_name, "link": self.views.link_check.isChecked(),
+                      "views": self._view_specs()},
         }
-        # What the camera last reported, or what's waiting to be applied.
-        camera = self._camera_values or self._pending_camera
-        if camera:
-            data["camera"] = {n: v for n, v in camera.items() if n in self.sliders}
+        # Each camera's control values (what it last reported, or what's waiting for it).
+        cameras = dict(self._camera_values)
+        for link in self._links():
+            if link.key and link.values:
+                cameras[camera_label(link.key)] = {n: v for n, v in link.values.items() if n in self.sliders}
+        if cameras:
+            data["cameras"] = cameras
+        link = self._link()  # also as "camera", as files from before views had it
+        if link is not None and link.key and camera_label(link.key) in cameras:
+            data["camera"] = cameras[camera_label(link.key)]
         return data
 
     def _recent_settings(self) -> list[str]:
@@ -1581,7 +2005,7 @@ class MainWindow(QMainWindow):
         self.settings_path = str(path)
         self.settings.setValue("settings_files/recent",
                                settings_file.add_recent(self._recent_settings(), path))
-        self._set_title(None if self._source == "live" else self._source)
+        self._update_source(self.active)
 
     def _fill_recent_menu(self):
         menu = self.recent_menu
@@ -1648,13 +2072,33 @@ class MainWindow(QMainWindow):
     def apply_settings(self, data: dict) -> list[str]:
         """Apply a settings file's contents. Returns notes about anything that couldn't be applied."""
         problems = []
-        camera = data.get("camera")
-        if camera:
-            if self.camera_open:
-                self._apply_camera_values(camera)
+        views = data.get("views")
+        if isinstance(views, dict):
+            if isinstance(views.get("views"), list) and views["views"]:
+                self._restore_views(views["views"])
+            if "link" in views:
+                self.views.set_linked(bool(views["link"]))
+            if views.get("layout") in LAYOUTS:
+                self._set_layout(views["layout"], add=False)
+
+        # Camera values: per camera name, or (files from before views) one set for the controlled camera.
+        cameras = data.get("cameras")
+        if not isinstance(cameras, dict):
+            link = self._link()
+            cameras = {camera_label(link.key): data["camera"]} if data.get("camera") and link is not None \
+                and link.key else {}
+        waiting = False
+        for label, values in cameras.items():
+            if not isinstance(values, dict):
+                continue
+            link = next((lk for lk in self._links() if lk.key and camera_label(lk.key) == label), None)
+            if link is not None and link.open:
+                self._apply_camera_values(link, values)
             else:
-                self._pending_camera = camera  # applied when the camera opens
-                problems.append("Camera settings will be applied when the camera opens.")
+                self._camera_values[label] = values  # applied when that camera opens
+                waiting = waiting or link is not None
+        if waiting:
+            problems.append("Camera settings will be applied when the camera opens.")
 
         cap = data.get("capture", {})
         scale = cap.get("save_scale")
@@ -1700,11 +2144,14 @@ class MainWindow(QMainWindow):
         self._apply_overlays()
         return problems
 
-    def _apply_camera_values(self, values: dict):
+    def _apply_camera_values(self, link: CameraLink, values: dict):
         for name, value in values.items():
-            slider = self.sliders.get(name)
-            if slider is not None and slider.isEnabled():
-                slider.setValue(int(value))  # sends it to the camera via _on_slider
+            if name not in self.sliders or link.ranges.get(name) is None:
+                continue
+            if link is self._link():
+                self.sliders[name].setValue(int(value))  # sends it to the camera via _on_slider
+            elif link.worker is not None:
+                link.worker.set_control(name, int(value))
 
     # --- grid and crosshair ---------------------------------------------------------------
 
@@ -1726,7 +2173,7 @@ class MainWindow(QMainWindow):
         self._apply_overlays()
 
     def _apply_overlays(self):
-        """Grid and crosshair, as the View menu and the settings say, on every image shown."""
+        """Grid and crosshair, as the View menu and the settings say, on every view."""
         for pane in self.panes:
             pane.view.set_overlays(self.grid_action.isChecked(), self.grid_style,
                                    self.crosshair_action.isChecked(), self.crosshair_style)
@@ -1734,96 +2181,21 @@ class MainWindow(QMainWindow):
         if dialog is not None and dialog.styles() != (self.grid_style, self.crosshair_style):
             dialog.set_styles(self.grid_style, self.crosshair_style)  # e.g. a settings file was opened
 
-    # --- compare -------------------------------------------------------------------------
-
-    def _show_compare(self, on: bool):
-        if not on:
-            self.set_active(0)
-        self.compare_action.setChecked(on)
-        self.compare.set_comparing(on)
-        self.compare.set_active(self._active_view())
-
-    def compare_paths(self, paths: list[str]):
-        """Add images to the compare grid (and show it)."""
-        failed, skipped = [], 0
-        for path in paths:
-            if self.compare.is_full():
-                skipped += 1
-                continue
-            img = load_image_file(path)
-            if img is None:
-                failed.append(Path(path).name)
-                continue
-            view = ImageView()
-            view.set_image(img)
-            pane = Pane(view, [], Counter(names=self.count_panel.counter.names), path=path)
-            self.panes.append(pane)
-            self._connect_pane(pane)
-            self.compare.add_view(view, Path(path).name, path)
-        self._show_compare(True)
-        if failed:
-            QMessageBox.warning(self, "Compare", "Could not read " + ", ".join(failed))
-        if skipped:
-            self.statusBar().showMessage(
-                f"The grid is full: {skipped} image{'s' if skipped != 1 else ''} not added. Remove some first.", 8000)
-
-    def compare_path(self, path: str):
-        self.compare_paths([path])
-
-    def open_compare(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "Add images to compare", self.folder_edit.text(), FILE_FILTER)
-        if paths:
-            self.compare_paths(paths)
-
-    def remove_compare(self, view: ImageView):
-        """Take an image out of the grid, with its measurements, marks and fiber axes."""
-        index = next(i for i, p in enumerate(self.panes) if p.view is view)
-        if index == 0:
-            return  # the main view stays
-        if index == self.active:
-            self.set_active(0)
-        elif index < self.active:
-            self.active -= 1
-        del self.panes[index]
-        self.compare.remove_view(view)
-        self.compare.set_active(self._active_view())
-
-    def remove_all_compare(self):
-        for pane in self.panes[1:]:
-            self.remove_compare(pane.view)
-
-    def save_compare(self):
-        panes = [p for p in self.panes if p.view.image is not None]
-        if len(panes) < 2:
-            QMessageBox.information(self, "Compare", "Add an image to compare first.")
-            return
-        names = [Path(p.path).name if p.path else self._source for p in panes]
-        default = next_capture_path(Path(self.folder_edit.text()), "compare", "png")
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save grid", str(default), "PNG (*.png);;TIFF (*.tif);;JPEG (*.jpg)")
-        if not path:
-            return
-        path = Path(path)
-        if path.suffix.lower() not in (".tif", ".tiff", ".png", ".jpg", ".jpeg"):
-            path = path.with_suffix(".png")
-        try:
-            save_image_file(path, grid_image([p.view.image for p in panes], names))
-        except Exception as e:
-            QMessageBox.warning(self, "Compare", f"Save failed: {e}")
-            return
-        self.statusBar().showMessage(f"Saved {path}", 5000)
-
     # --- video and time-lapse -----------------------------------------------------------
 
     def _request_recording(self, start: bool):
+        link = self._link()
+        if link is None or link.worker is None:
+            return
         if start:
-            self.worker.start_recording(Path(self.folder_edit.text()), clean_name(self.name_edit.text()),
+            link.worker.start_recording(Path(self.folder_edit.text()), clean_name(self.name_edit.text()),
                                         **self.record_panel.video_settings())
         else:
-            self.worker.stop_recording()
+            link.worker.stop_recording()
 
-    def _on_recording_changed(self, on: bool, path: str):
-        self.record_panel.set_recording(on, path)
+    def _on_recording_changed(self, link: CameraLink, on: bool, path: str):
+        if link is self._link():
+            self.record_panel.set_recording(on, path)
         if on:
             self.statusBar().showMessage(f"Recording to {Path(path).name}...")
         elif path:
@@ -1831,8 +2203,11 @@ class MainWindow(QMainWindow):
             self._update_next_name()
 
     def _request_timelapse(self, start: bool):
+        link = self._link()
+        if link is None or link.worker is None:
+            return
         if not start:
-            self.worker.stop_timelapse()
+            link.worker.stop_timelapse()
             return
         opts = {
             "n_frames": self.average_combo.currentData(),
@@ -1841,31 +2216,35 @@ class MainWindow(QMainWindow):
             "folder": Path(self.folder_edit.text()),
             "name": clean_name(self.name_edit.text()),
         }
-        self.worker.start_timelapse(self.record_panel.make_timelapse(), opts)
+        link.timelapse = True
+        link.worker.start_timelapse(self.record_panel.make_timelapse(), opts)
         self.record_panel.set_timelapse_running(True)
 
-    def _on_timelapse_progress(self, taken: int, total: int, next_due: float, path: str):
-        self.record_panel.set_timelapse_progress(taken, total, next_due)
+    def _on_timelapse_progress(self, link: CameraLink, taken: int, total: int, next_due: float, path: str):
+        if link is self._link():
+            self.record_panel.set_timelapse_progress(taken, total, next_due)
         self.last_saved_label.setText(f"Saved {Path(path).name} (time-lapse)")
         self._update_next_name()
 
-    def _on_timelapse_finished(self, message: str):
-        self.record_panel.set_timelapse_message(message)
+    def _on_timelapse_finished(self, link: CameraLink, message: str):
+        if link is self._link():
+            self.record_panel.set_timelapse_message(message)
         self.statusBar().showMessage(message, 10000)
         self._update_next_name()
 
     def closeEvent(self, event):
-        busy = self._busy_recording()
+        busy = [f"on {camera_label(lk.key)}, {' and '.join(self._busy(lk))}" for lk in self._links() if self._busy(lk)]
         if busy and QMessageBox.question(
-            self, "Quit", f"{' and '.join(busy).capitalize()}. Stop and quit?"
+            self, "Quit", f"{'; '.join(busy).capitalize()}. Stop and quit?"
         ) != QMessageBox.StandardButton.Yes:
             event.ignore()
             return
         if self._job is not None:
             self._job.wait()  # let a running processing job finish first
-        self._fiber_next = None
+        self._fiber_waiting.clear()
         if self._fiber_job is not None:
             self._fiber_job.wait()
         self._save_settings()
-        self.worker.stop()
+        for link in self._links():
+            link.stop()
         super().closeEvent(event)
