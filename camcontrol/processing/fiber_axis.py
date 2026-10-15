@@ -56,8 +56,10 @@ Run directly to test on an image (default: "Fiber Types.png"):
     python -m camcontrol.processing.fiber_axis [image]
 """
 
+import functools
 import math
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -167,8 +169,11 @@ def find_fibers(image: np.ndarray, max_fibers: int = 10) -> list[tuple[float, fl
     """
     gray = cv2.cvtColor(as_bgr(image), cv2.COLOR_BGR2GRAY)
     found = []
-    for c in find_touching_fibers(image, max_fibers) + _find_round_regions(image):
-        fitted = fit_cladding_edge(gray, *c)
+    touching = find_touching_fibers(image, max_fibers)
+    for i, c in enumerate(touching + _find_round_regions(image)):
+        if any(math.hypot(c[0] - k[0], c[1] - k[1]) < 0.5 * max(k[2], c[2]) for k in found):
+            continue  # the same fiber again: no need to fit it
+        fitted = c if i == 0 and touching else fit_cladding_edge(gray, *c)  # touching's first is fitted already
         if fitted is not None and abs(fitted[2] - c[2]) < 0.2 * c[2] and math.hypot(fitted[0] - c[0], fitted[1] - c[1]) < 0.2 * c[2]:
             c = fitted
         if all(math.hypot(c[0] - k[0], c[1] - k[1]) > 0.8 * max(k[2], c[2]) for k in found):
@@ -241,7 +246,7 @@ def fit_cladding_edge(gray: np.ndarray, cx: float, cy: float, radius: float,
     """
     smooth = cv2.GaussianBlur(gray, (0, 0), max(1.5, radius / 150)).astype(np.float32)
     h, w = gray.shape
-    background = float(np.percentile(smooth, 5))
+    background = float(np.percentile(smooth[::4, ::4], 5))  # every 16th pixel is plenty
     a = np.linspace(0, 2 * np.pi, rays, endpoint=False)
     every = np.arange(rays)
     for _ in range(4):
@@ -261,10 +266,9 @@ def fit_cladding_edge(gray: np.ndarray, cx: float, cy: float, radius: float,
         usable = falls.any(axis=1) & (level - background > 0.25 * (np.median(level) - background))
         last = falls.shape[1] - 1 - np.argmax(falls[:, ::-1], axis=1)
         window = int(max(3, 0.06 * radius))
-        k = last.copy()
-        for i in np.nonzero(usable)[0]:
-            lo, hi = max(0, last[i] - window), min(len(t), last[i] + window + 1)
-            k[i] = lo + int(np.argmin(slope[i, lo:hi]))
+        near = last[:, None] + np.arange(-window, window + 1)  # each ray's window round its fall
+        steep = np.where((near >= 0) & (near < len(t)), slope[every[:, None], np.clip(near, 0, len(t) - 1)], np.inf)
+        k = near[every, np.argmin(steep, axis=1)]
         px, py = xs[every, k][usable].astype(np.float64), ys[every, k][usable].astype(np.float64)
         if len(px) < 20:
             return None
@@ -412,7 +416,9 @@ def _sample(g: np.ndarray, xs: np.ndarray, ys: np.ndarray, width: int = 4096) ->
     takes maps narrower than 32767 px."""
     fx, fy = xs.reshape(-1).astype(np.float32), ys.reshape(-1).astype(np.float32)
     n = len(fx)
-    rows = max(1, -(-n // width))
+    if n <= width:
+        return cv2.remap(g, fx[None], fy[None], cv2.INTER_LINEAR).reshape(xs.shape)
+    rows = -(-n // width)
     pad = rows * width - n
     out = cv2.remap(g, np.pad(fx, (0, pad)).reshape(rows, width), np.pad(fy, (0, pad)).reshape(rows, width),
                     cv2.INTER_LINEAR)
@@ -483,23 +489,9 @@ def _coarse_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, half: int, n: int 
     radius) at the search scale, and the quality (the best pair's score over
     a typical pair's about the centre)."""
     size = SYMMETRY_SIZE
-    sizes = np.arange(ROD_SIZES[0], ROD_SIZES[1], 0.015) * size
-    maps = _ring_maps(gx, gy, cap, sizes, 64)
-    # Rod pairs about the cladding centre (rows), moved by each core offset (columns).
-    angles, spacings, radii = (v.ravel() for v in np.meshgrid(
-        np.radians(np.arange(0, 180, 2.0)), np.arange(ROD_SPACINGS[0], ROD_SPACINGS[1], 0.02) * size,
-        np.arange(len(sizes)), indexing="ij"))
-    keep = spacings - sizes[radii] > 0.05 * size  # apart
-    angles, spacings, radii = angles[keep], spacings[keep], radii[keep]
-    ox, oy = (v.ravel() * size for v in np.meshgrid(CORE_OFFSETS, CORE_OFFSETS))
-    inside = spacings[:, None] + sizes[radii][:, None] + np.hypot(ox, oy) < ROD_MAX_REACH * size
-    dx, dy = spacings * np.cos(angles), -spacings * np.sin(angles)  # screen y points down
-
-    def lookup(x, y):  # maps are every 2nd pixel
-        return maps[radii[:, None], np.round(y / 2).astype(int), np.round(x / 2).astype(int)]
-    mx, my = half + ox[None], half + oy[None]
-    score = np.where(inside, np.minimum(lookup(mx + dx[:, None], my + dy[:, None]),
-                                        lookup(mx - dx[:, None], my - dy[:, None])), 0)
+    angles, spacings, radii, sizes, ox, oy, inside, first, second, box = _pair_grid(half)
+    maps = _ring_maps(gx, gy, cap, sizes, 64, box).ravel()
+    score = np.where(inside, np.minimum(maps[first], maps[second]), 0)
     centred = int(np.argmin(np.hypot(ox, oy)))
     quality = float(score.max() / max(np.median(score[inside[:, centred], centred]), 1e-6))
     starts = []
@@ -517,37 +509,77 @@ def _coarse_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, half: int, n: int 
     return [np.array([half + ox[o], half + oy[o], angles[i], spacings[i], sizes[radii[i]]], float) for i, o in starts], quality
 
 
-def _refine_pair(gx: np.ndarray, gy: np.ndarray, cap: float, p: np.ndarray) -> np.ndarray:
-    """Step 2 of find_rods: the pair p (as _coarse_pairs) moved to where its
-    two outlines follow the edges best, in ever finer steps."""
-    p = p.copy()
+_POOL = ThreadPoolExecutor(2, thread_name_prefix="fiber_axis")
+
+
+@functools.lru_cache(maxsize=4)
+def _pair_grid(half: int):
+    """The rod pairs _coarse_pairs tries, for a search map of this shape:
+    pairs about the centre (rows: angle, spacing, size index), moved by each
+    core offset (columns: ox, oy), whether each lies inside ROD_MAX_REACH,
+    each pair's two circle centres as indices into the flattened _ring_maps,
+    and the box (x0, y0, x1, y1) those maps cover: every centre possible."""
+    size = SYMMETRY_SIZE
+    sizes = np.arange(ROD_SIZES[0], ROD_SIZES[1], 0.015) * size
+    angles, spacings, radii = (v.ravel() for v in np.meshgrid(
+        np.radians(np.arange(0, 180, 2.0)), np.arange(ROD_SPACINGS[0], ROD_SPACINGS[1], 0.02) * size,
+        np.arange(len(sizes)), indexing="ij"))
+    keep = spacings - sizes[radii] > 0.05 * size  # apart
+    angles, spacings, radii = angles[keep], spacings[keep], radii[keep]
+    ox, oy = (v.ravel() * size for v in np.meshgrid(CORE_OFFSETS, CORE_OFFSETS))
+    inside = spacings[:, None] + sizes[radii][:, None] + np.hypot(ox, oy) < ROD_MAX_REACH * size
+    dx, dy = spacings * np.cos(angles), -spacings * np.sin(angles)  # screen y points down
+    reach = int(math.ceil(ROD_MAX_REACH * size - sizes[0])) + 1  # farthest a rod centre can be
+    lo, hi = half - reach, half + reach + 1
+    w = hi - lo
+
+    def index(x, y):
+        xi = np.clip(np.round(x).astype(np.int64) - lo, 0, w - 1)
+        yi = np.clip(np.round(y).astype(np.int64) - lo, 0, w - 1)
+        return (radii[:, None] * w + yi) * w + xi
+    mx, my = half + ox[None], half + oy[None]
+    return (angles, spacings, radii, sizes, ox, oy, inside,
+            index(mx + dx[:, None], my + dy[:, None]), index(mx - dx[:, None], my - dy[:, None]), (lo, lo, hi, hi))
+
+
+def _refine_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, pairs: np.ndarray) -> np.ndarray:
+    """Step 2 of find_rods: each pair (rows, as _coarse_pairs) moved to where
+    its two outlines follow the edges best, in ever finer steps. All pairs
+    at once, each on its own path."""
+    p = np.array(pairs, float)
+    n = len(p)
     steps = np.array([2.0, 2.0, math.radians(1.0), 2.0, 2.0])
     for _ in range(6):
+        moving = np.ones(n, bool)
         for _ in range(10):  # until nothing moves
             was = p.copy()
             for k in range(5):
-                tries = np.repeat(p[None], 5, axis=0)
-                tries[:, k] += np.arange(-2, 3) * steps[k]
-                p = tries[int(np.argmax(_pair_score(gx, gy, cap, *tries.T, 128, exact=True, both=np.add)))]
-            if np.array_equal(p, was):
+                tries = np.repeat(p[moving][:, None], 5, axis=1)  # (pairs, 5 tries, 5 values)
+                tries[..., k] += np.arange(-2, 3) * steps[k]
+                score = _pair_score(gx, gy, cap, *np.moveaxis(tries, -1, 0), 128, exact=True, both=np.add)
+                p[moving] = tries[np.arange(len(tries)), np.argmax(score, axis=1)]
+            moving &= ~np.all(p == was, axis=1)
+            if not moving.any():
                 break
         steps /= 2
     return p
 
 
-def _ring_maps(gx: np.ndarray, gy: np.ndarray, cap: float, radii, samples: int, step: int = 2) -> np.ndarray:
-    """_ring_score of circles of each radius centred on every step-th pixel
-    (nearest pixel samples), as an array (len(radii), h / step, w / step);
-    0 for circles off the map."""
-    h, w = gx.shape
+def _ring_maps(gx: np.ndarray, gy: np.ndarray, cap: float, radii, samples: int, box) -> np.ndarray:
+    """_ring_score of circles of each radius centred on every pixel of the
+    box (x0, y0, x1, y1) (nearest pixel samples), as an array (len(radii),
+    y1 - y0, x1 - x0); 0 for circles off the map."""
+    x0, y0, x1, y1 = box
     pad = int(math.ceil(max(radii))) + 1
-    maps = np.zeros((len(radii), -(-h // step), -(-w // step)), np.float32)
-    for a in np.linspace(0, 2 * np.pi, samples, endpoint=False):
+    maps = np.zeros((len(radii), y1 - y0, x1 - x0), np.float32)
+    for a in np.linspace(0, np.pi, samples // 2, endpoint=False):
+        # The gradient across the circle is the same at a and a + 180 degrees, up to sign.
         across = cv2.copyMakeBorder(np.minimum(np.abs(gx * math.cos(a) + gy * math.sin(a)), cap),
                                     pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
         for i, r in enumerate(radii):
-            sx, sy = pad + int(round(r * math.cos(a))), pad + int(round(r * math.sin(a)))
-            maps[i] += across[sy:sy + h:step, sx:sx + w:step]
+            for sign in (1, -1):
+                sx, sy = pad + x0 + int(round(sign * r * math.cos(a))), pad + y0 + int(round(sign * r * math.sin(a)))
+                maps[i] += across[sy:sy + y1 - y0, sx:sx + x1 - x0]
     return maps / samples
 
 
@@ -600,20 +632,23 @@ def _find_rods(grads, cx: float, cy: float):
     # from the ROD_STARTS best different pairs of step 1, with and without
     # dirt, keeping the result that best follows edges with and without dirt,
     # all round both rods (_edge_coverage).
-    results, tried = [], []
-    for search in ((clean_gx, clean_gy), (gx, gy)):
-        starts, quality = _coarse_pairs(*search, cap, half)
+    tried, qualities = [], []
+    # Both searches at once: numpy and OpenCV let go of the GIL while they work.
+    for starts, quality in _POOL.map(lambda g: _coarse_pairs(*g, cap, half), ((clean_gx, clean_gy), (gx, gy))):
         for p in starts:
-            if any(np.array_equal(p, t) for t in tried):
-                continue
-            tried.append(p)
-            p = _refine_pair(gx, gy, cap, p)
-            mx, my, angle, spacing, r = p
-            dx, dy = spacing * math.cos(angle), -spacing * math.sin(angle)
-            centres = [(mx + dx, my + dy), (mx - dx, my - dy)]
-            edges = (_pair_score(gx, gy, cap, *p, 256, exact=True) + _pair_score(clean_gx, clean_gy, cap, *p, 256, exact=True)) / 2
-            rank = float(edges) * min(_edge_coverage(gx, gy, x, y, r, typical) for x, y in centres)
-            results.append((rank, quality, p, centres))
+            if not any(np.array_equal(p, t) for t in tried):
+                tried.append(p)
+                qualities.append(quality)
+    refined = _refine_pairs(gx, gy, cap, np.array(tried))
+    edges = (_pair_score(gx, gy, cap, *refined.T, 256, exact=True)
+             + _pair_score(clean_gx, clean_gy, cap, *refined.T, 256, exact=True)) / 2
+    results = []
+    for p, quality, e in zip(refined, qualities, edges):
+        mx, my, angle, spacing, r = p
+        dx, dy = spacing * math.cos(angle), -spacing * math.sin(angle)
+        centres = [(mx + dx, my + dy), (mx - dx, my - dy)]
+        rank = float(e) * min(_edge_coverage(gx, gy, x, y, r, typical) for x, y in centres)
+        results.append((rank, quality, p, centres))
     _, quality, (mx, my, angle, spacing, r), centres = max(results, key=lambda res: res[0])
 
     # 3. Each centre to a fraction of a pixel.

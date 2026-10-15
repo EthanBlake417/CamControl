@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
@@ -197,9 +197,9 @@ class MainWindow(QMainWindow):
         self.count_panel = CountPanel()
         self.fiber_panel = FiberPanel()
         self._fiber_last = 0.0  # when the live view was last measured
-        self._fiber_job: Job | None = None  # live fiber measuring running in the background
-        self._still_fiber_job: Job | None = None  # measuring an opened image (Update live on)
-        self._still_fiber_next = None  # image opened while that was busy: measured next
+        self._fiber_job: Job | None = None  # fiber measuring running in the background (one at a time)
+        self._fiber_next = None  # request made while it was busy: run next (only the newest is kept)
+        self._fiber_generation = 0  # counts settings changes: results measured with older settings are dropped
         # The main view first, then any compare images; the panels start on the main view.
         self.panes = [Pane(self.view, self.measure_panel.measurements, self.count_panel.counter)]
         self.active = 0
@@ -359,7 +359,7 @@ class MainWindow(QMainWindow):
     def _build_fiber_dock(self):
         panel = self.fiber_panel
         panel.find_requested.connect(self.find_fiber_axes)
-        panel.method_changed.connect(lambda: panel.axes and self.find_fiber_axes(quiet=True))
+        panel.method_changed.connect(self._fiber_settings_changed)
         panel.changed.connect(lambda: self._active_view().set_fiber_axes(panel.axes, panel.selected()))
         panel.export_requested.connect(self.export_fiber_axes)
         panel.live_changed.connect(lambda on: on and self.find_fiber_axes())
@@ -923,59 +923,81 @@ class MainWindow(QMainWindow):
         if (self.fiber_panel.live_check.isChecked() and self._fiber_job is None
                 and now - self._fiber_last >= FIBER_LIVE_INTERVAL_S):
             self._fiber_last = now
-            self._measure_live_fibers(frame)
+            self._request_fibers(0, frame.copy(), "live")  # copy: the worker may reuse its buffer
 
-    def _measure_live_fibers(self, frame):
-        analyse = self._fiber_analysis(0)  # the live image is the left one
-        frame = frame.copy()  # the worker may reuse its buffer
-        job = Job(lambda: analyse(frame), self)
-        job.succeeded.connect(self._live_fibers_done)
+    def _request_fibers(self, index: int, image, kind: str):
+        """Measure the fiber axes of pane index's image in the background, with
+        the panel's settings as they are now. kind: "live" (a camera frame;
+        skipped while another measuring runs), "image" (an image opened, or the
+        settings changed) or "find" (Find axes: say how many were found).
+        One runs at a time; a request made meanwhile runs next, replacing any
+        other waiting one, so the newest image and settings always win."""
+        from_camera = index == 0 and self.live
+        request = (index, image, kind, from_camera, self._fiber_generation, self._fiber_analysis(index))
+        if self._fiber_job is not None:
+            if kind != "live":
+                self._fiber_next = request
+            return
+        analyse = request[-1]
+        job = Job(lambda: analyse(image), self)
+        job.succeeded.connect(lambda axes: self._fibers_done(request, axes))
         job.failed.connect(lambda msg: self.statusBar().showMessage(f"Fiber axes: {msg}", 6000))
-        job.finished.connect(self._live_fibers_finished)
+        job.finished.connect(self._fibers_finished)
         self._fiber_job = job
-        job.start()
+        job.start(QThread.Priority.LowPriority)  # the video and the window come first
 
-    def _live_fibers_done(self, axes):
-        # Skip results that no longer belong to the image shown (frozen, file opened, live update off).
-        if self.live and self.fiber_panel.live_check.isChecked():
-            self._show_fiber_axes(0, axes)
+    def _fibers_done(self, request, axes):
+        index, image, kind, from_camera, generation, _ = request
+        if generation != self._fiber_generation:
+            return  # measured with old settings: the new ones are being measured
+        # Only if the image measured is still the one shown: for a camera frame, while
+        # the camera still shows (and, live updates, while they're on).
+        if from_camera:
+            if not self.live or (kind == "live" and not self.fiber_panel.live_check.isChecked()):
+                return
+        elif index >= len(self.panes) or self.panes[index].view.image is not image or (index == 0 and self.live):
+            return
+        self._show_fiber_axes(index, axes)
+        if kind == "find":
+            if axes:
+                unclear = sum(not f.clear for f in axes)
+                note = f" ({unclear} unclear)" if unclear else ""
+                self.statusBar().showMessage(f"Found {len(axes)} fiber{'s' if len(axes) != 1 else ''}{note}.", 6000)
+            else:
+                self.statusBar().showMessage(
+                    "No fibers found. Draw a Circle (3 pt or centre) round the fiber in Measurements, then Find axes.", 10000)
 
-    def _live_fibers_finished(self):
+    def _fibers_finished(self):
         self._fiber_job.deleteLater()
         self._fiber_job = None
+        if self._fiber_next is not None:
+            index, image, kind = self._fiber_next[:3]
+            self._fiber_next = None
+            self._request_fibers(index, image, kind)  # with the settings as they are now
+
+    def _fiber_settings_changed(self):
+        """Method or detection settings changed: re-measure what's shown (if it was measured)."""
+        self._fiber_generation += 1
+        index = self.active
+        if index == 0 and self.live:
+            if self.fiber_panel.live_check.isChecked():
+                self._fiber_last = 0.0  # the next frame
+            elif self.fiber_panel.axes and self.view.image is not None:
+                self._request_fibers(0, self.view.image.copy(), "image")
+        elif self.fiber_panel.axes or (index == 0 and self.fiber_panel.live_check.isChecked()):
+            image = self.panes[index].view.image
+            if image is not None:
+                self._request_fibers(index, image, "image")
 
     def _measure_opened_image(self):
         """A new image (a file, a result) was opened: clear the old axes, and with
-        Update live on measure it, in the background, so clicking through images keeps the axes
-        up to date. One at a time: an image opened meanwhile is measured next,
-        and only the newest image's result is shown."""
+        Update live on measure it, in the background, so clicking through images
+        keeps the axes up to date."""
         if self.live or self.view.image is None:
             return
         self._show_fiber_axes(0, [])  # the old image's axes don't belong to this one
-        if not self.fiber_panel.live_check.isChecked():
-            return
-        image = self.view.image
-        if self._still_fiber_job is not None:
-            self._still_fiber_next = image
-            return
-        analyse = self._fiber_analysis(0)
-        job = Job(lambda: analyse(image), self)
-        job.succeeded.connect(lambda axes: self._opened_fibers_done(image, axes))
-        job.failed.connect(lambda msg: self.statusBar().showMessage(f"Fiber axes: {msg}", 6000))
-        job.finished.connect(self._opened_fibers_finished)
-        self._still_fiber_job = job
-        job.start()
-
-    def _opened_fibers_done(self, image, axes):
-        if not self.live and self.view.image is image and self.fiber_panel.live_check.isChecked():
-            self._show_fiber_axes(0, axes)
-
-    def _opened_fibers_finished(self):
-        self._still_fiber_job.deleteLater()
-        self._still_fiber_job = None
-        if self._still_fiber_next is not None:
-            self._still_fiber_next = None
-            self._measure_opened_image()  # the image shown now
+        if self.fiber_panel.live_check.isChecked():
+            self._request_fibers(0, self.view.image, "image")
 
     def _on_camera_settings(self, values: dict):
         self._camera_values.update(values)
@@ -1451,16 +1473,11 @@ class MainWindow(QMainWindow):
         image = self.panes[index].view.image
         if image is None:
             return
-        axes = self._fiber_analysis(index)(image)
-        self._show_fiber_axes(index, axes)
+        if index == 0 and self.live:
+            image = image.copy()  # the camera worker may reuse the frame's buffer
+        self._request_fibers(index, image, "image" if quiet else "find")  # in the background
         if not quiet:
-            if axes:
-                unclear = sum(not f.clear for f in axes)
-                note = f" ({unclear} unclear)" if unclear else ""
-                self.statusBar().showMessage(f"Found {len(axes)} fiber{'s' if len(axes) != 1 else ''}{note}.", 6000)
-            else:
-                self.statusBar().showMessage(
-                    "No fibers found. Draw a Circle (3 pt or centre) round the fiber in Measurements, then Find axes.", 10000)
+            self.statusBar().showMessage("Finding fiber axes...")
             if self.fiber_dock.isHidden():  # show the results (minimizing the others on its edge)
                 self.fiber_dock.toggleViewAction().trigger()
 
@@ -1800,9 +1817,9 @@ class MainWindow(QMainWindow):
             return
         if self._job is not None:
             self._job.wait()  # let a running processing job finish first
-        for job in (self._fiber_job, self._still_fiber_job):
-            if job is not None:
-                job.wait()
+        self._fiber_next = None
+        if self._fiber_job is not None:
+            self._fiber_job.wait()
         self._save_settings()
         self.worker.stop()
         super().closeEvent(event)
