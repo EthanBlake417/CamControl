@@ -1960,9 +1960,19 @@ class MainWindow(QMainWindow):
         logo = QPixmap(str(LOGO))
         if not logo.isNull():
             box.setIconPixmap(logo.scaledToWidth(160, Qt.TransformationMode.SmoothTransformation))
-        box.setText(
-            "<b>CamControl</b><br>"
-            "Live view, capture and measurement for the O.C. White Ultra-Cam II."
+        box.setText("<b>CamControl</b>")
+        box.setInformativeText(
+            "Live view, capture, measurement and image processing for USB microscope cameras "
+            "(e.g. the O.C. White Ultra-Cam II and the ETN3000 fiber end-face inspector)."
+            "<ul style='margin-left: -20px;'>"
+            "<li>One or more views side by side, each showing a camera, an image, a video or a result; "
+            "several cameras live at once</li>"
+            "<li>Photo capture with frame averaging, video recording and time-lapse</li>"
+            "<li>Measurements, counting, and the slow/fast axes of PM fibers (Panda, Bow-tie, Elliptical)</li>"
+            "<li>Flat-field correction, focus stacking, HDR, stitching and fluorescence composites</li>"
+            "<li>Grid and crosshair overlays, settings files, Excel/CSV export</li>"
+            "</ul>"
+            "Made by Ethan Blake at Grid Evolution Technologies."
         )
         box.exec()
 
