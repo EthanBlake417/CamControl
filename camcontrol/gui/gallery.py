@@ -8,7 +8,7 @@ capture folder, or in another folder chosen in the panel.
 - Updates by itself when files in the folder change (new captures, files
   copied in or deleted), using QFileSystemWatcher.
 - Double-click a thumbnail to open it in the main view (videos play there).
-  The image open in the main view has an orange frame; selected ones are blue.
+  The image open in the main view is outlined; selected ones are tinted.
   Then the arrow keys (also Home/End/Page Up/Down) step to the next or
   previous one and open it; with Shift or Ctrl held they only select.
 - Select several (Ctrl/Shift-click) and right-click to focus stack, HDR,
@@ -27,11 +27,22 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
-from PySide6.QtCore import QFile, QFileSystemWatcher, QObject, QPointF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPen, QPixmap, QPolygonF
+from PySide6.QtCore import QFile, QFileSystemWatcher, QObject, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QIcon,
+    QKeySequence,
+    QPainter,
+    QPalette,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QFileDialog,
     QHBoxLayout,
@@ -122,48 +133,66 @@ def draw_play_mark(pixmap: QPixmap):
     painter.end()
 
 
-OPEN_COLOR = QColor(255, 140, 0)      # frame round the image open in the main view
-SELECTED_COLOR = QColor(0, 120, 215)  # selected thumbnails (also while the list isn't focused)
+CELL_PAD = 6  # px of space round the thumbnail and name, the same on every side
 
 
 class _ThumbnailDelegate(QStyledItemDelegate):
-    """Draws selection plainly (a blue fill and frame, focused or not) and an
-    orange frame, with the name in bold, round the image open in the main view."""
+    """Lays out each cell itself, so the thumbnail sits centred with even
+    space all round and the name on one line under it (shortened in the
+    middle if too long; the tooltip has it in full). One color (the
+    system's highlight color), two marks: selected thumbnails get a light
+    tint (also while the list isn't focused), and the image open in the
+    main view a solid outline and a bold name."""
 
     def __init__(self, panel: "GalleryPanel"):
         super().__init__(panel)
         self._panel = panel
 
+    def sizeHint(self, option: QStyleOptionViewItem, index) -> QSize:
+        return QSize(THUMB_SIZE.width() + 2 * CELL_PAD,
+                     THUMB_SIZE.height() + option.fontMetrics.height() + 3 * CELL_PAD)
+
     def paint(self, painter: QPainter, option: QStyleOptionViewItem, index):
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         is_open = self._panel.is_open(index.data(PATH_ROLE))
-        rect = option.rect.adjusted(1, 1, -1, -1)
+        accent = option.palette.color(QPalette.ColorGroup.Active, QPalette.ColorRole.Highlight)
+        cell = QRectF(option.rect).adjusted(1, 1, -1, -1)
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         if selected:
-            fill = QColor(SELECTED_COLOR)
-            fill.setAlpha(70)
+            tint = QColor(accent)
+            tint.setAlpha(55)
             painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(fill)
-            painter.drawRoundedRect(rect, 4, 4)
-        painter.restore()
-        # The thumbnail and name as usual, minus the style's own (faint) selection.
-        plain = QStyleOptionViewItem(option)
-        self.initStyleOption(plain, index)
-        plain.state &= ~(QStyle.StateFlag.State_Selected | QStyle.StateFlag.State_HasFocus)
+            painter.setBrush(tint)
+            painter.drawRoundedRect(cell, 5, 5)
+
+        # Thumbnail: centred in the THUMB_SIZE area at the top of the cell.
+        r = option.rect
+        area = QRect(r.x() + (r.width() - THUMB_SIZE.width()) // 2, r.y() + CELL_PAD, THUMB_SIZE.width(),
+                     THUMB_SIZE.height())
+        icon = index.data(Qt.ItemDataRole.DecorationRole)
+        if isinstance(icon, QIcon):
+            pixmap = icon.pixmap(THUMB_SIZE)
+            size = pixmap.deviceIndependentSize().toSize()
+            painter.drawPixmap(QRect(area.x() + (area.width() - size.width()) // 2,
+                                     area.y() + (area.height() - size.height()) // 2, size.width(), size.height()),
+                               pixmap)
+
+        # Name: one line, centred under it.
+        font = QFont(option.font)
+        font.setBold(is_open)
+        painter.setFont(font)
+        painter.setPen(option.palette.color(QPalette.ColorRole.Text))
+        text_rect = QRect(r.x() + CELL_PAD, area.bottom() + 1 + CELL_PAD, r.width() - 2 * CELL_PAD,
+                          option.fontMetrics.height())
+        name = QFontMetrics(font).elidedText(index.data(Qt.ItemDataRole.DisplayRole) or "",
+                                             Qt.TextElideMode.ElideMiddle, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, name)
+
         if is_open:
-            plain.font.setBold(True)
-        style = plain.widget.style() if plain.widget else QApplication.style()
-        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, plain, painter, plain.widget)
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        if is_open:
-            painter.setPen(QPen(OPEN_COLOR, 3))
-            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4, 4)
-        elif selected:
-            painter.setPen(QPen(SELECTED_COLOR, 2))
-            painter.drawRoundedRect(rect, 4, 4)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(accent, 2))
+            painter.drawRoundedRect(cell.adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
         painter.restore()
 
 
@@ -231,7 +260,6 @@ class GalleryPanel(QWidget):
         self.list.setResizeMode(QListView.ResizeMode.Adjust)
         self.list.setMovement(QListView.Movement.Static)
         self.list.setUniformItemSizes(True)
-        self.list.setWordWrap(True)
         self.list.setSpacing(4)
         self.list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list.setItemDelegate(_ThumbnailDelegate(self))
@@ -247,8 +275,8 @@ class GalleryPanel(QWidget):
         self.list.addAction(self.delete_action)
         layout.addWidget(self.list)
 
-        hint = QLabel("Double-click to open (orange frame), then the arrow keys step through. Ctrl/Shift-click to "
-                      "select several (blue), right-click for tools. Delete moves to the Recycle Bin.")
+        hint = QLabel("Double-click to open (outlined), then the arrow keys step through. Ctrl/Shift-click to "
+                      "select several, right-click for tools. Delete moves to the Recycle Bin.")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
         layout.addWidget(hint)
@@ -288,7 +316,7 @@ class GalleryPanel(QWidget):
         return [path for _, path in reversed(rows)]  # the list shows newest first
 
     def set_open_path(self, path: str | None):
-        """The image now shown in the main view (None: live, or not a file): framed in orange."""
+        """The image now shown in the main view (None: live, or not a file): outlined."""
         self._open = os.path.normcase(os.path.abspath(path)) if path else None
         self.list.viewport().update()
 
