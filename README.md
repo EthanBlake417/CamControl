@@ -260,6 +260,24 @@ uv sync
 
 Close HD2 before running anything. Windows lets only one program use the camera at a time.
 
+## Tests
+
+Run them from the project folder (`uv sync` installs pytest with the rest):
+
+```powershell
+venv\Scripts\python -m pytest                  # everything, about 1.5 minutes
+venv\Scripts\python -m pytest -m "not slow"    # without the long fiber accuracy runs
+venv\Scripts\python -m pytest tests/test_views.py -k capture   # one file, tests named *capture*
+```
+
+Each test passes or fails on its own; no camera is needed, and nothing is written outside a temporary folder (not `captures/`, not the app's saved settings).
+
+- `tests/test_processing.py`: every module's own self-test (`python -m camcontrol.processing.hdr` and the like), and fiber axis accuracy: rods with a dark blob over one at 18 angles, `Fiber Types.png`, a glow round the cladding edge, and synthetic dirty fibers with known axes (`tests/synth.py`, 40 of each kind, marked slow). Checks on real end faces (`WIN_20261006_11_09_45_Pro.jpg`, `Fiber 3 WIN_...jpg`, the `36879B` bow-tie TIFs) run when those files are in the project folder and are skipped otherwise.
+- `tests/test_views.py`: the main window with two fake cameras (`tests/fakes.py`: synthetic fiber frames at 30 fps, like a real camera thread): one and several views, two cameras live at once, Controls following the active view, moving a camera, linked capture names, Live/Freeze, layouts, measurements per view, Update live fiber axes on both cameras, results and Save, video, flat-field, views coming back next time, settings files (also from before views), grid and crosshair.
+- `tests/test_parts.py`: capture file names, settings files, grid and crosshair settings, the Captures panel.
+
+When something changes on purpose (e.g. a better fiber method), update the expected values in the test with a note of why.
+
 ## Project layout (planned)
 
 ```
@@ -309,6 +327,10 @@ camcontrol/
 │       ├── count.py         # counting marks and export
 │       ├── fiber_axis.py    # PM fiber slow/fast axis
 │       └── fluorescence.py
+├── tests/               # pytest: see Tests above
+│   ├── conftest.py      # offscreen Qt app, fake cameras, a window that writes only to a temp folder
+│   ├── fakes.py         # fake camera thread
+│   └── synth.py         # synthetic dirty fiber end faces with known axes
 ├── tools/
 │   ├── probe_camera.py  # Phase 0 diagnostic
 │   └── camera_settings.py  # opens the driver's own settings dialog
