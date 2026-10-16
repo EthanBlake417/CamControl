@@ -147,3 +147,39 @@ def test_real_bow_ties(name):
     f = fa.analyse(load_image_file(str(path)), centre_only=True)[0]
     assert f.fiber_type == "Bow-tie"
     assert angle_error(f.slow_deg, 0.45) < 0.5
+
+
+def test_plain_disc_does_not_crash():
+    """A round fiber with no rods at all (no edges inside) is unclear, not an error."""
+    img = np.full((600, 600, 3), 15, np.uint8)
+    cv2.circle(img, (300, 300), 200, (190,) * 3, -1)
+    f = fa.analyse(cv2.GaussianBlur(img, (0, 0), 1.5), centre_only=True)[0]
+    assert not f.clear
+
+
+@pytest.mark.parametrize("angle", [0, 8, 172])
+def test_rod_running_off_the_image(angle):
+    """A fiber at the frame's edge with a rod partly off the image: the rod is
+    scored over the part of its outline shown, so it's found where it is."""
+    test = np.full((500, 800, 3), 12, np.uint8)
+    cv2.circle(test, (690, 250), 175, (200,) * 3, -1)
+    a = math.radians(angle)
+    for s in (-1, 1):
+        cv2.circle(test, (round(690 + s * 95 * math.cos(a)), round(250 - s * 95 * math.sin(a))), 48, (150,) * 3, 3)
+    f = fa.measure_axis(cv2.GaussianBlur(test, (0, 0), 1.5), 690, 250, 175, "rods")
+    assert angle_error(f.slow_deg, angle) < 1.0
+    right = max(x for x, _ in f.part_centres)
+    assert abs(right - (690 + 95 * abs(math.cos(a)))) < 4
+
+
+def test_real_vgroove_photo():
+    """Three Panda fibers side by side, the outer rods running off the image, a dark
+    blotch over one rod, the core showing as a bright spot (the user's photo)."""
+    path = ROOT / "WIN_20261008_07_31_07_Pro.jpg"
+    if not path.is_file():
+        pytest.skip("WIN_20261008_07_31_07_Pro.jpg isn't in the project folder")
+    found = sorted(fa.analyse(load_image_file(str(path))), key=lambda f: f.cx)
+    assert len(found) == 3
+    for f, truth in zip(found, (-2.0, -0.9, -0.3)):  # judged from the rod outlines by eye
+        assert f.fiber_type == "Panda" and f.clear
+        assert angle_error(f.slow_deg, truth) < 1.0

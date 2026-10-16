@@ -27,7 +27,9 @@ How it's measured, for each fiber:
      rods placed either side of the fiber centre (see find_rods), using
      only edges, so shading and dark blobs inside the fiber don't count.
      Each rod is then fitted on its own; the axis is the line through
-     their centres. Needs no threshold. The result is unclear if the rod
+     their centres. Needs no threshold. Rods running off the image (fibers
+     at the frame's edge) are scored over the part of their outline shown.
+     A clearly visible core spot breaks near-ties between rod pairs. The result is unclear if the rod
      outlines are faint or not round (quality, coverage), e.g. on a Bow-tie
      fiber: use "symmetry" for those.
    - "symmetry": the line the end face is most mirror-symmetric about
@@ -96,6 +98,12 @@ TURNED_GAIN = 0.05         # "auto": ... and the two parts must match better tur
                            # (Panda rods: -0.1 to 0.01; wedges and ellipse ends: 0.09 and up)
 OTHER_SHAPE_QUALITY = 2.4  # "auto": other shapes are only tried when the rod search found strong edges
                            # (wedges and ellipses give 2.7 and up; a failed search on a dirty Panda, about 2)
+MIN_SHOWN = 0.5        # rod outlines off the image: scored over the part shown, at least this share
+CORE_SEARCH = 0.15     # a visible core spot is looked for within this fraction of the radius
+CORE_SIGNIFICANCE = 8.0  # ... standing out this many noise levels from the cladding
+CORE_SPREAD = 0.08     # rod pairs centred further from it than this (fraction of the radius) count less
+CORE_TIE = 0.9         # ... among the pairs ranked at least this share of the best (only near-ties:
+                       # a speck of dirt taken for the core can't overrule a clear winner)
 
 METHODS = {  # name: label in the panel
     "auto": "Automatic",
@@ -429,7 +437,9 @@ def _rod_gradients(image: np.ndarray, cx: float, cy: float, radius: float):
     """The fiber scaled to a radius of SYMMETRY_SIZE px, blurred, as x and y
     gradients, with the cladding edge and anything off the image zeroed.
     Returns gx, gy, half (the fiber centre's pixel), scale, typical (the
-    median gradient size inside: mostly noise), dirt (_dirt_mask)."""
+    median gradient size inside: mostly noise), dirt (_dirt_mask), core (a
+    visible core spot, _detect_core, or None) and valid (1 where the map
+    shows the image, 0 off it)."""
     gray = cv2.cvtColor(as_bgr(image), cv2.COLOR_BGR2GRAY).astype(np.float32)
     scale = SYMMETRY_SIZE / radius
     half = int(SYMMETRY_SIZE * 1.05)
@@ -439,6 +449,7 @@ def _rod_gradients(image: np.ndarray, cx: float, cy: float, radius: float):
     yy, xx = np.mgrid[:size[1], :size[0]]
     edge = np.hypot(xx - half, yy - half) > ROD_SEARCH_EDGE * SYMMETRY_SIZE
     dirt = _dirt_mask(crop, ~edge)
+    core = _detect_core(crop, half)
     crop = cv2.GaussianBlur(crop, (0, 0), 1.5)
     gx, gy = cv2.Sobel(crop, cv2.CV_32F, 1, 0) / 8, cv2.Sobel(crop, cv2.CV_32F, 0, 1) / 8
     # Parts of the fiber off the image: no edges there (not even the image border).
@@ -448,7 +459,33 @@ def _rod_gradients(image: np.ndarray, cx: float, cy: float, radius: float):
     typical = max(float(np.median(np.hypot(gx, gy)[~off])), GRADIENT_FLOOR)  # floor: clean, drawn images
     gx[off] = 0
     gy[off] = 0
-    return gx, gy, half, scale, typical, dirt
+    valid = (in_image > 0).astype(np.float32)
+    return gx, gy, half, scale, typical, dirt, core, valid
+
+
+def _detect_core(crop: np.ndarray, half: int):
+    """The fiber core, if it shows as a small spot (brighter or darker) near the
+    middle of the search map: a compact peak of a difference of Gaussians,
+    standing out clearly from the cladding's texture. Rod edges and shading
+    aren't compact, so they don't count. (x, y) in the map, or None."""
+    d = cv2.GaussianBlur(crop, (0, 0), 3) - cv2.GaussianBlur(crop, (0, 0), 10)
+    yy, xx = np.mgrid[:d.shape[0], :d.shape[1]]
+    dist = np.hypot(xx - half, yy - half)
+    near = np.where(dist <= CORE_SEARCH * SYMMETRY_SIZE, np.abs(d), 0)
+    py, px = np.unravel_index(int(np.argmax(near)), near.shape)
+    peak = float(near[py, px])
+    inner = d[dist < 0.6 * SYMMETRY_SIZE]
+    noise = max(1.4826 * float(np.median(np.abs(inner - np.median(inner)))), 0.5)
+    if peak < CORE_SIGNIFICANCE * noise:
+        return None
+    # Compact: strong right round the peak, weak in a ring further out.
+    sd = np.sign(d[py, px]) * d
+    r = np.hypot(xx - px, yy - py)
+    inside, ring = float(sd[r <= 5].mean()), float(sd[(r >= 12) & (r <= 20)].mean())
+    if inside < 3 * max(ring, 0.0) or inside < 0.5 * peak:
+        return None
+    w = np.where(r <= 8, np.clip(sd - 0.5 * peak, 0, None), 0)
+    return (float((w * xx).sum() / w.sum()), float((w * yy).sum() / w.sum())) if w.sum() > 0 else None
 
 
 def _dirt_mask(crop: np.ndarray, inside: np.ndarray) -> np.ndarray:
@@ -465,32 +502,40 @@ def _dirt_mask(crop: np.ndarray, inside: np.ndarray) -> np.ndarray:
 
 
 def _ring_score(gx: np.ndarray, gy: np.ndarray, cap: float, qx, qy, rho, samples: int,
-                exact: bool = False) -> np.ndarray:
+                exact: bool = False, valid: np.ndarray | None = None) -> np.ndarray:
     """How well each circle (centres qx, qy, radii rho: arrays of one shape)
     follows edges: the mean, round the circle, of the gradient across it,
     each sample counting at most cap. With the cap, a circle scores by how
-    much of it lies on an edge, so a few strong dust edges can't win."""
+    much of it lies on an edge, so a few strong dust edges can't win. With
+    valid (1 on the image), the mean is over the part of the circle on the
+    image, at least MIN_SHOWN of it."""
     a = np.linspace(0, 2 * np.pi, samples, endpoint=False)
     ca, sa = np.cos(a), np.sin(a)
     xs = np.asarray(qx)[..., None] + np.asarray(rho)[..., None] * ca
     ys = np.asarray(qy)[..., None] + np.asarray(rho)[..., None] * sa
     if exact:  # in between pixels
         sx, sy = _sample(gx, xs, ys), _sample(gy, xs, ys)
+        shown = None if valid is None else _sample(valid, xs, ys)
     else:  # nearest pixel: fast, for the wide search
         h, w = gx.shape
         xi, yi = np.clip(np.round(xs).astype(int), 0, w - 1), np.clip(np.round(ys).astype(int), 0, h - 1)
         sx, sy = gx[yi, xi], gy[yi, xi]
-    return np.minimum(np.abs(sx * ca + sy * sa), cap).mean(-1)
+        shown = None if valid is None else valid[yi, xi]
+    across = np.minimum(np.abs(sx * ca + sy * sa), cap)
+    if shown is None or valid.min() >= 1:
+        return across.mean(-1)
+    return across.sum(-1) / np.maximum(shown.sum(-1), MIN_SHOWN * samples)
 
 
-def _coarse_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, half: int, n: int = ROD_STARTS):
+def _coarse_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, half: int, n: int = ROD_STARTS,
+                  valid: np.ndarray | None = None, core=None):
     """Step 1 of find_rods: the n best different rod pairs (and the best
-    about the centre), as (midpoint x, midpoint y, angle, spacing, rod
-    radius) at the search scale, and the quality (the best pair's score over
-    a typical pair's about the centre)."""
+    about the centre, and about the core if it shows), as (midpoint x,
+    midpoint y, angle, spacing, rod radius) at the search scale, and the
+    quality (the best pair's score over a typical pair's about the centre)."""
     size = SYMMETRY_SIZE
     angles, spacings, radii, sizes, ox, oy, inside, first, second, box = _pair_grid(half)
-    maps = _ring_maps(gx, gy, cap, sizes, 64, box).ravel()
+    maps = _ring_maps(gx, gy, cap, sizes, 64, box, valid).ravel()
     score = np.where(inside, np.minimum(maps[first], maps[second]), 0)
     centred = int(np.argmin(np.hypot(ox, oy)))
     quality = float(score.max() / max(np.median(score[inside[:, centred], centred]), 1e-6))
@@ -504,8 +549,12 @@ def _coarse_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, half: int, n: int 
             starts.append((i, o))
             if len(starts) == n:
                 break
-    if all(o != centred for _, o in starts):  # the best pair about the centre too
-        starts.append((int(np.argmax(score[:, centred])), centred))
+    anchors = [centred]  # the best pair about the centre too, and about the core
+    if core is not None:
+        anchors.append(int(np.argmin(np.hypot(ox - (core[0] - half), oy - (core[1] - half)))))
+    for o in anchors:
+        if all(o != q for _, q in starts):
+            starts.append((int(np.argmax(score[:, o])), o))
     return [np.array([half + ox[o], half + oy[o], angles[i], spacings[i], sizes[radii[i]]], float) for i, o in starts], quality
 
 
@@ -542,7 +591,8 @@ def _pair_grid(half: int):
             index(mx + dx[:, None], my + dy[:, None]), index(mx - dx[:, None], my - dy[:, None]), (lo, lo, hi, hi))
 
 
-def _refine_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, pairs: np.ndarray) -> np.ndarray:
+def _refine_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, pairs: np.ndarray,
+                  valid: np.ndarray | None = None) -> np.ndarray:
     """Step 2 of find_rods: each pair (rows, as _coarse_pairs) moved to where
     its two outlines follow the edges best, in ever finer steps. All pairs
     at once, each on its own path."""
@@ -556,7 +606,9 @@ def _refine_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, pairs: np.ndarray)
             for k in range(5):
                 tries = np.repeat(p[moving][:, None], 5, axis=1)  # (pairs, 5 tries, 5 values)
                 tries[..., k] += np.arange(-2, 3) * steps[k]
-                score = _pair_score(gx, gy, cap, *np.moveaxis(tries, -1, 0), 128, exact=True, both=np.add)
+                tries[..., 4] = np.maximum(tries[..., 4], 2.0)  # no edges at all (a plain disc) can shrink a rod to nothing
+                score = _pair_score(gx, gy, cap, *np.moveaxis(tries, -1, 0), 128, exact=True, both=np.add,
+                                    valid=valid)
                 p[moving] = tries[np.arange(len(tries)), np.argmax(score, axis=1)]
             moving &= ~np.all(p == was, axis=1)
             if not moving.any():
@@ -565,13 +617,18 @@ def _refine_pairs(gx: np.ndarray, gy: np.ndarray, cap: float, pairs: np.ndarray)
     return p
 
 
-def _ring_maps(gx: np.ndarray, gy: np.ndarray, cap: float, radii, samples: int, box) -> np.ndarray:
+def _ring_maps(gx: np.ndarray, gy: np.ndarray, cap: float, radii, samples: int, box,
+               valid: np.ndarray | None = None) -> np.ndarray:
     """_ring_score of circles of each radius centred on every pixel of the
     box (x0, y0, x1, y1) (nearest pixel samples), as an array (len(radii),
     y1 - y0, x1 - x0); 0 for circles off the map."""
     x0, y0, x1, y1 = box
     pad = int(math.ceil(max(radii))) + 1
     maps = np.zeros((len(radii), y1 - y0, x1 - x0), np.float32)
+    partial = valid is not None and valid.min() < 1  # part of the fiber off the image
+    if partial:
+        shown = np.zeros_like(maps)
+        valid_pad = cv2.copyMakeBorder(valid, pad, pad, pad, pad, cv2.BORDER_CONSTANT, value=0)
     for a in np.linspace(0, np.pi, samples // 2, endpoint=False):
         # The gradient across the circle is the same at a and a + 180 degrees, up to sign.
         across = cv2.copyMakeBorder(np.minimum(np.abs(gx * math.cos(a) + gy * math.sin(a)), cap),
@@ -580,14 +637,18 @@ def _ring_maps(gx: np.ndarray, gy: np.ndarray, cap: float, radii, samples: int, 
             for sign in (1, -1):
                 sx, sy = pad + x0 + int(round(sign * r * math.cos(a))), pad + y0 + int(round(sign * r * math.sin(a)))
                 maps[i] += across[sy:sy + y1 - y0, sx:sx + x1 - x0]
+                if partial:
+                    shown[i] += valid_pad[sy:sy + y1 - y0, sx:sx + x1 - x0]
+    if partial:
+        return maps / np.maximum(shown, MIN_SHOWN * samples)
     return maps / samples
 
 
-def _pair_score(gx, gy, cap, mx, my, angle, spacing, rho, samples, exact=False, both=np.minimum):
+def _pair_score(gx, gy, cap, mx, my, angle, spacing, rho, samples, exact=False, both=np.minimum, valid=None):
     """_ring_score of two circles of radius rho, spacing either side of (mx, my) at angle (radians)."""
     dx, dy = spacing * np.cos(angle), -spacing * np.sin(angle)  # screen y points down
-    return both(_ring_score(gx, gy, cap, mx + dx, my + dy, rho, samples, exact),
-                _ring_score(gx, gy, cap, mx - dx, my - dy, rho, samples, exact))
+    return both(_ring_score(gx, gy, cap, mx + dx, my + dy, rho, samples, exact, valid),
+                _ring_score(gx, gy, cap, mx - dx, my - dy, rho, samples, exact, valid))
 
 
 def find_rods(image: np.ndarray, cx: float, cy: float, radius: float):
@@ -625,7 +686,7 @@ def find_rods(image: np.ndarray, cx: float, cy: float, radius: float):
 
 def _find_rods(grads, cx: float, cy: float):
     """find_rods on _rod_gradients' result, plus the turned gain (_match_rods)."""
-    gx, gy, half, scale, typical, dirt = grads
+    gx, gy, half, scale, typical, dirt, core, valid = grads
     cap = EDGE_CAP * typical
     clean_gx, clean_gy = np.where(dirt, 0, gx), np.where(dirt, 0, gy)
     # 2. The pair as one shape: midpoint x, y, angle, spacing, size. Refined
@@ -634,22 +695,33 @@ def _find_rods(grads, cx: float, cy: float):
     # all round both rods (_edge_coverage).
     tried, qualities = [], []
     # Both searches at once: numpy and OpenCV let go of the GIL while they work.
-    for starts, quality in _POOL.map(lambda g: _coarse_pairs(*g, cap, half), ((clean_gx, clean_gy), (gx, gy))):
+    for starts, quality in _POOL.map(lambda g: _coarse_pairs(*g, cap, half, valid=valid, core=core),
+                                     ((clean_gx, clean_gy), (gx, gy))):
         for p in starts:
             if not any(np.array_equal(p, t) for t in tried):
                 tried.append(p)
                 qualities.append(quality)
-    refined = _refine_pairs(gx, gy, cap, np.array(tried))
-    edges = (_pair_score(gx, gy, cap, *refined.T, 256, exact=True)
-             + _pair_score(clean_gx, clean_gy, cap, *refined.T, 256, exact=True)) / 2
+    refined = _refine_pairs(gx, gy, cap, np.array(tried), valid)
+    edges = (_pair_score(gx, gy, cap, *refined.T, 256, exact=True, valid=valid)
+             + _pair_score(clean_gx, clean_gy, cap, *refined.T, 256, exact=True, valid=valid)) / 2
     results = []
     for p, quality, e in zip(refined, qualities, edges):
         mx, my, angle, spacing, r = p
         dx, dy = spacing * math.cos(angle), -spacing * math.sin(angle)
         centres = [(mx + dx, my + dy), (mx - dx, my - dy)]
-        rank = float(e) * min(_edge_coverage(gx, gy, x, y, r, typical) for x, y in centres)
+        rank = float(e) * min(_edge_coverage(gx, gy, x, y, r, typical, valid=valid) for x, y in centres)
         results.append((rank, quality, p, centres))
-    _, quality, (mx, my, angle, spacing, r), centres = max(results, key=lambda res: res[0])
+    top = max(res[0] for res in results)
+
+    def weight(res):
+        """A visible core breaks near-ties: the rods sit either side of it."""
+        if core is None:
+            return res[0]
+        if res[0] < CORE_TIE * top:
+            return 0.0
+        off = math.hypot(res[2][0] - core[0], res[2][1] - core[1]) / (CORE_SPREAD * SYMMETRY_SIZE)
+        return res[0] * math.exp(-off * off)
+    _, quality, (mx, my, angle, spacing, r), centres = max(results, key=weight)
 
     # 3. Each centre to a fraction of a pixel.
     fitted, sizes = [], []
@@ -663,7 +735,7 @@ def _find_rods(grads, cx: float, cy: float):
         fitted.append((x, y))
         sizes.append(rr)
     r = float(np.mean(sizes))  # one size for both
-    shows = [_edge_coverage(gx, gy, x, y, r, typical) for x, y in fitted]
+    shows = [_edge_coverage(gx, gy, x, y, r, typical, valid=valid) for x, y in fitted]
     weak, strong = int(np.argmin(shows)), int(np.argmax(shows))
     shift, turned_gain = _match_rods(gx, gy, typical, fitted, r, dirt)
     (x0, y0), (x1, y1) = fitted
@@ -677,7 +749,7 @@ def _find_rods(grads, cx: float, cy: float):
         # edge fits (which dirt can pull), if the match is good and agrees with them.
         px, py = (x0 + x1) / 2, (y0 + y1) / 2
         fitted = [(px - shift[0] / 2, py - shift[1] / 2), (px + shift[0] / 2, py + shift[1] / 2)]
-        shows = [max(was, _edge_coverage(gx, gy, x, y, r, typical)) for was, (x, y) in zip(shows, fitted)]
+        shows = [max(was, _edge_coverage(gx, gy, x, y, r, typical, valid=valid)) for was, (x, y) in zip(shows, fitted)]
     rods = [((x - half) / scale + cx, (y - half) / scale + cy, r / scale) for x, y in fitted]
     return rods, quality, min(shows), turned_gain
 
@@ -692,6 +764,8 @@ def _match_rods(gx, gy, typical: float, centres, r: float, dirt=None, search: in
     wedges or the two ends of an ellipse, which point opposite ways. Dirt
     (mask) round rod 0 and the core are left out of the match.
     Returns (shift or None, turned gain), or (None, None) off the map."""
+    if not r > 0 or not np.all(np.isfinite(centres)):
+        return None, None
     strength = np.minimum(np.hypot(gx, gy), EDGE_CAP * typical).astype(np.float32)
     (ax, ay), (bx, by) = centres
     size = int(math.ceil(1.25 * r)) + 1
@@ -741,7 +815,7 @@ def _fit_rod_edge(gx, gy, x, y, r, spread: float = 0.08, rays: int = 180):
     return _fit_circle(xs[np.arange(rays), k][strong].astype(np.float64), ys[np.arange(rays), k][strong].astype(np.float64))
 
 
-def _edge_coverage(gx, gy, x, y, r, typical: float, n_arcs: int = 32) -> float:
+def _edge_coverage(gx, gy, x, y, r, typical: float, n_arcs: int = 32, valid=None) -> float:
     """Fraction of the circle's outline (in n_arcs arcs) where a clear edge
     lies right on the circle: on each arc, the strongest edge within 5% of
     the radius must be at least ON_CIRCLE_SHARE of the strongest within 25%.
@@ -754,8 +828,17 @@ def _edge_coverage(gx, gy, x, y, r, typical: float, n_arcs: int = 32) -> float:
     xs, ys = (x + np.outer(radii, ca)).astype(np.float32), (y + np.outer(radii, sa)).astype(np.float32)
     across = np.abs(cv2.remap(gx, xs, ys, cv2.INTER_LINEAR) * ca + cv2.remap(gy, xs, ys, cv2.INTER_LINEAR) * sa)
     across = across.reshape(len(radii), n_arcs, per_arc).max(axis=2)  # strongest edge per radius, per arc
-    near = across[np.abs(radii - r) <= 0.05 * r].max(axis=0)
-    return float(((near >= ON_CIRCLE_SHARE * across.max(axis=0)) & (near > 2 * typical)).mean())
+    near_rows = np.abs(radii - r) <= 0.05 * r
+    if not near_rows.any():
+        return 0.0
+    near = across[near_rows].max(axis=0)
+    good = float(((near >= ON_CIRCLE_SHARE * across.max(axis=0)) & (near > 2 * typical)).sum())
+    if valid is None or valid.min() >= 1:
+        return good / n_arcs
+    # Arcs off the image don't count (but at least MIN_SHOWN of the arcs do).
+    mid = a[per_arc // 2::per_arc]
+    shown = float((_sample(valid, x + r * np.cos(mid), y + r * np.sin(mid)) >= 0.5).sum())
+    return good / max(shown, MIN_SHOWN * n_arcs)
 
 
 def _boundary_fit(gx, gy, cap, xs, ys, nx, ny) -> np.ndarray:
@@ -770,7 +853,7 @@ def shape_fits(grads, cx: float, cy: float, rods) -> dict[str, float]:
     either side of the core) and the best ellipse round the core (Elliptical),
     both searched along the rods' axis (+-6 degrees). Each is the mean capped
     gradient across its outline, over the cap (0-1), so they compare fairly."""
-    gx, gy, half, scale, typical, _ = grads
+    gx, gy, half, scale, typical = grads[:5]
     cap = EDGE_CAP * typical
     size = SYMMETRY_SIZE
     (ax, ay, ar), (bx, by, br) = rods
