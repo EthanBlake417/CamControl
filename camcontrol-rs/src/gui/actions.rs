@@ -1281,6 +1281,8 @@ impl App {
             from_camera: self.pane(id).live,
             generation: self.fiber_generation,
             circles,
+            previous: (kind == FiberKind::Live && !self.pane(id).fibers.is_empty())
+                .then(|| self.pane(id).fibers.iter().map(|f| (f.cx, f.cy, f.radius)).collect()),
             method: self.fiber.method.clone(),
             parts_centre: self.fiber.parts_centre,
             detection: self.fiber.detection.clone(),
@@ -1296,10 +1298,11 @@ impl App {
         let (tx, rx) = mpsc::channel();
         let wake = self.wake();
         let (img, circles, method, pc, det, co) = (req.image.clone(), req.circles.clone(), req.method.clone(), req.parts_centre, req.detection.clone(), req.centre_only);
+        let previous = req.previous.clone();
         std::thread::Builder::new()
             .name("fiber axes".into())
             .spawn(move || {
-                let axes = fiber_axis::analyse(&img, circles.as_deref(), &method, pc, &det, co);
+                let axes = fiber_axis::analyse_tracking(&img, circles.as_deref(), previous.as_deref(), &method, pc, &det, co);
                 let _ = tx.send(axes);
                 wake();
             })

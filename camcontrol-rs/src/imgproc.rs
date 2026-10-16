@@ -5,7 +5,7 @@
 //! Images: `RgbImage` / `GrayImage` (8-bit, from the image crate) for pixels
 //! people see, and `ImgF` (one f32 channel) for everything in between.
 
-use image::{GrayImage, Luma, Rgb, RgbImage};
+use image::{GrayImage, Rgb, RgbImage};
 
 /// One channel of f32 values, row by row.
 #[derive(Clone, Debug, PartialEq)]
@@ -95,9 +95,14 @@ impl ImgF {
 
 /// Run f(y, row) for every row of a w-wide buffer, on all cores (in bands of rows).
 pub fn par_rows<T: Send>(data: &mut [T], w: usize, f: impl Fn(usize, &mut [T]) + Sync) {
+    par_rows_min(data, w, 20_000, f);
+}
+
+/// As par_rows, splitting even small outputs (at least min_len values) when each value is a lot of work.
+pub fn par_rows_min<T: Send>(data: &mut [T], w: usize, min_len: usize, f: impl Fn(usize, &mut [T]) + Sync) {
     let h = if w == 0 { 0 } else { data.len() / w };
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16);
-    if h * w < 20_000 || threads == 1 {
+    if h * w < min_len || threads == 1 || h < 2 {
         for (y, row) in data.chunks_mut(w.max(1)).enumerate() {
             f(y, row);
         }
@@ -323,36 +328,47 @@ pub fn median_blur(src: &GrayImage, k: usize) -> GrayImage {
     let (w, h) = (src.width() as usize, src.height() as usize);
     let r = (k / 2) as isize;
     let raw = src.as_raw();
-    let half = (k * k / 2) as u32; // the median is the (half+1)-th smallest
-    let mut out = GrayImage::new(w as u32, h as u32);
-    for y in 0..h {
-        // Huang's sliding histogram along the row.
-        let mut hist = [0u32; 256];
-        let add = |hist: &mut [u32; 256], x: isize, sign: i32| {
-            for dy in -r..=r {
-                let v = raw[replicate(y as isize + dy, h) * w + replicate(x, w)] as usize;
-                hist[v] = (hist[v] as i32 + sign) as u32;
-            }
-        };
+    let half = (k * k / 2) as i32; // the median is the (half+1)-th smallest
+    let mut out = vec![0u8; w * h];
+    par_rows(&mut out, w, |y, row| {
+        // Huang's sliding histogram along the row, with the median and the
+        // count below it kept up to date (no rescan of the histogram).
+        let mut hist = [0i32; 256];
+        let (mut med, mut below) = (0usize, 0i32); // below: values < med
+        let col = |x: isize| (-r..=r).map(move |dy| raw[replicate(y as isize + dy, h) * w + replicate(x, w)] as usize);
         for dx in -r..=r {
-            add(&mut hist, dx, 1);
+            for v in col(dx) {
+                hist[v] += 1;
+            }
         }
         for x in 0..w {
             if x > 0 {
-                add(&mut hist, x as isize - 1 - r, -1);
-                add(&mut hist, x as isize + r, 1);
-            }
-            let mut seen = 0;
-            for (v, &n) in hist.iter().enumerate() {
-                seen += n;
-                if seen > half {
-                    out.put_pixel(x as u32, y as u32, Luma([v as u8]));
-                    break;
+                for v in col(x as isize - 1 - r) {
+                    hist[v] -= 1;
+                    if v < med {
+                        below -= 1;
+                    }
+                }
+                for v in col(x as isize + r) {
+                    hist[v] += 1;
+                    if v < med {
+                        below += 1;
+                    }
                 }
             }
+            // Move med so that below <= half < below + hist[med].
+            while below > half {
+                med -= 1;
+                below -= hist[med];
+            }
+            while below + hist[med] <= half {
+                below += hist[med];
+                med += 1;
+            }
+            row[x] = med as u8;
         }
-    }
-    out
+    });
+    GrayImage::from_raw(w as u32, h as u32, out).unwrap()
 }
 
 // --- thresholds and shapes ------------------------------------------------------------
@@ -1002,26 +1018,27 @@ pub fn resize_gray(src: &GrayImage, w: u32, h: u32, how: Interp) -> GrayImage {
 /// sum(T I M) / sqrt(sum((T M)^2) sum((I M)^2)) with a 0/1 mask; 0 where undefined.
 pub fn match_template_ccorr_normed(image: &ImgF, templ: &ImgF, mask: &ImgF) -> ImgF {
     let (ow, oh) = (image.w - templ.w + 1, image.h - templ.h + 1);
-    let tm: Vec<f32> = templ.data.iter().zip(&mask.data).map(|(t, m)| t * m).collect();
-    let tt: f64 = tm.iter().map(|&v| (v as f64) * (v as f64)).sum();
-    ImgF::from_fn(ow, oh, |x, y| {
-        let (mut num, mut ii) = (0f64, 0f64);
-        for ty in 0..templ.h {
-            let row = (y + ty) * image.w + x;
-            for tx in 0..templ.w {
-                let k = ty * templ.w + tx;
-                let m = mask.data[k];
-                if m == 0.0 {
-                    continue;
-                }
-                let v = (image.data[row + tx] * m) as f64;
-                num += (tm[k] as f64) * v;
+    // Only the template pixels the mask keeps: (offset in the image, template x mask, mask).
+    let used: Vec<(usize, f64, f64)> = (0..templ.data.len())
+        .filter(|&k| mask.data[k] != 0.0)
+        .map(|k| ((k / templ.w) * image.w + k % templ.w, (templ.data[k] * mask.data[k]) as f64, mask.data[k] as f64))
+        .collect();
+    let tt: f64 = used.iter().map(|u| u.1 * u.1).sum();
+    let mut out = ImgF::new(ow, oh);
+    par_rows_min(&mut out.data, ow, 1, |y, row| {
+        for (x, o) in row.iter_mut().enumerate() {
+            let base = y * image.w + x;
+            let (mut num, mut ii) = (0f64, 0f64);
+            for &(off, tm, m) in &used {
+                let v = image.data[base + off] as f64 * m;
+                num += tm * v;
                 ii += v * v;
             }
+            let den = (tt * ii).sqrt();
+            *o = if den > 0.0 { (num / den) as f32 } else { 0.0 };
         }
-        let den = (tt * ii).sqrt();
-        if den > 0.0 { (num / den) as f32 } else { 0.0 }
-    })
+    });
+    out
 }
 
 // --- statistics ---------------------------------------------------------------------
@@ -1104,6 +1121,7 @@ pub fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Option<Vec<f64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::Luma;
 
     #[test]
     fn gaussian_kernels_match_opencv() {

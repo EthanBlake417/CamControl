@@ -21,7 +21,12 @@ Everything the Python app's README describes (shortcuts are the same):
 
 - **Stitching** uses its own feature matcher (FAST corners, oriented binary descriptors, RANSAC) instead of OpenCV's Stitcher: "scans" fits shift + rotation + scale, "panorama" a perspective (homography), blended with feathered edges. Results can differ slightly from OpenCV's.
 - **MP4 videos** are H.264. The Python app's MP4s use the older MPEG-4 Part 2 ("mp4v") codec, which this version can't play (its AVIs play fine).
-- **Fiber axis** results match the Python app's to a median 0.016° (worst 1.9°) over 69 test fibers, including the real photos (within 0.06°, same types). One fix: Python crashes on a plain disc with no rods (the rod radius goes negative); here it doesn't.
+- **Fiber axis** results match the Python app's to a median 0.016° (worst 1.9°) over 69 test fibers, including the real photos (within 0.06°, same types). Improvements over the Python app:
+  - Rods running off the image (fibers at the frame's edge, as in V-groove photos) are scored over the part of their outline that shows, so the rod inside the frame doesn't lose to a wrong circle.
+  - A clearly visible core spot breaks near-ties between rod pairs (the rods sit either side of it); it never overrules a clear winner, so a speck of dirt taken for the core does no harm.
+  - Update live follows the fibers from frame to frame (re-fitting each cladding edge) instead of searching the whole image every time: about 3x more updates a second.
+  - Several fibers in one image are measured at once; about 1.7x faster than before on a three-fiber photo, and faster than the Python app.
+  - Python crashes on a plain disc with no rods (the rod radius goes negative); here it doesn't.
 - The default output folder is `Pictures\CamControl` (the program's own folder may not be writable). Settings are kept by the window system's app storage, not QSettings.
 
 ## Build
@@ -49,12 +54,12 @@ The result is `target/release/camcontrol`. It runs on X11 and Wayland; file dial
 cargo test --release
 ```
 
-52 tests, about 5 s, no camera needed, nothing written outside a temporary folder:
+54 tests, about 5 s, no camera needed, nothing written outside a temporary folder:
 
 - image operations against OpenCV's behaviour, every processing tool, measurement maths, exports, settings files, video write/read/seek;
 - the window itself, driven by egui's test harness: opening images, Find axes, measuring by clicking, counting, views and layouts, processing, the clear-measurements question, settings files; and with a pretend camera: live view, capture, the exposure slider (including long exposures), video recording, time-lapse with its video, live fiber axes, moving a camera to another view.
 
-`cargo run --release --example fiber_compare -- <folder>` compares fiber results with the Python app's on images and a `cases.json` written by a Python script; `cargo run --example probe` lists cameras, opens the first and saves one frame.
+`cargo run --release --example fiber_compare -- <folder>` compares fiber results with the Python app's on images and a `cases.json` written by a Python script; `cargo run --example probe` lists cameras, opens the first and saves one frame; `cargo run --release --example fiber_one -- <image> [method] [--centre]` measures one image with timings (`FIBER_OUT=<png>` draws the result).
 
 Environment variables for testing: `CAMCONTROL_FAKE_CAMERA=1` adds a pretend camera ("Fake camera": a turning Panda fiber at 25 fps, with the MC802's controls), `CAMCONTROL_NO_CAMERAS=1` hides the real ones, `CAMCONTROL_TEST_FOLDER=<dir>` starts with that output folder.
 

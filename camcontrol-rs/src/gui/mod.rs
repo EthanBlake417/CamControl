@@ -158,6 +158,8 @@ struct FiberRequest {
     from_camera: bool,
     generation: u64,
     circles: Option<Vec<(f64, f64, f64)>>,
+    /// Live frames: the fibers measured last, to follow instead of searching again.
+    previous: Option<Vec<(f64, f64, f64)>>,
     method: String,
     parts_centre: bool,
     detection: Detection,
@@ -275,6 +277,7 @@ impl App {
         };
         let mut gallery = Gallery::new(wake.clone());
         gallery.count = saved.gallery_count.clamp(1, 500);
+        std::thread::spawn(crate::processing::fiber_axis::warm_up); // the first Find axes needn't wait
         let mut app = Self {
             panes: Vec::new(),
             active: 0,
