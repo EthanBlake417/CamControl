@@ -335,7 +335,7 @@ fn records_the_fiber_axes_on_the_video() {
     let axis = crate::processing::fiber_axis::FiberAxis {
         cx: 320.0, cy: 240.0, radius: 120.0, slow_deg: 5.0, elongation: 0.5, fiber_type: "Panda".into(), n_parts: 2,
         method: "rods".into(), axis_x: None, axis_y: None, parts: Vec::new(), part_centres: Vec::new(), threshold: 0.0,
-        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None,
+        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None, centre_brightness: None,
     };
     t.state_mut().active_pane_mut().fibers = vec![axis];
     t.state_mut().request_recording(true);
@@ -407,6 +407,43 @@ fn live_fiber_axes_and_moving_the_camera() {
     wait(&mut t, "frames in the new view", |a| a.pane(second).image().is_some());
 }
 
+/// Three Panda fibers in a row (as in a V-groove), the middle one with light in its core.
+fn three_fibers(path: &PathBuf) {
+    let mut img = RgbImage::from_pixel(960, 340, Rgb([25, 25, 25]));
+    for (k, x) in [160i64, 480, 800].into_iter().enumerate() {
+        draw::fill_circle_px(&mut img, x, 170, 140, [170, 190, 210]);
+        for s in [-1i64, 1] {
+            draw::fill_circle_px(&mut img, x + s * 70, 170, 32, [40, 100, 170]);
+        }
+        let core = if k == 1 { 255 } else { 200 };
+        draw::fill_circle_px(&mut img, x, 170, 7, [core, core, core]);
+    }
+    img.save(path).unwrap();
+}
+
+#[test]
+fn brightest_centre_histogram_and_fiber_crosshair() {
+    let (mut h, dir) = harness("brightest");
+    let path = dir.join("three.png");
+    three_fibers(&path);
+    open(&mut h, &path);
+    h.state_mut().saved.crosshair = true;
+    h.state_mut().saved.crosshair_style.anchor = "fiber".into();
+    h.state_mut().fiber.long_lines = true;
+    h.state_mut().find_fiber_axes(false);
+    wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
+    let lines = super::annotate::fiber_readout_lines(&h.state().active_pane().fibers);
+    assert_eq!(lines.last().unwrap(), "Brightest centre: position 2 from right (fiber 2)", "{lines:?}");
+    h.press_key_modifiers(Modifiers::COMMAND, Key::Num7);
+    h.run_ok();
+    assert!(h.state().panels.is_open(PanelId::Histogram));
+    let c = h.state().histogram.counts().expect("the open image counted");
+    assert_eq!(c[0].iter().sum::<u64>(), 960 * 340);
+    h.get_by_label("Logarithmic").click();
+    h.run_ok();
+    assert!(h.state().histogram.log);
+}
+
 /// Pictures of the window, rendered offscreen (no screen capture), for checking
 /// the layout by eye: `CAMCONTROL_SHOTS=<dir> cargo test --release --lib render_shots -- --ignored`
 #[test]
@@ -447,4 +484,20 @@ fn render_shots() {
     t.state_mut().panels.set_open(PanelId::Measurements, true);
     t.state_mut().saved.capture_tab = 1;
     shot(&mut t, "4_measure_video");
+    let three = dir.join("three.png");
+    three_fibers(&three);
+    let id = t.state().active;
+    let ctx = t.state().ctx.clone();
+    t.state_mut().set_layout("single", true);
+    t.state_mut().perform(&ctx, Action::OpenImage(id, three));
+    t.state_mut().saved.crosshair = true;
+    t.state_mut().saved.crosshair_style.anchor = "fiber".into();
+    t.state_mut().fiber.long_lines = true;
+    t.state_mut().find_fiber_axes(false);
+    wait(&mut t, "fiber axes", |a| a.active_pane().fibers.len() == 3);
+    t.state_mut().panels.set_open(PanelId::Histogram, true);
+    t.state_mut().histogram.log = true;
+    shot(&mut t, "5_brightest_histogram");
+    t.state_mut().panels.set_open(PanelId::Fiber, true);
+    shot(&mut t, "6_fiber_panel");
 }

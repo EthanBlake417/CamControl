@@ -19,8 +19,8 @@ fn main() {
     let found = analyse(&img, None, method, false, &Detection::default(), centre);
     println!("analyse ({method}): {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
     for f in &found {
-        println!("  ({:.1}, {:.1}) r {:.1}: {} slow {:.2} clear {} quality {:?} coverage {:?} turned {:?}",
-                 f.cx, f.cy, f.radius, f.fiber_type, f.slow_deg, f.clear(), f.quality, f.coverage, f.turned_gain);
+        println!("  ({:.1}, {:.1}) r {:.1}: {} slow {:.2} clear {} quality {:?} coverage {:?} turned {:?} centre brightness {:?}",
+                 f.cx, f.cy, f.radius, f.fiber_type, f.slow_deg, f.clear(), f.quality, f.coverage, f.turned_gain, f.centre_brightness);
     }
     // A live update: following the fibers just found (as Update live does).
     let previous: Vec<(f64, f64, f64)> = found.iter().map(|f| (f.cx, f.cy, f.radius)).collect();
@@ -29,7 +29,7 @@ fn main() {
     println!("live update (following): {:.0} ms, angles {:?}", t.elapsed().as_secs_f64() * 1000.0,
              followed.iter().map(|f| format!("{:.2}", f.slow_deg)).collect::<Vec<_>>());
     if let Some(out) = std::env::var_os("FIBER_OUT") {
-        camcontrol::gui::annotate::render_fiber_axes(&img, &found, true).save(out).unwrap();
+        camcontrol::gui::annotate::render_fiber_axes(&img, &found, camcontrol::gui::annotate::FiberDrawing { show_parts: true, long_lines: false }).save(out).unwrap();
     }
 }
 

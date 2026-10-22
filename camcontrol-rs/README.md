@@ -12,7 +12,12 @@ Everything the Python app's README describes (shortcuts are the same):
 - **Views**: several at once (Single, Side by side, Stacked, Grid), each with its own camera, image, video or result; Link views; Source menu; Save all as one image; several cameras live at once.
 - **Capture**: frame averaging, native or HD2-size (1.7x bicubic) save, TIFF/PNG, numbered names (`name-001.tif`, ...), `.json` sidecar with the same keys; Link views captures from every camera (`_view1`, `_view2`).
 - **Video** (MP4 H.264 or AVI Motion JPEG, real-time frame slots, Stop after) and **time-lapse** (fixed schedule, optional video at the end). Playback bar with frame steps and seeking.
-- **Measurements** (line, polyline, circle 3 pt / centre, angle, rectangle, polygon) with the table and Excel/CSV export plus image and annotated image; **Counting** (5 classes); **Fiber axis** (all five methods, Update live, detection settings, export; angles read out in green in the view's top-left corner; videos can be recorded with the axes drawn on).
+- **Measurements** (line, polyline, circle 3 pt / centre, angle, rectangle, polygon) with the table and Excel/CSV export plus image and annotated image; **Counting** (5 classes); **Fiber axis** (all five methods, Update live, detection settings, export; angles read out in big green letters in the view's top-left corner; videos can be recorded with the axes drawn on). Rust-only extras, still to add to the Python app:
+  - **Smallest rod** (Fiber axis panel, % of the fiber radius, default 18% = every size tried): Panda rod outlines smaller than this are never considered, so dust, bubbles or the core can't be outlined instead of a rod.
+  - **Axis lines across the view**: each fiber's axis lines carried on, thinner, to the edges of the view (and of exports and videos), to compare with the crosshair, the grid or lines in the image.
+  - **Crosshair on the fiber**: View > Overlay settings > Crosshair > Centre: "Fiber centre" puts the crosshair on the selected fiber (else fiber 1), with its lines across the whole view.
+  - **Brightest centre**: each fiber's centre brightness (0-255: the brightest spot within 15% of the radius of its centre, 3x3 px or 2% of the radius averaged, so one hot pixel doesn't count) is in the table and the export. With two or more fibers the brightest is ringed in green and the readout adds "Brightest centre: position N from right (fiber k)" (position 1 = rightmost; fibers are numbered left to right).
+- **Histogram** panel (Ctrl+7, Rust only): the share of the active view's pixels at each brightness 0-255 (luma), as a percentage or **Logarithmic** (log10 of the percentage); optionally red, green and blue; mean, lowest, highest and the share at 0 and 255 (clipped); hover for a value's numbers; Save... writes each value's percentage and log10 per channel to Excel or CSV. Live views are recounted up to 5 times a second.
 - **Processing**: flat-field (live and captures, or the image in a view), focus stack (ECC alignment), HDR (AlignMTB + Mertens, OpenCV's defaults), stitching (scans or panorama), fluorescence composites.
 - **Captures panel** with background thumbnails, keyboard stepping, right-click tools, delete to the Recycle Bin; grid and crosshair with their settings window; PyCharm-style panel stripes (drag a button to another edge); **settings files** in the Python app's format (files work in both).
 - Command line: `camcontrol [--index N] [files...]` (camera N in the first view; files open, more than one in new views).
@@ -54,7 +59,7 @@ The result is `target/release/camcontrol`. It runs on X11 and Wayland; file dial
 cargo test --release
 ```
 
-54 tests, about 5 s, no camera needed, nothing written outside a temporary folder:
+63 tests, about 6 s, no camera needed, nothing written outside a temporary folder:
 
 - image operations against OpenCV's behaviour, every processing tool, measurement maths, exports, settings files, video write/read/seek;
 - the window itself, driven by egui's test harness: opening images, Find axes, measuring by clicking, counting, views and layouts, processing, the clear-measurements question, settings files; and with a pretend camera: live view, capture, the exposure slider (including long exposures), video recording, time-lapse with its video, live fiber axes, moving a camera to another view.

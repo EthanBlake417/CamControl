@@ -22,7 +22,7 @@ use serde_json::{json, Map, Value};
 
 use super::{Camera, DeviceKey, Mode, Range, EXPOSURE_US};
 use crate::capture::{self, CaptureOptions};
-use crate::gui::annotate::render_fiber_axes;
+use crate::gui::annotate::{render_fiber_axes, FiberDrawing};
 use crate::gui::view::texture_tiles;
 use crate::processing::fiber_axis::FiberAxis;
 use crate::processing::flatfield::FlatField;
@@ -91,7 +91,7 @@ pub enum Cmd {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RecordOverlay {
     pub axes: Vec<FiberAxis>,
-    pub show_parts: bool,
+    pub drawing: FiberDrawing,
 }
 
 #[derive(Clone, Debug)]
@@ -294,7 +294,7 @@ impl Thread {
     }
 
     fn record(&mut self, frame: &RgbImage) {
-        let drawn = self.overlay.as_ref().filter(|o| !o.axes.is_empty()).map(|o| render_fiber_axes(frame, &o.axes, o.show_parts));
+        let drawn = self.overlay.as_ref().filter(|o| !o.axes.is_empty()).map(|o| render_fiber_axes(frame, &o.axes, o.drawing));
         let rec = self.recorder.as_mut().unwrap();
         if let Err(e) = rec.add(drawn.as_ref().unwrap_or(frame)) {
             self.send(Ev::Error(format!("Recording failed: {e}")));

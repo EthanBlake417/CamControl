@@ -47,7 +47,7 @@ pub(crate) fn with_ext(path: PathBuf, allowed: &[&str], default_ext: &str) -> Pa
 
 const FIBER_HEADERS: &[&str] = &["#", "Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity", "Method", "Clear",
                                  "Threshold (noise x)", "Rod outline found", "Centre x (px)", "Centre y (px)", "Axis x (px)",
-                                 "Axis y (px)", "Diameter (px)", "Image"];
+                                 "Axis y (px)", "Diameter (px)", "Centre brightness (0-255)", "Image"];
 
 fn fiber_row(i: usize, f: &FiberAxis, source: &str) -> Vec<Cell> {
     let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
@@ -64,6 +64,7 @@ fn fiber_row(i: usize, f: &FiberAxis, source: &str) -> Vec<Cell> {
         if f.method == "rods" { Cell::Empty } else { r2(f.threshold) },
         f.coverage.map(|c| Cell::Num((c * 1000.0).round() / 1000.0)).unwrap_or(Cell::Empty),
         r1(f.cx), r1(f.cy), r1(ax), r1(ay), r1(2.0 * f.radius),
+        f.centre_brightness.map(r1).unwrap_or(Cell::Empty),
         Cell::Text(source.into()),
     ]
 }
@@ -1260,7 +1261,7 @@ impl App {
         let (ip, dp) = (Self::beside(&path, "image"), Self::beside(&path, "axes"));
         let r = export::write_tables(&[sheet], &path, false)
             .and_then(|_| image.save(&ip).map_err(|e| e.to_string()))
-            .and_then(|_| super::annotate::render_fiber_axes(&image, &axes, self.fiber.show_parts).save(&dp).map_err(|e| e.to_string()));
+            .and_then(|_| super::annotate::render_fiber_axes(&image, &axes, self.fiber.drawing()).save(&dp).map_err(|e| e.to_string()));
         match r {
             Ok(()) => self.message(format!("Exported {} fibers to {}, {} and {}", axes.len(), file_name(&path), file_name(&ip), file_name(&dp)), Some(8.0)),
             Err(e) => self.warn("Export fiber axes", format!("Export failed: {e}")),
@@ -1427,13 +1428,13 @@ impl App {
         let pane = &self.panes[i];
         let Some(link) = pane.camera.as_ref() else { return };
         let on = link.recording && pane.live && self.saved.recording.draw_analysis && !pane.fibers.is_empty();
-        let show_parts = self.fiber.show_parts;
+        let drawing = self.fiber.drawing();
         let same = match &link.overlay_sent {
             None => !on,
-            Some(o) => on && o.show_parts == show_parts && o.axes == pane.fibers,
+            Some(o) => on && o.drawing == drawing && o.axes == pane.fibers,
         };
         if !same {
-            let want = on.then(|| RecordOverlay { axes: pane.fibers.clone(), show_parts });
+            let want = on.then(|| RecordOverlay { axes: pane.fibers.clone(), drawing });
             let link = self.panes[i].camera.as_mut().unwrap();
             link.send(Cmd::RecordOverlay(want.clone()));
             link.overlay_sent = want;

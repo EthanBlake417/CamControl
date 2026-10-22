@@ -177,7 +177,7 @@ pub struct Overlays<'a> {
     pub counter: Option<&'a Counter>,
     pub fibers: &'a [FiberAxis],
     pub fiber_selected: Option<usize>,
-    pub show_parts: bool,
+    pub fiber_drawing: annotate::FiberDrawing,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -576,16 +576,22 @@ impl ImageView {
             annotate::draw_marks(&mut canvas, counter, &to_screen, MARK_RADIUS_PX);
         }
         if !overlays.fibers.is_empty() {
-            annotate::draw_fiber_axes(&mut canvas, overlays.fibers, &to_screen, zoom as f64, &style, overlays.fiber_selected, overlays.show_parts);
+            let reach = rect.width() + rect.height(); // long lines run off the view
+            annotate::draw_fiber_axes(&mut canvas, overlays.fibers, &to_screen, zoom as f64, &style, overlays.fiber_selected, overlays.fiber_drawing, reach);
         }
         if let Some(c) = overlays.crosshair {
-            let area = if c.anchor == "window" {
-                rect
+            // On a fiber: its centre, with the lines across the whole view to compare with its axes.
+            let fiber = if c.anchor == "fiber" { overlays.fibers.get(overlays.fiber_selected.unwrap_or(0)) } else { None };
+            let (area, mid) = if let Some(f) = fiber {
+                let p = to_screen(f.cx, f.cy);
+                (rect, Pos2::new(p.0, p.1))
+            } else if c.anchor == "window" {
+                (rect, rect.center())
             } else {
                 let (a, b) = (to_screen(0.0, 0.0), to_screen(iw as f64, ih as f64));
-                Rect::from_min_max(Pos2::new(a.0, a.1), Pos2::new(b.0, b.1))
+                let area = Rect::from_min_max(Pos2::new(a.0, a.1), Pos2::new(b.0, b.1));
+                (area, area.center())
             };
-            let mid = area.center();
             let (col, w, d) = (c.rgba(), c.width as f32, c.dash());
             canvas.line((mid.x, area.top()), (mid.x, area.bottom()), col, w, d);
             canvas.line((area.left(), mid.y), (area.right(), mid.y), col, w, d);
@@ -594,7 +600,7 @@ impl ImageView {
             }
         }
         // The angles stay in the view's top-left corner, whatever the zoom.
-        annotate::draw_fiber_readout(&mut canvas, overlays.fibers, (rect.left() + 8.0, rect.top() + 8.0), style.font_px + 2.0);
+        annotate::draw_fiber_readout(&mut canvas, overlays.fibers, (rect.left() + 8.0, rect.top() + 8.0), annotate::READOUT_PX);
 
         self.mouse = over.map(|p| self.to_image(p));
         self.hover = over.and_then(|cursor| {

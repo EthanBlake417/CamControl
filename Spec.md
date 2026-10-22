@@ -59,6 +59,8 @@ Cameras it's for: the O.C. White Ultra-Cam II (Windows name "MC802 USB2.0 Camera
 | DISP-2 | Status bar: pixel position and RGB/value under the mouse, zoom, image size, frame rate, and what the active view shows. | Done | Manual |
 | OVL-1 | Grid overlay on every view: columns and rows, or square cells; line width, style, color, opacity; same on-screen width at any zoom. | Done | `test_parts.py`, `test_views.py` |
 | OVL-2 | Crosshair overlay on every view: on the image centre or the window centre; ring size; line width, style, color, opacity. | Done | `test_parts.py`, `test_views.py` |
+| OVL-4 | Crosshair centre "Fiber centre": on the selected fiber (else fiber 1), lines across the whole view; image centre when there are no fibers. Saved as `"anchor": "fiber"` (the Python app must accept it, or it falls back to the image centre). | Rust only | `cargo test` |
+| OVL-5 | Histogram panel (Ctrl+7): % of the active view's pixels at each brightness 0-255 (luma), linear or log10; optional R, G, B; mean, lowest, highest, share at 0 and 255; Save as Excel/CSV (value, % and log10(%) per channel). Live views recounted up to 5 times a second. | Rust only | `cargo test` |
 | OVL-3 | Overlay settings window stays open and the overlays follow as it's changed; settings remembered and in settings files. | Done | `test_views.py` |
 
 ## 6. Capture and output
@@ -118,7 +120,10 @@ Cameras it's for: the O.C. White Ultra-Cam II (Windows name "MC802 USB2.0 Camera
 | FIB-6 | Real end faces: ETN3000 photos within 0.6° of the reference; the 36879B bow-tie TIFs measured as Bow-tie. | Done | `test_processing.py` (when the files are present) |
 | FIB-7 | Update live: re-measures live views about 3 times a second (taking turns between views) and each image as it's opened. | Hardware? | `test_views.py` (fake cameras) |
 | FIB-8 | Show stress parts (shaded outlines, centres, pivot); export table, image and a drawn copy. | Done | Manual |
-| FIB-9 | Angle readout in green in the top-left corner of each view (and of the drawn copy): one line per fiber, "1: slow axis +0.5°", "(unclear)" when unsure; each fiber is tagged with just its number. | Rust only | `cargo test`, Manual |
+| FIB-9 | Angle readout in big green letters (26 px on screen; scaled with the image on the drawn copy and videos) in the top-left corner of each view: one line per fiber, "1: slow axis +0.5°", "(unclear)" when unsure; each fiber is tagged with just its number. | Rust only | `cargo test`, Manual |
+| FIB-10 | Smallest rod (% of the fiber radius, 18-40, default 18 = unchanged): Panda rod outlines smaller than this aren't considered. Saved in the fiber detection settings as `min_rod`. | Rust only | `cargo test` |
+| FIB-11 | "Axis lines across the view": axis lines carried on, thinner, to the view's edges (and the drawn copy's, and videos'), to compare with the crosshair, grid or lines in the image. | Rust only | `cargo test`, Manual |
+| FIB-12 | Brightest centre: each fiber's centre brightness (brightest small-box average within 15% of the radius of the centre) in the table and export; with 2+ fibers the brightest is ringed in green and the readout adds "Brightest centre: position N from right (fiber k)". | Rust only | `cargo test` (synthetic + the real V-groove photo by eye) |
 
 ## 12. Processing
 
@@ -143,7 +148,7 @@ Cameras it's for: the O.C. White Ultra-Cam II (Windows name "MC802 USB2.0 Camera
 
 | ID | Requirement | Status | Verified by |
 |---|---|---|---|
-| UI-1 | Panels (Controls, Captures, Measurements, Counting, Fiber axis) on edge stripes like PyCharm: one open per edge, minimize, drag to another edge; Ctrl+1..5. | Done | Manual |
+| UI-1 | Panels (Controls, Captures, Measurements, Counting, Fiber axis; Rust also Fiber log, Histogram) on edge stripes like PyCharm: one open per edge, minimize, drag to another edge; Ctrl+1..5 (Rust: ..7). | Done | Manual |
 | UI-2 | Keyboard shortcuts as listed in the README. | Done | Manual |
 | UI-3 | Help → About: what the app does, the GET logo, "Made by Ethan Blake at Grid Evolution Technologies." | Done | Manual |
 | UI-4 | Window and taskbar icon (GET logo). | Hardware? | Manual (taskbar icon not confirmed) |

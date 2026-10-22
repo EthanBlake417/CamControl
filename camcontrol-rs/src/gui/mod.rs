@@ -10,7 +10,7 @@
 //!     Ctrl+O      open an image or video   Ctrl+S  save the active view's image
 //!     Ctrl+E      export measurements      Ctrl+Shift+S  save settings
 //!     Ctrl+K      one view / several views Ctrl+Shift+K  add a view
-//!     Ctrl+1..5   show / hide Controls / Measurements / Captures / Counting / Fiber axis
+//!     Ctrl+1..7   show / hide Controls / Measurements / Captures / Counting / Fiber axis / Fiber log / Histogram
 //!     Ctrl+Q      quit
 //!
 //! Each view has its own source, live/frozen state, measurements, counting
@@ -24,6 +24,7 @@ pub mod annotate;
 mod dialogs;
 mod fiber_log;
 mod gallery;
+mod histogram;
 mod panels;
 mod player;
 mod settings;
@@ -172,12 +173,19 @@ pub struct FiberSettings {
     pub method: String,
     pub parts_centre: bool,
     pub show_parts: bool,
+    pub long_lines: bool,
     pub centre_only: bool,
     pub use_circles: bool,
     pub advanced: bool,
     pub detection: Detection,
     /// The automatic threshold last measured (shown when Auto is on).
     pub shown_threshold: f64,
+}
+
+impl FiberSettings {
+    pub fn drawing(&self) -> annotate::FiberDrawing {
+        annotate::FiberDrawing { show_parts: self.show_parts, long_lines: self.long_lines }
+    }
 }
 
 pub struct App {
@@ -204,6 +212,7 @@ pub struct App {
     pub(crate) class_names: Vec<String>,
     pub(crate) fiber: FiberSettings,
     pub(crate) fiber_log: fiber_log::FiberLog,
+    pub(crate) histogram: histogram::Histogram,
     fiber_job: Option<(FiberRequest, Receiver<Vec<FiberAxis>>)>,
     fiber_waiting: Vec<FiberRequest>,
     fiber_generation: u64,
@@ -271,6 +280,7 @@ impl App {
             method: saved.fiber_method.clone(),
             parts_centre: saved.fiber_parts_centre,
             show_parts: saved.fiber_show_parts,
+            long_lines: saved.fiber_long_lines,
             centre_only: saved.fiber_centre_only,
             use_circles: true,
             advanced: saved.fiber_advanced,
@@ -282,6 +292,7 @@ impl App {
         std::thread::spawn(crate::processing::fiber_axis::warm_up); // the first Find axes needn't wait
         let mut app = Self {
             fiber_log: Default::default(),
+            histogram: histogram::Histogram::new(saved.histogram_log, saved.histogram_colors),
             panes: Vec::new(),
             active: 0,
             controlled: None,
@@ -450,7 +461,7 @@ impl App {
             self.active_pane_mut().view.zoom_out();
         }
         for id in PanelId::ALL {
-            let key = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6][id.shortcut() - 1];
+            let key = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7][id.shortcut() - 1];
             if consume(&KeyboardShortcut::new(Modifiers::COMMAND, key)) {
                 self.panels.toggle(id);
             }
@@ -751,6 +762,7 @@ impl App {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.fiber_panel(ui));
             }
             PanelId::FiberLog => self.fiber_log_panel(ui),
+            PanelId::Histogram => self.histogram_panel(ui),
         }
     }
 
@@ -833,7 +845,7 @@ impl App {
             let grid = self.saved.grid.then_some(&self.saved.grid_style);
             let crosshair = self.saved.crosshair.then_some(&self.saved.crosshair_style);
             let active = self.active;
-            let (cal, show_parts) = (&self.calibration, self.fiber.show_parts);
+            let (cal, fiber_drawing) = (&self.calibration, self.fiber.drawing());
             let idx = self.panes.iter().position(|p| p.id == *id).unwrap();
             let pane = &mut self.panes[idx];
             let overlays = Overlays {
@@ -845,7 +857,7 @@ impl App {
                 counter: Some(&pane.counter),
                 fibers: &pane.fibers,
                 fiber_selected: pane.fiber_selected,
-                show_parts,
+                fiber_drawing,
             };
             let ev = pane.view.show(&mut cell, &overlays, keys_ok && pane.id == active);
             if pane.view.moved {
@@ -1005,6 +1017,9 @@ impl App {
         self.saved.fiber_centre_only = self.fiber.centre_only;
         self.saved.fiber_parts_centre = self.fiber.parts_centre;
         self.saved.fiber_show_parts = self.fiber.show_parts;
+        self.saved.fiber_long_lines = self.fiber.long_lines;
+        self.saved.histogram_log = self.histogram.log;
+        self.saved.histogram_colors = self.histogram.colors;
         self.saved.fiber_detection = self.fiber.detection.clone();
     }
 }

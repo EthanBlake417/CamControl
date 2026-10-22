@@ -30,6 +30,8 @@ const FIT_SAMPLES: f64 = 40000.0;
 const ROD_SEARCH_EDGE: f64 = 0.94;
 const ROD_MAX_REACH: f64 = 0.92;
 const ROD_SIZES: (f64, f64) = (0.18, 0.42);
+pub const DEFAULT_MIN_ROD: f64 = 18.0; // % of the radius: ROD_SIZES.0, i.e. every size searched
+pub const MAX_MIN_ROD: f64 = 40.0;
 const ROD_SPACINGS: (f64, f64) = (0.30, 0.72);
 const EDGE_CAP: f32 = 4.0;
 const GRADIENT_FLOOR: f32 = 0.5;
@@ -82,11 +84,14 @@ pub struct Detection {
     pub look_at: String,
     /// Smaller regions are specks: side of a square, % of the radius.
     pub min_size: f64,
+    /// Panda rod outlines: smallest rod radius considered, % of the fiber radius
+    /// (smaller round things, such as dust or the core, are never taken for a rod).
+    pub min_rod: f64,
 }
 
 impl Default for Detection {
     fn default() -> Self {
-        Self { threshold: None, smoothing: 1.0, look_at: "both".into(), min_size: 8.0 }
+        Self { threshold: None, smoothing: 1.0, look_at: "both".into(), min_size: 8.0, min_rod: DEFAULT_MIN_ROD }
     }
 }
 
@@ -109,6 +114,8 @@ pub struct FiberAxis {
     pub coverage: Option<f64>,
     pub rod_radii: Vec<f64>,
     pub turned_gain: Option<f64>,
+    /// Brightness (0-255) of the brightest spot near the centre (light in the core), see centre_brightness.
+    pub centre_brightness: Option<f64>,
 }
 
 impl FiberAxis {
@@ -131,6 +138,7 @@ impl FiberAxis {
             coverage: None,
             rod_radii: Vec::new(),
             turned_gain: None,
+            centre_brightness: None,
         }
     }
 
@@ -1017,13 +1025,17 @@ fn ring_maps(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, radii: &[f64], sample
 
 /// Step 1 of find_rods: the best different rod pairs (and the best about the
 /// centre), and the quality (the best pair's score over a typical pair's).
-fn coarse_pairs(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, half: usize, n: usize, core: Option<(f64, f64)>) -> (Vec<Pair>, f64) {
+fn coarse_pairs(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, half: usize, n: usize, core: Option<(f64, f64)>, min_r: f64)
+                -> (Vec<Pair>, f64) {
     let size = SYMMETRY_SIZE;
     let g = pair_grid(half);
     let maps = ring_maps(gx, gy, valid, cap, &g.sizes, 64, g.box_);
     let n_off = g.ox.len();
     let score: Vec<f32> = (0..g.inside.len())
-        .map(|k| if g.inside[k] { maps[g.first[k]].min(maps[g.second[k]]) } else { 0.0 })
+        .map(|k| {
+            let big_enough = g.sizes[g.radii[k / n_off]] >= min_r - 1e-9; // rods below the smallest size aren't tried
+            if g.inside[k] && big_enough { maps[g.first[k]].min(maps[g.second[k]]) } else { 0.0 }
+        })
         .collect();
     let centred = (0..n_off).min_by(|&a, &b| g.ox[a].hypot(g.oy[a]).partial_cmp(&g.ox[b].hypot(g.oy[b])).unwrap()).unwrap();
     let centred_scores: Vec<f32> = (0..g.angles.len())
@@ -1074,15 +1086,15 @@ fn coarse_pairs(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, half: usize, n: us
 }
 
 /// Step 2 of find_rods: each pair moved to where its outlines follow the edges best, in ever finer steps.
-fn refine_pairs(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, pairs: &[Pair]) -> Vec<Pair> {
+fn refine_pairs(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, pairs: &[Pair], min_r: f64) -> Vec<Pair> {
     // Each pair on its own path, so all at once.
     std::thread::scope(|s| {
-        let jobs: Vec<_> = pairs.iter().map(|&p| s.spawn(move || refine_pair(gx, gy, valid, cap, p))).collect();
+        let jobs: Vec<_> = pairs.iter().map(|&p| s.spawn(move || refine_pair(gx, gy, valid, cap, p, min_r))).collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     })
 }
 
-fn refine_pair(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, mut pair: Pair) -> Pair {
+fn refine_pair(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, mut pair: Pair, min_r: f64) -> Pair {
     let mut steps = [2.0, 2.0, 1f64.to_radians(), 2.0, 2.0];
     for _ in 0..6 {
         for _ in 0..10 {
@@ -1092,7 +1104,7 @@ fn refine_pair(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, mut pair: Pair) -> 
                 for d in -2..=2 {
                     let mut t = pair;
                     t[k] += d as f64 * steps[k];
-                    t[4] = t[4].max(2.0); // no edges at all (a plain disc) can shrink a rod to nothing
+                    t[4] = t[4].max(2.0).max(min_r); // no edges at all (a plain disc) can shrink a rod to nothing
                     let s = pair_score((gx, gy), valid, cap, &t, 128, true, true);
                     if s > best.0 {
                         best = (s, t);
@@ -1117,18 +1129,21 @@ pub fn warm_up() {
 
 /// Panda stress rods of the fiber: ([(x, y, r), (x, y, r)] in image pixels, quality, coverage).
 pub fn find_rods(image: &RgbImage, cx: f64, cy: f64, radius: f64) -> (Vec<(f64, f64, f64)>, f64, f64) {
-    let r = find_rods_in(&rod_gradients(image, cx, cy, radius), cx, cy);
+    let r = find_rods_in(&rod_gradients(image, cx, cy, radius), cx, cy, DEFAULT_MIN_ROD);
     (r.0, r.1, r.2)
 }
 
-fn find_rods_in(g: &Grads, cx: f64, cy: f64) -> (Vec<(f64, f64, f64)>, f64, f64, Option<f64>) {
+/// min_rod: smallest rod radius tried, % of the fiber radius.
+fn find_rods_in(g: &Grads, cx: f64, cy: f64, min_rod: f64) -> (Vec<(f64, f64, f64)>, f64, f64, Option<f64>) {
     let cap = EDGE_CAP * g.typical;
+    // At the search scale; the default leaves the search exactly as it was (refining may go below 18%).
+    let min_r = if min_rod > DEFAULT_MIN_ROD { min_rod.min(MAX_MIN_ROD) / 100.0 * SYMMETRY_SIZE } else { 0.0 };
     let clean_gx = ImgF { data: g.gx.data.iter().zip(&g.dirt.data).map(|(&v, &d)| if d { 0.0 } else { v }).collect(), ..g.gx.clone() };
     let clean_gy = ImgF { data: g.gy.data.iter().zip(&g.dirt.data).map(|(&v, &d)| if d { 0.0 } else { v }).collect(), ..g.gy.clone() };
     // Both coarse searches at once.
     let ((clean_starts, clean_q), (plain_starts, plain_q)) = std::thread::scope(|s| {
-        let a = s.spawn(|| coarse_pairs(&clean_gx, &clean_gy, &g.valid, cap, g.half, ROD_STARTS, g.core));
-        let b = coarse_pairs(&g.gx, &g.gy, &g.valid, cap, g.half, ROD_STARTS, g.core);
+        let a = s.spawn(|| coarse_pairs(&clean_gx, &clean_gy, &g.valid, cap, g.half, ROD_STARTS, g.core, min_r));
+        let b = coarse_pairs(&g.gx, &g.gy, &g.valid, cap, g.half, ROD_STARTS, g.core, min_r);
         (a.join().unwrap(), b)
     });
     let mut tried: Vec<Pair> = Vec::new();
@@ -1141,7 +1156,7 @@ fn find_rods_in(g: &Grads, cx: f64, cy: f64) -> (Vec<(f64, f64, f64)>, f64, f64,
             }
         }
     }
-    let refined = refine_pairs(&g.gx, &g.gy, &g.valid, cap, &tried);
+    let refined = refine_pairs(&g.gx, &g.gy, &g.valid, cap, &tried, min_r);
     // Each pair's rank: how well its outlines follow edges, times how much of them shows.
     let mut ranked: Vec<(f32, f64, Pair, [(f64, f64); 2])> = Vec::new();
     for (p, &quality) in refined.iter().zip(&qualities) {
@@ -1190,7 +1205,7 @@ fn find_rods_in(g: &Grads, cx: f64, cy: f64) -> (Vec<(f64, f64, f64)>, f64, f64,
         fitted.push((x, y));
         sizes.push(rr);
     }
-    let r = mean(&sizes);
+    let r = mean(&sizes).max(min_r);
     let mut shows: Vec<f64> = fitted.iter().map(|&(x, y)| edge_coverage(&g.gx, &g.gy, &g.valid, x, y, r, g.typical)).collect();
     let weak = if shows[1] < shows[0] { 1 } else { 0 };
     let strong = if shows[1] > shows[0] { 1 } else { 0 };
@@ -1428,7 +1443,7 @@ fn shape_fits(g: &Grads, cx: f64, cy: f64, rods: &[(f64, f64, f64)]) -> [(String
 
 fn measure_auto(image: &RgbImage, cx: f64, cy: f64, radius: f64, detection: &Detection) -> FiberAxis {
     let grads = rod_gradients(image, cx, cy, radius);
-    let found = measure_rods(image, cx, cy, radius, Some(&grads));
+    let found = measure_rods(image, cx, cy, radius, Some(&grads), detection.min_rod);
     if found.quality.unwrap_or(0.0) < OTHER_SHAPE_QUALITY {
         return found;
     }
@@ -1447,7 +1462,7 @@ fn measure_auto(image: &RgbImage, cx: f64, cy: f64, radius: f64, detection: &Det
     result
 }
 
-fn measure_rods(image: &RgbImage, cx: f64, cy: f64, radius: f64, grads: Option<&Grads>) -> FiberAxis {
+fn measure_rods(image: &RgbImage, cx: f64, cy: f64, radius: f64, grads: Option<&Grads>, min_rod: f64) -> FiberAxis {
     let own;
     let g = match grads {
         Some(g) => g,
@@ -1456,7 +1471,7 @@ fn measure_rods(image: &RgbImage, cx: f64, cy: f64, radius: f64, grads: Option<&
             &own
         }
     };
-    let (rods, quality, coverage, turned_gain) = find_rods_in(g, cx, cy);
+    let (rods, quality, coverage, turned_gain) = find_rods_in(g, cx, cy, min_rod);
     let ((ax, ay, ar), (bx, by, br)) = (rods[0], rods[1]);
     let angle = (-(by - ay)).atan2(bx - ax).to_degrees().rem_euclid(180.0);
     let (half_gap, rod) = ((bx - ax).hypot(by - ay) / 2.0, (ar + br) / 2.0);
@@ -1518,7 +1533,7 @@ pub fn measure_axis(image: &RgbImage, cx: f64, cy: f64, radius: f64, method: &st
         return measure_auto(image, cx, cy, radius, detection);
     }
     if method == "rods" {
-        return measure_rods(image, cx, cy, radius, None);
+        return measure_rods(image, cx, cy, radius, None, detection.min_rod);
     }
     let (w, h) = (image.width() as i64, image.height() as i64);
     let x0 = ((cx - radius) as i64).max(0);
@@ -1728,10 +1743,70 @@ pub fn analyse_tracking(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, p
     std::thread::scope(|s| {
         let jobs: Vec<_> = circles
             .iter()
-            .map(|&(x, y, r)| s.spawn(move || measure_axis(image, x, y, r, method, parts_centre, detection)))
+            .map(|&(x, y, r)| {
+                s.spawn(move || {
+                    let mut f = measure_axis(image, x, y, r, method, parts_centre, detection);
+                    f.centre_brightness = Some(centre_brightness(image, x, y, r));
+                    f
+                })
+            })
             .collect();
         jobs.into_iter().map(|j| j.join().unwrap()).collect()
     })
+}
+
+/// Brightness (luma, 0-255) of the brightest spot within CORE_SEARCH of the
+/// fiber centre: the peak of a small box average (2% of the radius, at least
+/// 3x3 px), so one hot pixel doesn't count. Light sent into a fiber shows here.
+pub fn centre_brightness(image: &RgbImage, cx: f64, cy: f64, radius: f64) -> f64 {
+    let (w, h) = (image.width() as i64, image.height() as i64);
+    let reach = (CORE_SEARCH * radius).max(2.0);
+    let k = ((0.02 * radius).round() as i64).max(1);
+    let (x0, x1) = (((cx - reach) as i64 - k).max(0), ((cx + reach).ceil() as i64 + k + 1).min(w));
+    let (y0, y1) = (((cy - reach) as i64 - k).max(0), ((cy + reach).ceil() as i64 + k + 1).min(h));
+    if x1 <= x0 || y1 <= y0 {
+        return 0.0;
+    }
+    let (cw, ch) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    // Summed-area table of the luma.
+    let mut sat = vec![0f64; (cw + 1) * (ch + 1)];
+    for y in 0..ch {
+        let mut row = 0.0;
+        for x in 0..cw {
+            let p = image.get_pixel((x0 + x as i64) as u32, (y0 + y as i64) as u32).0;
+            row += 0.299 * p[0] as f64 + 0.587 * p[1] as f64 + 0.114 * p[2] as f64;
+            sat[(y + 1) * (cw + 1) + x + 1] = sat[y * (cw + 1) + x + 1] + row;
+        }
+    }
+    let mut best = f64::NEG_INFINITY;
+    for y in 0..ch as i64 {
+        for x in 0..cw as i64 {
+            let (px, py) = ((x0 + x) as f64 + 0.5, (y0 + y) as f64 + 0.5);
+            if (px - cx).hypot(py - cy) > reach {
+                continue;
+            }
+            let (ax, bx) = ((x - k).max(0) as usize, (x + k + 1).min(cw as i64) as usize);
+            let (ay, by) = ((y - k).max(0) as usize, (y + k + 1).min(ch as i64) as usize);
+            let sum = sat[by * (cw + 1) + bx] - sat[ay * (cw + 1) + bx] - sat[by * (cw + 1) + ax] + sat[ay * (cw + 1) + ax];
+            best = best.max(sum / ((bx - ax) * (by - ay)) as f64);
+        }
+    }
+    if best.is_finite() { best } else { 0.0 }
+}
+
+/// Of two or more fibers, the one with the brightest centre: (its index, its
+/// position counted from the right, 1 = rightmost). None for fewer than two.
+pub fn brightest_centre(axes: &[FiberAxis]) -> Option<(usize, usize)> {
+    if axes.len() < 2 {
+        return None;
+    }
+    let (i, f) = axes
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.centre_brightness.is_some())
+        .max_by(|a, b| a.1.centre_brightness.partial_cmp(&b.1.centre_brightness).unwrap())?;
+    let position = 1 + axes.iter().filter(|o| o.cx > f.cx).count();
+    Some((i, position))
 }
 
 #[cfg(test)]
@@ -1810,5 +1885,49 @@ mod tests {
         assert!(!found.is_empty());
         let (x, y, r) = found[0];
         assert!((x - 200.0).abs() < 2.0 && (y - 200.0).abs() < 2.0 && (r - 150.0).abs() < 3.0, "{found:?}");
+    }
+
+    /// Big rods at 30 deg, and a pair of smaller, crisper rings at 120 deg:
+    /// with Smallest rod above the small rings' size, only the big rods count.
+    #[test]
+    fn smallest_rod_leaves_out_small_rings() {
+        let mut img = RgbImage::from_pixel(400, 400, image::Rgb([20, 20, 20]));
+        draw::fill_circle_px(&mut img, 200, 200, 150, [200, 200, 200]);
+        for (deg, gap, r, gray) in [(30.0f64, 85.0, 50, 175u8), (120.0, 60.0, 28, 0)] {
+            let a = deg.to_radians();
+            for s in [-1.0, 1.0] {
+                let (x, y) = (200.0 + s * gap * a.cos(), 200.0 - s * gap * a.sin());
+                draw::ring_px(&mut img, rne(x) as i64, rne(y) as i64, r, 3, [gray, gray, gray]);
+            }
+        }
+        let img = crate::imgproc::gaussian_blur_rgb(&img, 1.2);
+        let picky = Detection { min_rod: 30.0, ..Default::default() };
+        let f = measure_axis(&img, 200.0, 200.0, 150.0, "rods", false, &picky);
+        assert!(angle_error(f.slow_deg, 30.0) < 1.0, "{}", f.slow_deg);
+        assert!(f.rod_radii.iter().all(|&r| r >= 0.3 * 150.0 - 0.5), "{:?}", f.rod_radii);
+    }
+
+    #[test]
+    fn brightest_centre_counted_from_the_right() {
+        let mut img = RgbImage::from_pixel(900, 300, image::Rgb([10, 10, 10]));
+        for (x, core) in [(150, 120u8), (450, 250), (750, 160)] {
+            draw::fill_circle_px(&mut img, x, 150, 130, [90, 90, 90]);
+            draw::fill_circle_px(&mut img, x, 150, 6, [core, core, core]);
+        }
+        img.put_pixel(150, 150, image::Rgb([255, 255, 255])); // one hot pixel doesn't count
+        let mut axes: Vec<FiberAxis> = [150.0, 450.0, 750.0]
+            .iter()
+            .map(|&x| {
+                let mut f = FiberAxis::new(x, 150.0, 130.0, 0.0, 1.0, "?", 0);
+                f.centre_brightness = Some(centre_brightness(&img, x, 150.0, 130.0));
+                f
+            })
+            .collect();
+        let b: Vec<f64> = axes.iter().map(|f| f.centre_brightness.unwrap()).collect();
+        assert!((b[1] - 250.0).abs() < 1.0 && b[0] < 200.0, "{b:?}");
+        assert_eq!(brightest_centre(&axes), Some((1, 2)));
+        axes[2].centre_brightness = Some(255.0);
+        assert_eq!(brightest_centre(&axes), Some((2, 1)));
+        assert_eq!(brightest_centre(&axes[..1]), None);
     }
 }

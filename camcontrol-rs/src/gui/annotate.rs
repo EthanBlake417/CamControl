@@ -9,7 +9,7 @@ use crate::calibration::Calibration;
 use crate::draw::{label, Canvas, Color, Dash, SkiaCanvas, P};
 use crate::measure::{compute, is_circle, summary, Measurement};
 use crate::processing::count::{Counter, CLASS_COLORS};
-use crate::processing::fiber_axis::FiberAxis;
+use crate::processing::fiber_axis::{brightest_centre, FiberAxis};
 
 pub const MEASURE_COLOR: Color = [0, 255, 0, 255];
 pub const SELECTED_COLOR: Color = [255, 140, 0, 255];
@@ -18,6 +18,16 @@ pub const SLOW_COLOR: Color = [255, 0, 200, 255]; // magenta: shows on blue, whi
 pub const FAST_COLOR: Color = [255, 200, 0, 255];
 pub const READOUT_COLOR: Color = [0, 255, 0, 255];
 const LINE_LENGTH: f64 = 1.25; // axis lines reach this many radii from the centre
+/// Readout text height on screen (px); exports scale it with the image.
+pub const READOUT_PX: f32 = 26.0;
+
+/// How fiber axes are drawn (on screen, on exported copies and on videos).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FiberDrawing {
+    pub show_parts: bool,
+    /// Axis lines carried on (thinner) to the edges, to compare with the crosshair, grid or the image's own lines.
+    pub long_lines: bool,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Style {
@@ -125,8 +135,11 @@ pub fn fmt_angle(deg: f64) -> String {
     format!("{:+.1}", if a == 0.0 { 0.0 } else { a }) // no "-0.0"
 }
 
+/// `reach`: how far long lines go from the pivot (in output units; past the edges is fine).
 pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f64, f64) -> P, zoom: f64, style: &Style,
-                       selected: Option<usize>, show_parts: bool) {
+                       selected: Option<usize>, drawing: FiberDrawing, reach: f32) {
+    let show_parts = drawing.show_parts;
+    let brightest = brightest_centre(axes).map(|b| b.0);
     for (i, f) in axes.iter().enumerate() {
         let centre = to_out(f.cx, f.cy);
         let (ax, ay) = f.axis_point();
@@ -148,6 +161,18 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
             }
         }
         c.ellipse(centre, r, r, Some([255, 255, 255, 160]), (width / 2.0).max(1.0), Dash::Dot, None);
+        if drawing.long_lines {
+            for (deg, mut color) in [(f.fast_deg(), FAST_COLOR), (f.slow_deg, SLOW_COLOR)] {
+                color[3] = 170;
+                let a = deg.to_radians();
+                let (dx, dy) = (a.cos() as f32 * reach, -a.sin() as f32 * reach);
+                c.line((pivot.0 - dx, pivot.1 - dy), (pivot.0 + dx, pivot.1 + dy), color, (width / 2.0).max(1.0), Dash::Solid);
+            }
+        }
+        if brightest == Some(i) {
+            let k = (r * 0.25).max(style.marker * 3.0);
+            c.ellipse(centre, k, k, Some(READOUT_COLOR), width, Dash::Solid, None);
+        }
         for (deg, color, dash) in [(f.fast_deg(), FAST_COLOR, Dash::Dash), (f.slow_deg, SLOW_COLOR, Dash::Solid)] {
             let a = deg.to_radians();
             let (dx, dy) = ((a.cos() * r as f64 * LINE_LENGTH) as f32, (-a.sin() * r as f64 * LINE_LENGTH) as f32);
@@ -162,12 +187,18 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
     }
 }
 
-/// One readout line per fiber: number, slow axis angle, and "(unclear)" when unsure.
+/// One readout line per fiber: number, slow axis angle, and "(unclear)" when unsure;
+/// with several fibers, a last line saying which has the brightest centre.
 pub fn fiber_readout_lines(axes: &[FiberAxis]) -> Vec<String> {
-    axes.iter()
+    let mut lines: Vec<String> = axes
+        .iter()
         .enumerate()
         .map(|(i, f)| format!("{}: slow axis {}°{}", i + 1, fmt_angle(f.slow_deg), if f.clear() { "" } else { " (unclear)" }))
-        .collect()
+        .collect();
+    if let Some((i, position)) = brightest_centre(axes) {
+        lines.push(format!("Brightest centre: position {position} from right (fiber {})", i + 1));
+    }
+    lines
 }
 
 /// The angles in green, in a dark box with its top-left corner at `corner`.
@@ -207,13 +238,15 @@ pub fn render_marks(img: &RgbImage, counter: &Counter) -> RgbImage {
     c.to_image()
 }
 
-pub fn render_fiber_axes(img: &RgbImage, axes: &[FiberAxis], show_parts: bool) -> RgbImage {
+pub fn render_fiber_axes(img: &RgbImage, axes: &[FiberAxis], drawing: FiberDrawing) -> RgbImage {
     let w = img.width() as f32;
     let style = Style { line_width: (w / 600.0).max(2.0), font_px: (w / 60.0).round().max(14.0), marker: 3.0 };
     let mut c = SkiaCanvas::from_image(img);
-    draw_fiber_axes(&mut c, axes, &identity, 1.0, &style, None, show_parts);
-    let margin = style.font_px * 0.6;
-    draw_fiber_readout(&mut c, axes, (margin, margin), style.font_px);
+    draw_fiber_axes(&mut c, axes, &identity, 1.0, &style, None, drawing, w + img.height() as f32);
+    // Big, as on screen: READOUT_PX on a view about 1000 px wide.
+    let font = (w / 1000.0 * READOUT_PX).round().max(18.0);
+    let margin = font * 0.4;
+    draw_fiber_readout(&mut c, axes, (margin, margin), font);
     c.to_image()
 }
 

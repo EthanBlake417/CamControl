@@ -19,10 +19,19 @@ pub enum PanelId {
     Counting,
     Fiber,
     FiberLog,
+    Histogram,
 }
 
 impl PanelId {
-    pub const ALL: [PanelId; 6] = [PanelId::Controls, PanelId::Measurements, PanelId::Captures, PanelId::Counting, PanelId::Fiber, PanelId::FiberLog];
+    pub const ALL: [PanelId; 7] = [
+        PanelId::Controls,
+        PanelId::Measurements,
+        PanelId::Captures,
+        PanelId::Counting,
+        PanelId::Fiber,
+        PanelId::FiberLog,
+        PanelId::Histogram,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -32,10 +41,11 @@ impl PanelId {
             PanelId::Counting => "Counting",
             PanelId::Fiber => "Fiber axis",
             PanelId::FiberLog => "Fiber log",
+            PanelId::Histogram => "Histogram",
         }
     }
 
-    /// Ctrl+1..5 as in the Python app, plus Ctrl+6.
+    /// Ctrl+1..5 as in the Python app, plus Ctrl+6 and 7.
     pub fn shortcut(self) -> usize {
         match self {
             PanelId::Controls => 1,
@@ -44,6 +54,7 @@ impl PanelId {
             PanelId::Counting => 4,
             PanelId::Fiber => 5,
             PanelId::FiberLog => 6,
+            PanelId::Histogram => 7,
         }
     }
 }
@@ -83,6 +94,7 @@ impl Default for PanelLayout {
                 s(PanelId::Counting, Edge::Bottom, false),
                 s(PanelId::Fiber, Edge::Bottom, false),
                 s(PanelId::FiberLog, Edge::Bottom, false),
+                s(PanelId::Histogram, Edge::Bottom, false),
             ],
             dragging: None,
             stripe_rects: Vec::new(),

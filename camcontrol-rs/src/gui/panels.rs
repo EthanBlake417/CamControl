@@ -17,7 +17,7 @@ use crate::camera::{format_exposure, frame_sizes, ADJUSTABLE, EXPOSURE_US};
 use crate::capture::{next_capture_path, scaled_size};
 use crate::measure::{compute, fmt, is_circle, KINDS};
 use crate::processing::count::MAX_CLASSES;
-use crate::processing::fiber_axis::{method_label, Detection, LOOK_AT, METHODS};
+use crate::processing::fiber_axis::{brightest_centre, method_label, Detection, DEFAULT_MIN_ROD, LOOK_AT, MAX_MIN_ROD, METHODS};
 use crate::video::VIDEO_FORMATS;
 
 const BIG_BUTTON: f32 = 40.0;
@@ -613,10 +613,20 @@ impl App {
                 }
                 ui.checkbox(&mut self.fiber.show_parts, "Show stress parts").on_hover_text(
                     "Shade the stress parts the axis was measured from, with a cross at each one's centre,\nand ring the point the axis turns about. Also used for the exported drawing.");
+                ui.checkbox(&mut self.fiber.long_lines, "Axis lines across the view").on_hover_text(
+                    "Carry each fiber's axis lines on (thinner) to the edges of the view, to compare them with\nthe crosshair, the grid or lines in the image. For a crosshair on the fiber, choose\n\"Fiber centre\" in View > Overlay settings > Crosshair. Also used for exports and videos.");
                 changed |= ui.checkbox(&mut self.fiber.centre_only, "Only the centre fiber").on_hover_text(
                     "Of the fibers found automatically, measure only the one nearest the middle of the image\n(e.g. the lit fiber in a V-groove, with its neighbours ignored). Faster for Update live.").changed();
                 ui.checkbox(&mut self.fiber.use_circles, "Use circle measurements").on_hover_text(
                     "If there are Circle measurements, measure the fibers inside them\ninstead of finding fibers automatically.");
+                ui.horizontal(|ui| {
+                    ui.label("Smallest rod:");
+                    let r = ui.add(egui::DragValue::new(&mut self.fiber.detection.min_rod).range(DEFAULT_MIN_ROD..=MAX_MIN_ROD).speed(0.5).suffix("%"))
+                        .on_hover_text("Panda rod outlines: round things smaller than this (radius, % of the fiber's radius)\n\
+                                        are never taken for a stress rod, e.g. dust, bubbles or the core.\n\
+                                        18% (the smallest) tries every size; raise it when a speck is outlined instead of a rod.");
+                    tune |= r.changed();
+                });
                 ui.horizontal(|ui| {
                     if ui.button("Clear").clicked() {
                         self.active_pane_mut().fibers.clear();
@@ -691,15 +701,21 @@ impl App {
                 let a = self.active;
                 let mut select = None;
                 egui::ScrollArea::both().max_height((ui.available_height() - 50.0).max(60.0)).auto_shrink([false, true]).show(ui, |ui| {
-                    egui::Grid::new("fibers").striped(true).num_columns(9).show(ui, |ui| {
-                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "Clarity", "Method", "Centre (px)", "Axis through (px)", "Diameter (px)"] {
+                    egui::Grid::new("fibers").striped(true).num_columns(10).show(ui, |ui| {
+                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "Clarity", "Method", "Centre (px)", "Axis through (px)", "Diameter (px)",
+                                  "Centre brightness"] {
                             let r = ui.strong(h);
-                            if h == "Clarity" {
+                            if h == "Centre brightness" {
+                                r.on_hover_text("Brightness (0-255) of the brightest spot near the fiber's centre, e.g. light in the core.\n\
+                                                 With several fibers, the brightest is ringed in green and named in the readout\n\
+                                                 by its position counted from the right.");
+                            } else if h == "Clarity" {
                                 r.on_hover_text("How much longer the stress parts spread along the slow axis than across it.\nBelow 1.3 the axis isn't clear (e.g. a plain round fiber, or poor contrast).\nPanda rod outlines: how much of the rods' outlines was found;\nbelow 50% (or with faint outlines) the axis isn't clear.");
                             }
                         }
                         ui.end_row();
                         let p = self.pane(a);
+                        let brightest = brightest_centre(&p.fibers).map(|b| b.0);
                         for (i, f) in p.fibers.iter().enumerate() {
                             let sel = p.fiber_selected == Some(i);
                             let clarity = match f.coverage {
@@ -709,7 +725,8 @@ impl App {
                             let (ax, ay) = f.axis_point();
                             for t in [(i + 1).to_string(), f.fiber_type.clone(), fmt_angle(f.slow_deg), fmt_angle(f.fast_deg()), clarity,
                                       method_label(&f.method).to_string(), format!("{:.1}, {:.1}", f.cx, f.cy), format!("{ax:.1}, {ay:.1}"),
-                                      format!("{:.1}", 2.0 * f.radius)] {
+                                      format!("{:.1}", 2.0 * f.radius),
+                                      f.centre_brightness.map(|b| format!("{b:.0}{}", if brightest == Some(i) { "  (brightest)" } else { "" })).unwrap_or_default()] {
                                 if ui.selectable_label(sel, t).clicked() {
                                     select = Some(i);
                                 }
