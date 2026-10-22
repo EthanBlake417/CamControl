@@ -5,7 +5,7 @@
 //! events back. Only the newest frame is kept for the GUI (frames are dropped
 //! if it falls behind); video recording gets every frame. With a flat-field
 //! set, live frames, captures, videos and time-lapse images are corrected
-//! here first.
+//! here first. Videos can have the latest fiber axes drawn on (RecordOverlay).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -15,12 +15,16 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use eframe::egui::ColorImage;
 use image::RgbImage;
 use nokhwa::utils::CameraIndex;
 use serde_json::{json, Map, Value};
 
-use super::{exposure_seconds, Camera, DeviceKey, Mode, Range};
+use super::{Camera, DeviceKey, Mode, Range, EXPOSURE_US};
 use crate::capture::{self, CaptureOptions};
+use crate::gui::annotate::render_fiber_axes;
+use crate::gui::view::texture_tiles;
+use crate::processing::fiber_axis::FiberAxis;
 use crate::processing::flatfield::FlatField;
 use crate::video::{self, VideoRecorder};
 
@@ -77,8 +81,17 @@ pub enum Cmd {
     Flat(Option<Arc<FlatField>>),
     Record { folder: PathBuf, name: String, fmt: String, fps: f64, max_seconds: f64 },
     RecordStop,
+    /// What to draw on recorded frames (None: nothing).
+    RecordOverlay(Option<RecordOverlay>),
     TimeLapse(TimeLapse, CaptureRequest),
     TimeLapseStop,
+}
+
+/// The analysis drawn on recorded frames: the view's latest fiber axes.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecordOverlay {
+    pub axes: Vec<FiberAxis>,
+    pub show_parts: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -106,10 +119,11 @@ pub enum Ev {
     TimeLapseFinished(String),
 }
 
-/// The newest frame and a count, so the GUI only takes new ones.
+/// The newest frame (and its texture tiles) and a count, so the GUI only takes new ones.
 #[derive(Default)]
 pub struct Latest {
     pub frame: Option<Arc<RgbImage>>,
+    pub tiles: Vec<Arc<ColorImage>>,
     pub count: u64,
 }
 
@@ -119,6 +133,7 @@ struct Thread {
     wake: Arc<dyn Fn() + Send + Sync>,
     flat: Option<Arc<FlatField>>,
     recorder: Option<VideoRecorder>,
+    overlay: Option<RecordOverlay>,
     last_progress: Option<Instant>,
     timelapse: Option<(TimeLapse, CaptureRequest)>,
 }
@@ -161,8 +176,10 @@ impl Thread {
             if self.recorder.is_some() {
                 self.record(&frame);
             }
+            let tiles = texture_tiles(&frame);
             let mut l = self.latest.lock().unwrap();
             l.frame = Some(Arc::new(frame));
+            l.tiles = tiles;
             l.count += 1;
             drop(l);
             (self.wake)();
@@ -187,6 +204,7 @@ impl Thread {
                 Cmd::Flat(f) => self.flat = f,
                 Cmd::Record { folder, name, fmt, fps, max_seconds } => self.start_recording(folder, &name, &fmt, fps, max_seconds),
                 Cmd::RecordStop => self.stop_recording(),
+                Cmd::RecordOverlay(o) => self.overlay = o,
                 Cmd::TimeLapse(t, o) => {
                     self.stop_timelapse(None);
                     self.timelapse = Some((t, o));
@@ -210,8 +228,9 @@ impl Thread {
     /// Average, correct and save one image. Returns its path, or None on failure (reported).
     fn capture(&mut self, cam: &mut Camera, c: &CaptureRequest, extra: Map<String, Value>, prefix: &str, announce: bool) -> Option<PathBuf> {
         let exposure = cam.exposure();
+        let seconds = cam.get(EXPOSURE_US).ok().map(|us| us as f64 * 1e-6);
         if announce {
-            let per = exposure.map(|e| exposure_seconds(e as f64, cam.exposure_log2)).unwrap_or(0.0).max(1.0 / 25.0);
+            let per = seconds.unwrap_or(0.0).max(1.0 / 25.0);
             self.send(Ev::CaptureStarted(c.n_frames, c.n_frames as f64 * per));
         }
         let mut frames = Vec::new();
@@ -238,7 +257,7 @@ impl Thread {
         }
         let opts = CaptureOptions {
             exposure: exposure.map(|e| e as f64),
-            exposure_seconds: exposure.map(|e| exposure_seconds(e as f64, cam.exposure_log2)),
+            exposure_seconds: seconds,
             gain: cam.gain().map(|g| g as f64),
             frames_averaged: frames.len(),
             scale: c.scale,
@@ -275,8 +294,9 @@ impl Thread {
     }
 
     fn record(&mut self, frame: &RgbImage) {
+        let drawn = self.overlay.as_ref().filter(|o| !o.axes.is_empty()).map(|o| render_fiber_axes(frame, &o.axes, o.show_parts));
         let rec = self.recorder.as_mut().unwrap();
-        if let Err(e) = rec.add(frame) {
+        if let Err(e) = rec.add(drawn.as_ref().unwrap_or(frame)) {
             self.send(Ev::Error(format!("Recording failed: {e}")));
             self.stop_recording();
             return;
@@ -350,6 +370,8 @@ pub struct CameraLink {
     /// text, color (None: normal), tooltip
     pub status: (String, Option<[u8; 3]>, String),
     pub recording: bool,
+    /// What the thread was last told to draw on recorded frames.
+    pub overlay_sent: Option<RecordOverlay>,
     pub timelapse: bool,
     frame_times: VecDeque<Instant>,
     pub shown: u64,
@@ -373,6 +395,7 @@ impl CameraLink {
             exposure_log2: cfg!(windows),
             status: ("Connecting...".into(), None, String::new()),
             recording: false,
+            overlay_sent: None,
             timelapse: false,
             frame_times: VecDeque::new(),
             shown: 0,
@@ -390,7 +413,8 @@ impl CameraLink {
         let stop = Arc::new(AtomicBool::new(false));
         self.latest = Arc::new(Mutex::new(Latest::default()));
         self.shown = 0;
-        let mut t = Thread { events: etx, latest: self.latest.clone(), wake, flat, recorder: None, last_progress: None, timelapse: None };
+        self.overlay_sent = None;
+        let mut t = Thread { events: etx, latest: self.latest.clone(), wake, flat, recorder: None, overlay: None, last_progress: None, timelapse: None };
         let (key, s) = (self.key.clone(), stop.clone());
         self.handle = Some(std::thread::Builder::new()
             .name(format!("camera {}", self.key.label()))
@@ -455,14 +479,14 @@ impl CameraLink {
         events
     }
 
-    /// The newest frame, if it's one not taken yet.
-    pub fn take_frame(&mut self) -> Option<Arc<RgbImage>> {
+    /// The newest frame and its texture tiles, if it's one not taken yet.
+    pub fn take_frame(&mut self) -> Option<(Arc<RgbImage>, Vec<Arc<ColorImage>>)> {
         let l = self.latest.lock().unwrap();
         if l.count == self.shown {
             return None;
         }
         self.shown = l.count;
-        let f = l.frame.clone();
+        let f = l.frame.clone().map(|f| (f, l.tiles.clone()));
         drop(l);
         self.frame_times.push_back(Instant::now());
         if self.frame_times.len() > 30 {

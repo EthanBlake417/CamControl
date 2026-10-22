@@ -24,6 +24,8 @@ pub struct RecordState {
     pub video_format: String,
     pub video_fps: u32,
     pub video_limit: u32,
+    /// Draw the fiber axes and angle readout on recorded videos.
+    pub draw_analysis: bool,
     pub tl_interval: f64,
     pub tl_unit: usize,
     pub tl_count: u32,
@@ -33,7 +35,7 @@ pub struct RecordState {
 
 impl Default for RecordState {
     fn default() -> Self {
-        Self { video_format: "MP4".into(), video_fps: 25, video_limit: 0, tl_interval: 10.0, tl_unit: 0, tl_count: 60, tl_video: true, tl_video_fps: 10 }
+        Self { video_format: "MP4".into(), video_fps: 25, video_limit: 0, draw_analysis: true, tl_interval: 10.0, tl_unit: 0, tl_count: 60, tl_video: true, tl_video_fps: 10 }
     }
 }
 
@@ -52,6 +54,7 @@ impl RecordState {
         let num = |k: &str| v[k].as_f64();
         if let Some(n) = num("video_fps") { self.video_fps = (n as u32).clamp(1, 60); }
         if let Some(n) = num("video_limit") { self.video_limit = (n as u32).min(24 * 3600); }
+        if let Some(b) = v["draw_analysis"].as_bool() { self.draw_analysis = b; }
         if let Some(n) = num("tl_interval") { self.tl_interval = n.clamp(0.5, 100000.0); }
         if let Some(n) = num("tl_unit") { self.tl_unit = (n as usize).min(2); }
         if let Some(n) = num("tl_count") { self.tl_count = (n as u32).min(100000); }

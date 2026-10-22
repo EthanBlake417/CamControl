@@ -18,10 +18,11 @@ pub enum PanelId {
     Measurements,
     Counting,
     Fiber,
+    FiberLog,
 }
 
 impl PanelId {
-    pub const ALL: [PanelId; 5] = [PanelId::Controls, PanelId::Measurements, PanelId::Captures, PanelId::Counting, PanelId::Fiber];
+    pub const ALL: [PanelId; 6] = [PanelId::Controls, PanelId::Measurements, PanelId::Captures, PanelId::Counting, PanelId::Fiber, PanelId::FiberLog];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -30,10 +31,11 @@ impl PanelId {
             PanelId::Measurements => "Measurements",
             PanelId::Counting => "Counting",
             PanelId::Fiber => "Fiber axis",
+            PanelId::FiberLog => "Fiber log",
         }
     }
 
-    /// Ctrl+1..5, as in the Python app.
+    /// Ctrl+1..5 as in the Python app, plus Ctrl+6.
     pub fn shortcut(self) -> usize {
         match self {
             PanelId::Controls => 1,
@@ -41,6 +43,7 @@ impl PanelId {
             PanelId::Captures => 3,
             PanelId::Counting => 4,
             PanelId::Fiber => 5,
+            PanelId::FiberLog => 6,
         }
     }
 }
@@ -79,6 +82,7 @@ impl Default for PanelLayout {
                 s(PanelId::Measurements, Edge::Bottom, true),
                 s(PanelId::Counting, Edge::Bottom, false),
                 s(PanelId::Fiber, Edge::Bottom, false),
+                s(PanelId::FiberLog, Edge::Bottom, false),
             ],
             dragging: None,
             stripe_rects: Vec::new(),
@@ -256,6 +260,6 @@ mod tests {
         assert_eq!(l.open_on(Edge::Bottom), None);
         l.slots.push(Slot { id: PanelId::Fiber, edge: Edge::Right, open: true });
         l.repair();
-        assert_eq!(l.slots.len(), 5);
+        assert_eq!(l.slots.len(), PanelId::ALL.len());
     }
 }

@@ -22,6 +22,7 @@
 mod actions;
 pub mod annotate;
 mod dialogs;
+mod fiber_log;
 mod gallery;
 mod panels;
 mod player;
@@ -202,6 +203,7 @@ pub struct App {
     pub(crate) count_class: usize,
     pub(crate) class_names: Vec<String>,
     pub(crate) fiber: FiberSettings,
+    pub(crate) fiber_log: fiber_log::FiberLog,
     fiber_job: Option<(FiberRequest, Receiver<Vec<FiberAxis>>)>,
     fiber_waiting: Vec<FiberRequest>,
     fiber_generation: u64,
@@ -279,6 +281,7 @@ impl App {
         gallery.count = saved.gallery_count.clamp(1, 500);
         std::thread::spawn(crate::processing::fiber_axis::warm_up); // the first Find axes needn't wait
         let mut app = Self {
+            fiber_log: Default::default(),
             panes: Vec::new(),
             active: 0,
             controlled: None,
@@ -447,7 +450,7 @@ impl App {
             self.active_pane_mut().view.zoom_out();
         }
         for id in PanelId::ALL {
-            let key = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5][id.shortcut() - 1];
+            let key = [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6][id.shortcut() - 1];
             if consume(&KeyboardShortcut::new(Modifiers::COMMAND, key)) {
                 self.panels.toggle(id);
             }
@@ -747,6 +750,7 @@ impl App {
             PanelId::Fiber => {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.fiber_panel(ui));
             }
+            PanelId::FiberLog => self.fiber_log_panel(ui),
         }
     }
 

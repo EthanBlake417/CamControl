@@ -164,6 +164,7 @@ impl Canvas for EguiCanvas<'_> {
 struct Tile {
     texture: TextureHandle,
     rect: Rect, // image pixels
+    options: TextureOptions,
 }
 
 /// What the view should draw on top of the image.
@@ -240,12 +241,25 @@ impl Default for ImageView {
 
 fn tile_pixels(image: &RgbImage, x0: usize, y0: usize, w: usize, h: usize) -> ColorImage {
     let stride = image.width() as usize * 3;
-    let mut rgb = Vec::with_capacity(w * h * 3);
+    let mut pixels = Vec::with_capacity(w * h);
     for y in y0..y0 + h {
         let start = y * stride + x0 * 3;
-        rgb.extend_from_slice(&image.as_raw()[start..start + w * 3]);
+        pixels.extend(image.as_raw()[start..start + w * 3].chunks_exact(3).map(|p| Color32::from_rgb(p[0], p[1], p[2])));
     }
-    ColorImage::from_rgb([w, h], &rgb)
+    ColorImage { size: [w, h], pixels }
+}
+
+/// The image cut into texture tiles, ready to upload (camera threads make
+/// these, so the GUI thread doesn't convert every live frame).
+pub fn texture_tiles(image: &RgbImage) -> Vec<Arc<ColorImage>> {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    let mut tiles = Vec::new();
+    for y0 in (0..height).step_by(TILE) {
+        for x0 in (0..width).step_by(TILE) {
+            tiles.push(Arc::new(tile_pixels(image, x0, y0, TILE.min(width - x0), TILE.min(height - y0))));
+        }
+    }
+    tiles
 }
 
 impl ImageView {
@@ -262,25 +276,36 @@ impl ImageView {
     }
 
     pub fn set_image(&mut self, ctx: &egui::Context, image: Arc<RgbImage>) {
-        let (width, height) = (image.width() as usize, image.height() as usize);
+        let tiles = texture_tiles(&image);
+        self.set_image_tiles(ctx, image, tiles);
+    }
+
+    /// set_image with the tiles already made (texture_tiles).
+    pub fn set_image_tiles(&mut self, ctx: &egui::Context, image: Arc<RgbImage>, tiles: Vec<Arc<ColorImage>>) {
+        let width = image.width() as usize;
         let new_size = self.image.as_ref().map(|i| i.dimensions()) != Some(image.dimensions());
         if new_size {
             self.tiles.clear();
         }
         let options = self.options();
-        let mut n = 0;
-        for y0 in (0..height).step_by(TILE) {
-            for x0 in (0..width).step_by(TILE) {
-                let (w, h) = (TILE.min(width - x0), TILE.min(height - y0));
-                let pixels = tile_pixels(&image, x0, y0, w, h);
-                match self.tiles.get_mut(n) {
-                    Some(t) => t.texture.set(pixels, options),
-                    None => self.tiles.push(Tile {
-                        texture: ctx.load_texture(format!("image-{n}"), pixels, options),
-                        rect: Rect::from_min_size(Pos2::new(x0 as f32, y0 as f32), Vec2::new(w as f32, h as f32)),
-                    }),
+        let columns = width.div_ceil(TILE);
+        for (n, pixels) in tiles.into_iter().enumerate() {
+            match self.tiles.get_mut(n) {
+                // Same size and filter: write into the texture (a full set makes OpenGL reallocate it every frame).
+                Some(t) if t.options == options => t.texture.set_partial([0, 0], pixels, options),
+                Some(t) => {
+                    t.texture.set(pixels, options);
+                    t.options = options;
                 }
-                n += 1;
+                None => {
+                    let (x0, y0) = ((n % columns) * TILE, (n / columns) * TILE);
+                    let size = Vec2::new(pixels.size[0] as f32, pixels.size[1] as f32);
+                    self.tiles.push(Tile {
+                        texture: ctx.load_texture(format!("image-{n}"), pixels, options),
+                        rect: Rect::from_min_size(Pos2::new(x0 as f32, y0 as f32), size),
+                        options,
+                    });
+                }
             }
         }
         self.image = Some(image);
@@ -568,6 +593,8 @@ impl ImageView {
                 canvas.ellipse((mid.x, mid.y), c.circle as f32, c.circle as f32, Some(col), w, d, None);
             }
         }
+        // The angles stay in the view's top-left corner, whatever the zoom.
+        annotate::draw_fiber_readout(&mut canvas, overlays.fibers, (rect.left() + 8.0, rect.top() + 8.0), style.font_px + 2.0);
 
         self.mouse = over.map(|p| self.to_image(p));
         self.hover = over.and_then(|cursor| {

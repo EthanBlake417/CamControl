@@ -328,6 +328,55 @@ fn records_a_video() {
 }
 
 #[test]
+fn records_the_fiber_axes_on_the_video() {
+    let mut t = live("videoaxes");
+    t.state_mut().saved.recording.video_format = "AVI (higher quality, large)".into();
+    assert!(t.state().saved.recording.draw_analysis, "on by default");
+    let axis = crate::processing::fiber_axis::FiberAxis {
+        cx: 320.0, cy: 240.0, radius: 120.0, slow_deg: 5.0, elongation: 0.5, fiber_type: "Panda".into(), n_parts: 2,
+        method: "rods".into(), axis_x: None, axis_y: None, parts: Vec::new(), part_centres: Vec::new(), threshold: 0.0,
+        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None,
+    };
+    t.state_mut().active_pane_mut().fibers = vec![axis];
+    t.state_mut().request_recording(true);
+    wait(&mut t, "recording to start", |a| a.link().is_some_and(|l| l.recording && l.overlay_sent.is_some()));
+    std::thread::sleep(Duration::from_millis(800));
+    t.state_mut().request_recording(false);
+    wait(&mut t, "recording to stop", |a| a.link().is_some_and(|l| !l.recording));
+    let avi = files(&t.dir, "avi");
+    let mut r = crate::video::VideoReader::open(&avi[0]).unwrap();
+    let last = r.frame(r.frame_count - 1).unwrap();
+    // The green readout in the top-left corner (JPEG frames, so roughly green).
+    let green = (0..60).flat_map(|y| (0..300).map(move |x| (x, y)))
+        .filter(|&(x, y)| { let p = last.get_pixel(x, y).0; p[1] > 120 && p[1] > p[0] + 60 && p[1] > p[2] + 60 })
+        .count();
+    assert!(green > 50, "{green} green pixels");
+}
+
+#[test]
+fn exposure_set_as_a_time() {
+    let mut t = live("exposurems");
+    let send = |t: &mut Test, us: f64| {
+        if let Some(l) = t.state_mut().link_mut() {
+            l.send(crate::camera::worker::Cmd::Control(crate::camera::EXPOSURE_US.into(), us));
+        }
+    };
+    let get = |a: &App, k: &str| a.link().and_then(|l| l.values.get(k).copied());
+    // 900 ms: between the camera's steps (625 ms and 1.25 s).
+    send(&mut t, 900_000.0);
+    wait(&mut t, "900 ms", |a| get(a, "exposure_us") == Some(900_000));
+    assert_eq!(get(t.state(), "exposure"), Some(-4));
+    // 3 s: past the longest step, 3 frames added.
+    send(&mut t, 3_000_000.0);
+    wait(&mut t, "3 s", |a| get(a, "exposure_us") == Some(3_000_000));
+    // A whole step again resets the brightening.
+    if let Some(l) = t.state_mut().link_mut() {
+        l.send(crate::camera::worker::Cmd::Control("exposure".into(), -5.0));
+    }
+    wait(&mut t, "step -5", |a| get(a, "exposure_us") == Some(312_500));
+}
+
+#[test]
 fn time_lapse_with_video() {
     let mut t = live("timelapse");
     let r = &mut t.state_mut().saved.recording;

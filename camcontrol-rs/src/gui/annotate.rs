@@ -16,6 +16,7 @@ pub const SELECTED_COLOR: Color = [255, 140, 0, 255];
 pub const PREVIEW_COLOR: Color = [0, 200, 255, 255];
 pub const SLOW_COLOR: Color = [255, 0, 200, 255]; // magenta: shows on blue, white and black
 pub const FAST_COLOR: Color = [255, 200, 0, 255];
+pub const READOUT_COLOR: Color = [0, 255, 0, 255];
 const LINE_LENGTH: f64 = 1.25; // axis lines reach this many radii from the centre
 
 #[derive(Clone, Copy, Debug)]
@@ -155,9 +156,33 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
         if show_parts {
             c.ellipse(pivot, style.marker * 1.5, style.marker * 1.5, Some([255, 255, 255, 255]), (width / 2.0).max(1.0), Dash::Solid, None);
         }
-        let text = format!("{}: {}°{}", i + 1, fmt_angle(f.slow_deg), if f.clear() { "" } else { " (unclear)" });
+        // Just the number here; the angles are in the readout (draw_fiber_readout).
         let above = (centre.0 - r * 0.7, centre.1 - r * LINE_LENGTH as f32 - style.font_px * 2.2);
-        label(c, above, &text, SLOW_COLOR, style.font_px);
+        label(c, above, &(i + 1).to_string(), SLOW_COLOR, style.font_px);
+    }
+}
+
+/// One readout line per fiber: number, slow axis angle, and "(unclear)" when unsure.
+pub fn fiber_readout_lines(axes: &[FiberAxis]) -> Vec<String> {
+    axes.iter()
+        .enumerate()
+        .map(|(i, f)| format!("{}: slow axis {}°{}", i + 1, fmt_angle(f.slow_deg), if f.clear() { "" } else { " (unclear)" }))
+        .collect()
+}
+
+/// The angles in green, in a dark box with its top-left corner at `corner`.
+pub fn draw_fiber_readout(c: &mut dyn Canvas, axes: &[FiberAxis], corner: P, font_px: f32) {
+    let lines = fiber_readout_lines(axes);
+    if lines.is_empty() {
+        return;
+    }
+    let pad = font_px * 0.4;
+    let step = font_px * 1.3;
+    let w = lines.iter().map(|l| c.text_width(l, font_px)).fold(0.0, f32::max) + 2.0 * pad;
+    let h = step * lines.len() as f32 + 2.0 * pad - (step - font_px * 1.15);
+    c.fill_rect(corner, (corner.0 + w, corner.1 + h), [0, 0, 0, 170]);
+    for (k, line) in lines.iter().enumerate() {
+        c.text((corner.0 + pad, corner.1 + pad + k as f32 * step), line, font_px, READOUT_COLOR);
     }
 }
 
@@ -187,6 +212,8 @@ pub fn render_fiber_axes(img: &RgbImage, axes: &[FiberAxis], show_parts: bool) -
     let style = Style { line_width: (w / 600.0).max(2.0), font_px: (w / 60.0).round().max(14.0), marker: 3.0 };
     let mut c = SkiaCanvas::from_image(img);
     draw_fiber_axes(&mut c, axes, &identity, 1.0, &style, None, show_parts);
+    let margin = style.font_px * 0.6;
+    draw_fiber_readout(&mut c, axes, (margin, margin), style.font_px);
     c.to_image()
 }
 

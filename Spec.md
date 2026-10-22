@@ -2,7 +2,7 @@
 
 What the software must do, and how we know it does. The README explains how to use it; this file is the checklist. Keep it current: when a feature is added, changed or dropped, update its line here (and the test that checks it).
 
-**Status:** **Done** (works and is checked), **Hardware?** (done, but not yet tried on the real camera or setup it's for), **Planned** (not built yet).
+**Status:** **Done** (works and is checked), **Hardware?** (done, but not yet tried on the real camera or setup it's for), **Planned** (not built yet), **Rust only** (done in camcontrol-rs, still to do in the Python app).
 **Verified by:** a test in `tests/` (run `venv\Scripts\python -m pytest`), a module self-test (`python -m ...`, also run by the tests), or **Manual** (checked by hand in the app).
 
 Owner: Ethan Blake, Grid Evolution Technologies. Last reviewed: 2026-10-14.
@@ -31,6 +31,7 @@ Cameras it's for: the O.C. White Ultra-Cam II (Windows name "MC802 USB2.0 Camera
 | CAM-3 | Sliders for exposure, gain, contrast, saturation, sharpness, set through the Windows camera interfaces directly (not OpenCV). Controls a camera lacks show "not available". | Done | Manual, `test_views.py` |
 | CAM-4 | Recovers exposure control after HD2 has used the camera (a write without the "manual" flag first). | Hardware? | Manual (not re-checked since 2026-09) |
 | CAM-5 | Exposure beyond the camera's maximum (to ~20 s) by adding frames in software; live view shows a running sum; captures record `frames_summed_per_exposure`. | Hardware? | Fake camera only |
+| CAM-9 | Exposure set as a time in ms (typed, with decimals, or a logarithmic slider), not only whole camera steps. Windows: the camera's step just below, brightened in software up to 2x; past its longest, any number of frames added (up to 16). Linux: 0.1 ms steps. Saved as `exposure_us` beside `exposure` in settings files. | Rust only | `cargo test` (fake camera) |
 | CAM-6 | All camera access runs on a background thread per camera, so the window never waits for a camera. Frames are dropped, not queued, if the window falls behind. | Done | `test_views.py` |
 | CAM-7 | A camera that's off, unplugged or stops sending shows "Not connected"; **Reconnect** opens it again. | Done | Manual |
 | CAM-8 | Two or more cameras live at once, each in its own view on its own thread. | Hardware? | `test_views.py` (fake cameras); real pair not tried |
@@ -78,6 +79,7 @@ Cameras it's for: the O.C. White Ultra-Cam II (Windows name "MC802 USB2.0 Camera
 | REC-2 | Time-lapse: a capture every N s/min/h, a set number or until stopped, optionally joined into a video. | Done | `camcontrol.recording` self-test, Manual |
 | REC-3 | Play MP4/AVI in a view: play/pause, frame steps, seek, time and frame number. | Done | `test_views.py` |
 | REC-4 | Closing the app, reconnecting or changing a camera while recording asks first; a recording is always left playable. | Done | Manual |
+| REC-5 | "Draw fiber axes on the video" (on by default): recorded frames carry the view's latest fiber axes and the angle readout, as on screen. | Rust only | `cargo test` (fake camera) |
 
 ## 8. Captures panel
 
@@ -116,6 +118,7 @@ Cameras it's for: the O.C. White Ultra-Cam II (Windows name "MC802 USB2.0 Camera
 | FIB-6 | Real end faces: ETN3000 photos within 0.6° of the reference; the 36879B bow-tie TIFs measured as Bow-tie. | Done | `test_processing.py` (when the files are present) |
 | FIB-7 | Update live: re-measures live views about 3 times a second (taking turns between views) and each image as it's opened. | Hardware? | `test_views.py` (fake cameras) |
 | FIB-8 | Show stress parts (shaded outlines, centres, pivot); export table, image and a drawn copy. | Done | Manual |
+| FIB-9 | Angle readout in green in the top-left corner of each view (and of the drawn copy): one line per fiber, "1: slow axis +0.5°", "(unclear)" when unsure; each fiber is tagged with just its number. | Rust only | `cargo test`, Manual |
 
 ## 12. Processing
 

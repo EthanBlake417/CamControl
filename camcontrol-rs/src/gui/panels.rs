@@ -13,7 +13,7 @@ use super::player::format_duration;
 use super::settings::{AVERAGE_CHOICES, FORMATS, UNITS};
 use super::{App, TUNE_DELAY};
 use crate::camera::worker::{now_epoch, Cmd};
-use crate::camera::{format_exposure, frame_sizes, ADJUSTABLE};
+use crate::camera::{format_exposure, frame_sizes, ADJUSTABLE, EXPOSURE_US};
 use crate::capture::{next_capture_path, scaled_size};
 use crate::measure::{compute, fmt, is_circle, KINDS};
 use crate::processing::count::MAX_CLASSES;
@@ -167,7 +167,36 @@ impl App {
                 for name in ADJUSTABLE {
                     ui.label(capitalize(name));
                     let info = self.link().map(|l| (l.ranges.get(name).copied().flatten(), l.values.get(name).copied(), l.exposure_log2));
+                    let us = self.link().and_then(|l| Some((l.ranges.get(EXPOSURE_US).copied().flatten()?, l.values.get(EXPOSURE_US).copied())));
                     match info {
+                        Some((Some(_), v, log2)) if open && name == "exposure" && us.is_some() => {
+                            // Set as a time in ms; the slider is logarithmic so short and long times both fit.
+                            let (r, cur) = us.unwrap();
+                            let (lo, hi) = (r.min as f64 / 1000.0, r.max as f64 / 1000.0);
+                            let mut ms = cur.unwrap_or(r.default) as f64 / 1000.0;
+                            let how = if log2 {
+                                "The camera itself only doubles or halves its exposure; times in between are\n\
+                                 made by brightening the next shorter step in software (up to 2x), and times\n\
+                                 past its longest by adding frames."
+                            } else {
+                                "Set in steps of 0.1 ms."
+                            };
+                            let step = v.map(|v| format!("\nCamera exposure value now: {v}")).unwrap_or_default();
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().slider_width = 150.0;
+                                let slider = ui.add(egui::Slider::new(&mut ms, lo..=hi).logarithmic(true).show_value(false));
+                                let speed = ms * 0.005;
+                                let field = ui.add(egui::DragValue::new(&mut ms).range(lo..=hi).speed(speed).max_decimals(2)
+                                    .suffix(" ms").update_while_editing(false))
+                                    .on_hover_text(format!("Exposure time. Type a number of milliseconds, or drag.\n{how}{step}"));
+                                if slider.changed() || field.changed() {
+                                    changes.push((EXPOSURE_US, (ms * 1000.0).round() as i64));
+                                }
+                                if slider.is_pointer_button_down_on() || field.is_pointer_button_down_on() {
+                                    holding = Some((EXPOSURE_US.to_string(), (ms * 1000.0).round() as i64));
+                                }
+                            });
+                        }
                         Some((Some(r), v, log2)) if open => {
                             let mut value = v.unwrap_or(r.default);
                             let text = if name == "exposure" { format!("{value}  (~{})", format_exposure(value as f64, log2)) } else { value.to_string() };
@@ -362,6 +391,9 @@ impl App {
                     .custom_formatter(|v, _| if v == 0.0 { "no limit".into() } else { format!("{v:.0} s") }));
                 ui.end_row();
             });
+            ui.checkbox(&mut r.draw_analysis, "Draw fiber axes on the video")
+                .on_hover_text("Records the fiber axes and the angle readout as shown in the view.
+                                Turn on Update live in Fiber axis so they follow the camera.");
             let text = if recording { "Stop recording" } else { "Record" };
             if big_button(ui, text, open).clicked() {
                 self.request_recording(!recording);

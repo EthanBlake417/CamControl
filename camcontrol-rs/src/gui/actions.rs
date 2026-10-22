@@ -19,7 +19,7 @@ use super::style::{CrosshairStyle, GridStyle};
 use super::view::ViewEvent;
 use super::views::{self, LAYOUTS, MAX_VIEWS};
 use super::{Action, App, FiberKind, FiberRequest, Pane, ProcessJob, ResultInfo, FIBER_LIVE_INTERVAL};
-use crate::camera::worker::{CameraLink, CaptureRequest, Cmd, Ev, TimeLapse};
+use crate::camera::worker::{CameraLink, CaptureRequest, Cmd, Ev, RecordOverlay, TimeLapse};
 use crate::camera::{camera_list, DeviceKey};
 use crate::capture::{self, clean_name, next_capture_path, HD2_SCALE};
 use crate::export::{self, Cell, Sheet};
@@ -31,18 +31,41 @@ use crate::video::is_video;
 pub const SAVE_SCALES: [f64; 2] = [1.0, HD2_SCALE];
 const IMAGE_FILTER: [&str; 6] = ["tif", "tiff", "png", "jpg", "jpeg", "bmp"];
 
-fn file_name(p: &Path) -> String {
+pub(crate) fn file_name(p: &Path) -> String {
     p.file_name().unwrap_or_default().to_string_lossy().to_string()
 }
 
-fn timestamp() -> String {
+pub(crate) fn timestamp() -> String {
     chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
 }
 
 /// A save dialog's path, with a known extension (else `default_ext`).
-fn with_ext(path: PathBuf, allowed: &[&str], default_ext: &str) -> PathBuf {
+pub(crate) fn with_ext(path: PathBuf, allowed: &[&str], default_ext: &str) -> PathBuf {
     let ok = path.extension().is_some_and(|e| allowed.contains(&e.to_string_lossy().to_lowercase().as_str()));
     if ok { path } else { path.with_extension(default_ext) }
+}
+
+const FIBER_HEADERS: &[&str] = &["#", "Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity", "Method", "Clear",
+                                 "Threshold (noise x)", "Rod outline found", "Centre x (px)", "Centre y (px)", "Axis x (px)",
+                                 "Axis y (px)", "Diameter (px)", "Image"];
+
+fn fiber_row(i: usize, f: &FiberAxis, source: &str) -> Vec<Cell> {
+    let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
+    let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
+    let (ax, ay) = f.axis_point();
+    vec![
+        Cell::Num((i + 1) as f64),
+        Cell::Text(f.fiber_type.clone()),
+        r2(super::annotate::signed_angle(f.slow_deg)),
+        r2(super::annotate::signed_angle(f.fast_deg())),
+        Cell::Num((f.elongation * 1000.0).round() / 1000.0),
+        Cell::Text(method_label(&f.method).into()),
+        Cell::Bool(f.clear()),
+        if f.method == "rods" { Cell::Empty } else { r2(f.threshold) },
+        f.coverage.map(|c| Cell::Num((c * 1000.0).round() / 1000.0)).unwrap_or(Cell::Empty),
+        r1(f.cx), r1(f.cy), r1(ax), r1(ay), r1(2.0 * f.radius),
+        Cell::Text(source.into()),
+    ]
 }
 
 impl App {
@@ -485,6 +508,7 @@ impl App {
             for ev in events {
                 self.camera_event(ctx, id, ev);
             }
+            self.sync_record_overlay(i);
             if let Some(hold) = self.slider_hold.clone() {
                 if self.controlled == Some(id) {
                     if let Some(link) = self.pane_mut(id).camera.as_mut() {
@@ -493,8 +517,8 @@ impl App {
                 }
             }
             let pane = &mut self.panes[i];
-            if let (true, Some(f)) = (pane.live, frame) {
-                pane.view.set_image(ctx, f.clone());
+            if let (true, Some((f, tiles))) = (pane.live, frame) {
+                pane.view.set_image_tiles(ctx, f.clone(), tiles);
                 if id == self.active {
                     self.fps_label = fps.map(|f| format!("{f:.1} fps")).unwrap_or_default();
                 }
@@ -1159,7 +1183,7 @@ impl App {
 
     // --- exports ---------------------------------------------------------------------------------
 
-    fn export_path(&self, title: &str, stem: &str) -> Option<PathBuf> {
+    pub(crate) fn export_path(&self, title: &str, stem: &str) -> Option<PathBuf> {
         let default = format!("{stem}_{}.xlsx", timestamp());
         let path = rfd::FileDialog::new()
             .set_title(title)
@@ -1220,27 +1244,8 @@ impl App {
     }
 
     pub(crate) fn fiber_sheet(&self, source: &str) -> Sheet {
-        let rows = self.active_pane().fibers.iter().enumerate().map(|(i, f)| {
-            let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
-            let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
-            let (ax, ay) = f.axis_point();
-            vec![
-                Cell::Num((i + 1) as f64),
-                Cell::Text(f.fiber_type.clone()),
-                r2(super::annotate::signed_angle(f.slow_deg)),
-                r2(super::annotate::signed_angle(f.fast_deg())),
-                Cell::Num((f.elongation * 1000.0).round() / 1000.0),
-                Cell::Text(method_label(&f.method).into()),
-                Cell::Bool(f.clear()),
-                if f.method == "rods" { Cell::Empty } else { r2(f.threshold) },
-                f.coverage.map(|c| Cell::Num((c * 1000.0).round() / 1000.0)).unwrap_or(Cell::Empty),
-                r1(f.cx), r1(f.cy), r1(ax), r1(ay), r1(2.0 * f.radius),
-                Cell::Text(source.into()),
-            ]
-        }).collect();
-        Sheet::new("Fiber axes", &["#", "Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity", "Method", "Clear",
-                                   "Threshold (noise x)", "Rod outline found", "Centre x (px)", "Centre y (px)", "Axis x (px)",
-                                   "Axis y (px)", "Diameter (px)", "Image"], rows)
+        let rows = self.active_pane().fibers.iter().enumerate().map(|(i, f)| fiber_row(i, f, source)).collect();
+        Sheet::new("Fiber axes", FIBER_HEADERS, rows)
     }
 
     pub(crate) fn export_fiber_axes(&mut self) {
@@ -1347,6 +1352,7 @@ impl App {
         let n = axes.len();
         let unclear = axes.iter().filter(|f| !f.clear()).count();
         self.pane_mut(req.pane).fibers = axes;
+        self.record_fibers(req.pane);
         if req.kind == FiberKind::Find {
             if n > 0 {
                 let note = if unclear > 0 { format!(" ({unclear} unclear)") } else { String::new() };
@@ -1413,6 +1419,24 @@ impl App {
             link.send(Cmd::Record { folder, name, fmt: r.video_format.clone(), fps: r.video_fps as f64, max_seconds: r.video_limit as f64 });
         } else {
             link.send(Cmd::RecordStop);
+        }
+    }
+
+    /// Tells a recording camera which fiber axes to draw on the video, when they change.
+    fn sync_record_overlay(&mut self, i: usize) {
+        let pane = &self.panes[i];
+        let Some(link) = pane.camera.as_ref() else { return };
+        let on = link.recording && pane.live && self.saved.recording.draw_analysis && !pane.fibers.is_empty();
+        let show_parts = self.fiber.show_parts;
+        let same = match &link.overlay_sent {
+            None => !on,
+            Some(o) => on && o.show_parts == show_parts && o.axes == pane.fibers,
+        };
+        if !same {
+            let want = on.then(|| RecordOverlay { axes: pane.fibers.clone(), show_parts });
+            let link = self.panes[i].camera.as_mut().unwrap();
+            link.send(Cmd::RecordOverlay(want.clone()));
+            link.overlay_sent = want;
         }
     }
 

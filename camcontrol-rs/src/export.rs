@@ -20,7 +20,7 @@ impl Cell {
         v.map(Cell::Num).unwrap_or(Cell::Empty)
     }
 
-    fn csv(&self) -> String {
+    pub fn csv(&self) -> String {
         match self {
             Cell::Empty => String::new(),
             Cell::Num(v) => format_num(*v),
