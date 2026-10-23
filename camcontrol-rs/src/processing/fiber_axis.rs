@@ -8,7 +8,7 @@
 //!
 //! For each fiber: find the cladding circle, then the slow axis by one of
 //! METHODS ("auto" picks rods for Panda fibers, mirror symmetry for Bow-tie
-//! and Elliptical ones). Angles are in degrees, counter-clockwise from
+//! and Elliptical ones, and the apple core when the rods are washed out). Angles are in degrees, counter-clockwise from
 //! horizontal as seen on screen, 0 to 180.
 
 use std::f64::consts::PI;
@@ -51,11 +51,18 @@ const CORE_SEARCH: f64 = 0.15;      // a visible core spot is looked for within 
 const CORE_SIGNIFICANCE: f32 = 8.0; // ... standing out this many noise levels from the cladding
 const CORE_SPREAD: f64 = 0.08;      // rod pairs centred further from it than this (fraction of the radius) count less
 const CORE_TIE: f32 = 0.9;          // ... among the pairs ranked at least this share of the best
+const APPLE_REACH: f64 = 0.3;       // the apple core is looked at within this fraction of the radius
+const APPLE_SIZE: f64 = 100.0;      // ... on a copy this many pixels across that reach
+const APPLE_SYMMETRY: (f64, f64) = (0.8, 0.3); // mirror correlation needed about its better and its other axis
+const APPLE_PINCH: f64 = 0.05;      // the pinched sides' corners reaching this much (share of the middle) further than the others'
+const APPLE_SIDE: f64 = 75.0;       // degrees either side of an axis to trace the outline
+const APPLE_AGREE: f64 = 3.0;       // degrees: rods and apple core agreeing
 
 /// name, label in the panel
-pub const METHODS: [(&str, &str); 5] = [
+pub const METHODS: [(&str, &str); 6] = [
     ("auto", "Automatic"),
     ("rods", "Panda rod outlines"),
+    ("core", "Apple core"),
     ("symmetry", "Mirror symmetry"),
     ("centres", "Stress part centres"),
     ("moments", "Second moments"),
@@ -116,6 +123,8 @@ pub struct FiberAxis {
     pub turned_gain: Option<f64>,
     /// Brightness (0-255) of the brightest spot near the centre (light in the core), see centre_brightness.
     pub centre_brightness: Option<f64>,
+    /// Measured from the apple core (see apple_core): whether it was clear.
+    pub core_clear: Option<bool>,
 }
 
 impl FiberAxis {
@@ -139,6 +148,7 @@ impl FiberAxis {
             rod_radii: Vec::new(),
             turned_gain: None,
             centre_brightness: None,
+            core_clear: None,
         }
     }
 
@@ -154,6 +164,9 @@ impl FiberAxis {
     }
 
     pub fn clear(&self) -> bool {
+        if let Some(c) = self.core_clear {
+            return c;
+        }
         if let Some(q) = self.quality {
             return q >= MIN_ROD_QUALITY && self.coverage.unwrap_or(0.0) >= MIN_ROD_COVERAGE;
         }
@@ -223,9 +236,33 @@ pub fn find_fibers(image: &RgbImage, max_fibers: usize) -> Vec<(f64, f64, f64)> 
     if found.is_empty() {
         found = find_hough_circles(&gray, 10);
     }
+    found = faint_cladding_around(&gray, found);
     found.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     found.truncate(max_fibers);
     found
+}
+
+/// Below this share of the image's short side, a "fiber" may be just its bright core.
+const SMALL_FIBER: f64 = 0.15;
+
+/// With the cladding about as bright as the background, only a lit core stands out
+/// and passes for a small fiber: if a faint circle (and no strong one) surrounds it,
+/// that's the cladding. A strong circle could be the microscope's field stop instead.
+fn faint_cladding_around(gray: &image::GrayImage, found: Vec<(f64, f64, f64)>) -> Vec<(f64, f64, f64)> {
+    let small = SMALL_FIBER * gray.width().min(gray.height()) as f64;
+    if found.is_empty() || found.iter().any(|c| c.2 >= small) || hough_circles(gray, 10, 800.0, None).iter().any(|h| h.2 >= small) {
+        return found;
+    }
+    let inside = |c: &(f64, f64, f64), h: &(f64, f64, f64)| (c.0 - h.0).hypot(c.1 - h.1) + c.2 < h.2 && h.2 > 3.0 * c.2;
+    let claddings: Vec<_> = refine_faint(gray, hough_circles(gray, 10, 400.0, Some(FAINT_EDGES))).into_iter()
+        .filter(|h| found.iter().any(|c| inside(c, h)))
+        .collect();
+    if claddings.is_empty() {
+        return found;
+    }
+    let mut kept: Vec<_> = found.into_iter().filter(|c| !claddings.iter().any(|h| inside(c, h))).collect();
+    kept.extend(claddings);
+    kept
 }
 
 /// Just the circle whose centre is nearest the middle of a w x h image.
@@ -543,13 +580,44 @@ fn round_regions(gray: &image::GrayImage, bright: &Mask) -> Vec<(f64, f64, f64)>
 
 /// Circles by edges voting along their gradient for centres (as
 /// cv2.HoughCircles HOUGH_GRADIENT does), on a smaller copy. The last resort.
+/// A fiber on a bright background (lit from the front, or grey) has only a faint
+/// edge, below the usual edge strength: then look again on a smaller, smoother
+/// copy, taking this image's strongest edges, whatever their strength.
 fn find_hough_circles(gray: &image::GrayImage, max_fibers: usize) -> Vec<(f64, f64, f64)> {
+    let found = hough_circles(gray, max_fibers, 800.0, None);
+    if !found.is_empty() {
+        return found;
+    }
+    refine_faint(gray, hough_circles(gray, max_fibers, 400.0, Some(FAINT_EDGES)))
+}
+
+/// The faint pass's circles are rough (found on a small copy): fit each to its cladding edge.
+fn refine_faint(gray: &image::GrayImage, circles: Vec<(f64, f64, f64)>) -> Vec<(f64, f64, f64)> {
+    circles.into_iter().map(|c| match fit_cladding_edge(gray, c.0, c.1, c.2, 360) {
+        Some(f) if (f.2 - c.2).abs() < 0.2 * c.2 && (f.0 - c.0).hypot(f.1 - c.1) < 0.2 * c.2 => f,
+        _ => c,
+    }).collect()
+}
+
+/// Faint-edge pass: the strongest this share of the image counts as edges (if stronger than noise).
+const FAINT_EDGES: f64 = 0.04;
+const FAINT_EDGE_MIN: f32 = 6.0;
+
+/// `faint`: None = edges of fixed strength; Some(share) = this image's strongest `share` of gradients.
+fn hough_circles(gray: &image::GrayImage, max_fibers: usize, size: f64, faint: Option<f64>) -> Vec<(f64, f64, f64)> {
     let (w, h) = (gray.width() as f64, gray.height() as f64);
-    let scale = (800.0 / w.max(h)).min(1.0);
+    let scale = (size / w.max(h)).min(1.0);
     let small = ip::resize_gray(gray, rne(w * scale) as u32, rne(h * scale) as u32, ip::Interp::Area);
     let small = ip::median_blur(&small, 5);
     let f = ImgF::from_gray(&small);
     let (gx, gy) = (ip::sobel(&f, true), ip::sobel(&f, false));
+    let threshold = match faint {
+        None => 120.0, // Canny's high threshold, roughly
+        Some(share) => {
+            let mags: Vec<f32> = gx.data.iter().zip(&gy.data).map(|(a, b)| a.hypot(*b)).collect();
+            ip::percentile(&mags, 100.0 * (1.0 - share)).max(FAINT_EDGE_MIN) as f64
+        }
+    };
     let short = small.width().min(small.height()) as f64;
     let (min_r, max_r) = (rne(short * 0.06), rne(short * 0.5));
     let dp = 1.5;
@@ -560,8 +628,8 @@ fn find_hough_circles(gray: &image::GrayImage, max_fibers: usize) -> Vec<(f64, f
         for x in 1..f.w - 1 {
             let (dx, dy) = (gx.at(x, y) as f64, gy.at(x, y) as f64);
             let mag = dx.hypot(dy);
-            if mag < 120.0 {
-                continue; // Canny's high threshold, roughly
+            if mag < threshold {
+                continue;
             }
             edges.push((x as f64, y as f64));
             let (ux, uy) = (dx / mag, dy / mag);
@@ -1444,6 +1512,12 @@ fn shape_fits(g: &Grads, cx: f64, cy: f64, rods: &[(f64, f64, f64)]) -> [(String
 fn measure_auto(image: &RgbImage, cx: f64, cy: f64, radius: f64, detection: &Detection) -> FiberAxis {
     let grads = rod_gradients(image, cx, cy, radius);
     let found = measure_rods(image, cx, cy, radius, Some(&grads), detection.min_rod);
+    if !found.clear() {
+        // Washed-out rods: a clear apple core still shows the axes.
+        if let Some(core) = apple_core(image, cx, cy, radius).filter(AppleCore::clear) {
+            return core.axis(cx, cy, radius);
+        }
+    }
     if found.quality.unwrap_or(0.0) < OTHER_SHAPE_QUALITY {
         return found;
     }
@@ -1459,7 +1533,145 @@ fn measure_auto(image: &RgbImage, cx: f64, cy: f64, radius: f64, detection: &Det
     }
     let mut result = measure_axis(image, cx, cy, radius, "symmetry", false, detection);
     result.fiber_type = other.0.clone();
+    // The bright pattern round a Panda's core can fit a wedge or an ellipse better than
+    // faint rods do: if the rods and the apple core agree, and the other shape doesn't, keep the rods.
+    if let Some(core) = apple_core(image, cx, cy, radius).filter(AppleCore::clear) {
+        if axial_diff(core.slow_deg, found.slow_deg) < APPLE_AGREE && axial_diff(core.slow_deg, result.slow_deg) >= APPLE_AGREE {
+            return found;
+        }
+    }
     result
+}
+
+/// Difference of two axis angles (degrees, wrapping every 180°), 0 to 90.
+fn axial_diff(a: f64, b: f64) -> f64 {
+    let d = (a - b).rem_euclid(180.0);
+    d.min(180.0 - d)
+}
+
+/// The "apple core": the bright region round a Panda fiber's core, pinched on the two
+/// sides where the rods press on it. Its two mirror axes are the fiber's axes, and its
+/// long pinched sides face the rods, so the axis their edges point along is the slow one.
+/// It often stays sharp when the rods are washed out (grey, front-lit pictures).
+#[derive(Clone, Copy, Debug)]
+pub struct AppleCore {
+    pub slow_deg: f64,
+    /// Mirror correlation (-1 to 1) about the better and the other axis.
+    pub symmetry: (f64, f64),
+    /// How far the outline reaches along the slow and the fast axis, over its distance where
+    /// the axis crosses it: 1 = straight or bulging side, more = pinched (concave).
+    pub pinch: (f64, f64),
+}
+
+impl AppleCore {
+    pub fn clear(&self) -> bool {
+        self.symmetry.0.max(self.symmetry.1) >= APPLE_SYMMETRY.0
+            && self.symmetry.0.min(self.symmetry.1) >= APPLE_SYMMETRY.1
+            && self.pinch.0 - self.pinch.1 >= APPLE_PINCH
+    }
+
+    fn axis(&self, cx: f64, cy: f64, radius: f64) -> FiberAxis {
+        let mut f = FiberAxis::new(cx, cy, radius, self.slow_deg, 1.0, if self.clear() { "Panda" } else { "?" }, 0);
+        f.method = "core".into();
+        f.core_clear = Some(self.clear());
+        f
+    }
+}
+
+/// The apple core round (cx, cy), or None if that part of the fiber is off the image.
+pub fn apple_core(image: &RgbImage, cx: f64, cy: f64, radius: f64) -> Option<AppleCore> {
+    let reach = radius * APPLE_REACH;
+    if cx - reach < 0.0 || cy - reach < 0.0 || cx + reach > image.width() as f64 || cy + reach > image.height() as f64 || reach < 4.0 {
+        return None;
+    }
+    let gray = ImgF::from_gray(&ip::to_gray(image));
+    let k = (reach.min(APPLE_SIZE)) as usize; // half-size of the copy
+    let step = reach / k as f64;
+    let n = 2 * k;
+    let mut crop = ImgF::new(n, n);
+    for y in 0..n {
+        for x in 0..n {
+            let (u, v) = (cx + (x as f64 - k as f64 + 0.5) * step, cy + (y as f64 - k as f64 + 0.5) * step);
+            crop.data[y * n + x] = ip::sample(&gray, u as f32 - 0.5, v as f32 - 0.5);
+        }
+    }
+    let crop = ip::gaussian_blur(&crop, k as f64 / 60.0);
+    let half = k as f64;
+    let disc: Vec<(usize, usize)> = (0..n * n)
+        .map(|i| (i % n, i / n))
+        .filter(|&(x, y)| (x as f64 + 0.5 - half).hypot(y as f64 + 0.5 - half) < 0.95 * half)
+        .collect();
+    // Pearson correlation of the copy with its mirror image about the line at `deg`.
+    let mirror = |deg: f64| -> f64 {
+        let t = deg.to_radians();
+        let (ux, uy) = (t.cos(), -t.sin()); // y down
+        let (mut sa, mut sb, mut saa, mut sbb, mut sab) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        for &(x, y) in &disc {
+            let (px, py) = (x as f64 + 0.5 - half, y as f64 + 0.5 - half);
+            let d = px * ux + py * uy;
+            let (rx, ry) = (2.0 * d * ux - px, 2.0 * d * uy - py);
+            let a = crop.data[y * n + x] as f64;
+            let b = ip::sample(&crop, (rx + half - 0.5) as f32, (ry + half - 0.5) as f32) as f64;
+            sa += a;
+            sb += b;
+            saa += a * a;
+            sbb += b * b;
+            sab += a * b;
+        }
+        let m = disc.len() as f64;
+        let cov = sab / m - sa * sb / (m * m);
+        let var = ((saa / m - (sa / m).powi(2)) * (sbb / m - (sb / m).powi(2))).sqrt();
+        if var > 1e-9 { cov / var } else { 0.0 }
+    };
+    // Both axes at once: the best pair 90° apart, to 1° and then 0.1°.
+    let pair = |deg: f64| mirror(deg) + mirror(deg + 90.0);
+    let best = |angles: Vec<f64>| -> f64 {
+        let scores: Vec<f64> = std::thread::scope(|s| {
+            let jobs: Vec<_> = angles.chunks(angles.len().div_ceil(8)).map(|c| s.spawn(|| c.iter().map(|&a| pair(a)).collect::<Vec<_>>())).collect();
+            jobs.into_iter().flat_map(|j| j.join().unwrap()).collect()
+        });
+        let i = (0..scores.len()).max_by(|&a, &b| scores[a].partial_cmp(&scores[b]).unwrap()).unwrap();
+        angles[i]
+    };
+    let coarse = best(arange(0.0, 90.0, 1.0));
+    let theta = best(arange(coarse - 1.0, coarse + 1.001, 0.1)).rem_euclid(90.0);
+    // Which axis goes through the pinches: trace the outline (the strongest edge along rays
+    // from the centre) and see how far it reaches along each axis. A pinched side's corners
+    // reach further than its middle; a straight or bulging side's middle reaches furthest.
+    let ray_edge = |deg: f64| -> f64 {
+        let t = deg.to_radians();
+        let (ux, uy) = (t.cos(), -t.sin());
+        let at = |r: f64| ip::sample(&crop, (half + r * ux - 0.5) as f32, (half + r * uy - 0.5) as f32) as f64;
+        let mut best = (0.0, half);
+        let mut r = 0.1 * half;
+        while r < 0.93 * half {
+            let g = (at(r + 1.5) - at(r - 1.5)).abs();
+            if g > best.0 {
+                best = (g, r);
+            }
+            r += 0.5;
+        }
+        best.1
+    };
+    let pinch = |axis: f64| -> f64 {
+        let mut total = 0.0;
+        for end in [0.0, 180.0] {
+            let middle = [-2.0, 0.0, 2.0].iter().map(|d| ray_edge(axis + end + d)).sum::<f64>() / 3.0;
+            let reach = (1..=APPLE_SIDE as usize)
+                .flat_map(|d| [d as f64, -(d as f64)])
+                .map(|d| ray_edge(axis + end + d) * d.to_radians().cos())
+                .fold(middle, f64::max);
+            total += reach / middle.max(1.0);
+        }
+        total / 2.0
+    };
+    let (a, b) = (pinch(theta), pinch(theta + 90.0));
+    let (slow, other) = if a >= b { (theta, theta + 90.0) } else { (theta + 90.0, theta) };
+    Some(AppleCore {
+        slow_deg: slow.rem_euclid(180.0),
+        symmetry: (mirror(slow), mirror(other)),
+        pinch: (a.max(b), a.min(b)),
+    })
 }
 
 fn measure_rods(image: &RgbImage, cx: f64, cy: f64, radius: f64, grads: Option<&Grads>, min_rod: f64) -> FiberAxis {
@@ -1534,6 +1746,12 @@ pub fn measure_axis(image: &RgbImage, cx: f64, cy: f64, radius: f64, method: &st
     }
     if method == "rods" {
         return measure_rods(image, cx, cy, radius, None, detection.min_rod);
+    }
+    if method == "core" {
+        return match apple_core(image, cx, cy, radius) {
+            Some(core) => core.axis(cx, cy, radius),
+            None => FiberAxis::new(cx, cy, radius, 0.0, 1.0, "?", 0),
+        };
     }
     let (w, h) = (image.width() as i64, image.height() as i64);
     let x0 = ((cx - radius) as i64).max(0);
@@ -1835,7 +2053,7 @@ mod tests {
     fn drawn_panda_every_method() {
         for truth in [0.0, 30.0, 75.0, 120.0] {
             let img = drawn_panda(truth);
-            for (method, _) in METHODS {
+            for &(method, _) in METHODS.iter().filter(|m| m.0 != "core") {
                 let f = measure_axis(&img, 200.0, 200.0, 150.0, method, false, &Detection::default());
                 let used = if method == "auto" { "rods" } else { method };
                 assert!(angle_error(f.slow_deg, truth) < 2.0 && f.fiber_type == "Panda" && f.method == used,
@@ -1885,6 +2103,83 @@ mod tests {
         assert!(!found.is_empty());
         let (x, y, r) = found[0];
         assert!((x - 200.0).abs() < 2.0 && (y - 200.0).abs() < 2.0 && (r - 150.0).abs() < 3.0, "{found:?}");
+    }
+
+    /// A drawn apple core: wide, pinched top and bottom where the rods press (slow axis
+    /// through the pinch), its rods too faint to see.
+    fn drawn_apple_core(slow: f64) -> RgbImage {
+        let (c, r) = (300.0, 250.0);
+        let t = slow.to_radians();
+        let (sx, sy) = (t.cos(), -t.sin()); // along the slow axis, y down
+        let mut img = RgbImage::from_pixel(600, 600, image::Rgb([20, 20, 20]));
+        draw::fill_circle_px(&mut img, 300, 300, 250, [150, 150, 150]);
+        for (x, y, p) in img.enumerate_pixels_mut() {
+            let (px, py) = (x as f64 - c, y as f64 - c);
+            let (s, f) = (px * sx + py * sy, -px * sy + py * sx);
+            let (w, h) = (0.17 * r, 0.09 * r + 0.05 * r * (f / (0.17 * r)).powi(2));
+            if f.abs() < w && s.abs() < h {
+                p.0 = [220, 220, 220];
+            }
+        }
+        crate::imgproc::gaussian_blur_rgb(&img, 1.5)
+    }
+
+    #[test]
+    fn apple_core_gives_the_axes() {
+        for truth in [0.0, 30.0, 93.0, 150.0] {
+            let img = drawn_apple_core(truth);
+            let core = apple_core(&img, 300.0, 300.0, 250.0).unwrap();
+            assert!(core.clear() && angle_error(core.slow_deg, truth) < 1.0, "{truth}: {core:?}");
+            // No rods to see: Automatic falls back on the apple core.
+            let f = measure_axis(&img, 300.0, 300.0, 250.0, "auto", false, &Detection::default());
+            assert!(f.method == "core" && f.clear() && angle_error(f.slow_deg, truth) < 1.0, "{truth}: {f:?}");
+        }
+    }
+
+    /// The user's grey, front-lit captures of one Panda fiber (rods about vertical, often
+    /// washed out; a sharp apple core): every one found and measured within 4° of the rods'
+    /// direction by eye, except two that can't be (rods unclear; only the core lit).
+    #[test]
+    fn real_grey_captures() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/release/captures");
+        for name in ["180148", "180150", "180430", "180445", "180452", "180703", "180708", "180712", "180746", "180757",
+                     "181139", "181330", "181345", "181355", "181407", "181428", "181720"] {
+            let Some(img) = crate::capture::load_image(&dir.join(format!("cap_20261020_{name}.tif"))) else { return }; // not in the repository
+            let found = analyse(&img, None, "auto", false, &Detection::default(), false);
+            assert_eq!(found.len(), 1, "{name}");
+            assert!(found[0].clear() && angle_error(found[0].slow_deg, 93.0) < 4.0, "{name}: {:?}", found[0]);
+        }
+    }
+
+    /// A grey fiber on a grey background, as when lit from the front: only a faint
+    /// edge shows, with or without a lit core that stands out (the 2026-10-20 captures).
+    #[test]
+    fn finds_a_fiber_by_its_faint_edge() {
+        for lit_core in [false, true] {
+            let mut img = RgbImage::from_pixel(1280, 720, image::Rgb([150, 150, 150]));
+            draw::ring_px(&mut img, 660, 370, 330, 4, [134, 134, 134]);
+            for s in [-1, 1] {
+                draw::fill_circle_px(&mut img, 660, 370 + s * 165, 95, [140, 140, 140]);
+            }
+            if lit_core {
+                draw::fill_circle_px(&mut img, 660, 370, 45, [255, 255, 255]);
+            }
+            // Uneven light (brighter on the left, so a brightness threshold splits the image, not the fiber) and a little sensor noise.
+            let mut seed = 12345u32;
+            for (x, _, p) in img.enumerate_pixels_mut() {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let v = p.0[0] as i32 + 45 - (x as i32 * 90 / 1280) + (seed >> 24) as i32 % 9 - 4;
+                let v = v.clamp(0, 255) as u8;
+                p.0 = [v, v, v];
+            }
+            let img = crate::imgproc::gaussian_blur_rgb(&img, 1.5);
+            let found = find_fibers(&img, 10);
+            assert!(!found.is_empty(), "lit core {lit_core}: nothing found");
+            let (x, y, r) = found[0];
+            // The cladding (not the core, not nothing), roughly: a thin drawn ring isn't refined
+            // like a real edge, so how closely is checked on the real captures by eye.
+            assert!((x - 660.0).hypot(y - 370.0) < 33.0 && (r - 330.0).abs() < 33.0, "lit core {lit_core}: {found:?}");
+        }
     }
 
     /// Big rods at 30 deg, and a pair of smaller, crisper rings at 120 deg:

@@ -181,19 +181,17 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
         if show_parts {
             c.ellipse(pivot, style.marker * 1.5, style.marker * 1.5, Some([255, 255, 255, 255]), (width / 2.0).max(1.0), Dash::Solid, None);
         }
-        // Just the number here; the angles are in the readout (draw_fiber_readout).
-        let above = (centre.0 - r * 0.7, centre.1 - r * LINE_LENGTH as f32 - style.font_px * 2.2);
-        label(c, above, &(i + 1).to_string(), SLOW_COLOR, style.font_px);
+        // No tag on the fiber: they're numbered left to right in the readout (draw_fiber_readout).
     }
 }
 
-/// One readout line per fiber: number, slow axis angle, and "(unclear)" when unsure;
+/// One readout line per fiber (numbered left to right): slow and fast axis angles, and "(unclear)" when unsure;
 /// with several fibers, a last line saying which has the brightest centre.
 pub fn fiber_readout_lines(axes: &[FiberAxis]) -> Vec<String> {
     let mut lines: Vec<String> = axes
         .iter()
         .enumerate()
-        .map(|(i, f)| format!("{}: slow axis {}°{}", i + 1, fmt_angle(f.slow_deg), if f.clear() { "" } else { " (unclear)" }))
+        .map(|(i, f)| format!("{}: slow {}°  fast {}°{}", i + 1, fmt_angle(f.slow_deg), fmt_angle(f.fast_deg()), if f.clear() { "" } else { " (unclear)" }))
         .collect();
     if let Some((i, position)) = brightest_centre(axes) {
         lines.push(format!("Brightest centre: position {position} from right (fiber {})", i + 1));

@@ -24,7 +24,8 @@ const BIG_BUTTON: f32 = 40.0;
 
 fn method_tip(name: &str) -> &'static str {
     match name {
-        "auto" => "Works out the fiber type and uses the best method for it: Panda rod outlines\nfor Panda fibers, Mirror symmetry for Bow-tie and Elliptical ones.",
+        "auto" => "Works out the fiber type and uses the best method for it: Panda rod outlines\nfor Panda fibers, Mirror symmetry for Bow-tie and Elliptical ones; the Apple core\nwhen the rods are washed out (or to confirm them).",
+        "core" => "For Panda fibers: the bright \"apple core\" round the fiber's core, pinched on the\ntwo sides where the rods press on it. Its mirror axes are the fiber's axes; the one\nthrough the pinches is the slow axis. Works when the rods are washed out (grey or\nfront-lit pictures). Unclear if the core isn't symmetric or isn't pinched.",
         "rods" => "For Panda fibers: finds the round outlines of the two stress rods and takes\nthe line through their centres. Uses only edges, so shading and dark patches\ndon't matter, and needs no detection settings. Unclear if the outlines are faint\nor not round (e.g. Bow-tie fibers: use Mirror symmetry for those).",
         "symmetry" => "The line the end face is most mirror-symmetric about (and at 90° to it).\nNo threshold; lopsided stress parts don't pull it.",
         "centres" => "The line through the centres of the two stress parts (Panda, Bow-tie).\nEach part counts the same whatever its shape. Elliptical fibers use Second moments.",
