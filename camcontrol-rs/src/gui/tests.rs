@@ -346,11 +346,11 @@ fn records_the_fiber_axes_on_the_video() {
     let avi = files(&t.dir, "avi");
     let mut r = crate::video::VideoReader::open(&avi[0]).unwrap();
     let last = r.frame(r.frame_count - 1).unwrap();
-    // The green readout in the top-left corner (JPEG frames, so roughly green).
-    let green = (0..60).flat_map(|y| (0..300).map(move |x| (x, y)))
-        .filter(|&(x, y)| { let p = last.get_pixel(x, y).0; p[1] > 120 && p[1] > p[0] + 60 && p[1] > p[2] + 60 })
+    // The readout in the top-left corner: colored text (green number, magenta slow, amber fast; JPEG frames, so roughly).
+    let colored = (0..60).flat_map(|y| (0..300).map(move |x| (x, y)))
+        .filter(|&(x, y)| { let p = last.get_pixel(x, y).0; let (hi, lo) = (*p.iter().max().unwrap(), *p.iter().min().unwrap()); hi > 150 && hi - lo > 90 })
         .count();
-    assert!(green > 50, "{green} green pixels");
+    assert!(colored > 50, "{colored} colored pixels");
 }
 
 #[test]
@@ -407,6 +407,28 @@ fn live_fiber_axes_and_moving_the_camera() {
     wait(&mut t, "frames in the new view", |a| a.pane(second).image().is_some());
 }
 
+/// Update live on a video: its frames are measured as it plays.
+#[test]
+fn live_fiber_axes_on_a_video() {
+    let (mut h, dir) = harness("fibervideo");
+    let png = dir.join("three.png");
+    three_fibers(&png);
+    let frame = image::open(&png).unwrap().to_rgb8();
+    let avi = dir.join("three.avi");
+    let mut w = crate::video::open_writer(&avi, "AVI (higher quality, large)", 10.0, frame.dimensions()).unwrap();
+    for _ in 0..40 {
+        w.write(&frame).unwrap();
+    }
+    w.finish().unwrap();
+    h.state_mut().fiber.live = true;
+    let ctx = h.state().ctx.clone();
+    let a = h.state().active;
+    h.state_mut().perform(&ctx, Action::OpenVideo(a, avi));
+    h.run_ok();
+    assert!(h.state().player.as_ref().is_some_and(|p| p.playing));
+    wait(&mut h, "fiber axes on the playing video", |s| s.active_pane().fibers.len() == 3);
+}
+
 /// Three Panda fibers in a row (as in a V-groove), the middle one with light in its core.
 fn three_fibers(path: &PathBuf) {
     let mut img = RgbImage::from_pixel(960, 340, Rgb([25, 25, 25]));
@@ -429,7 +451,7 @@ fn brightest_centre_histogram_and_fiber_crosshair() {
     open(&mut h, &path);
     h.state_mut().saved.crosshair = true;
     h.state_mut().saved.crosshair_style.anchor = "fiber".into();
-    h.state_mut().fiber.long_lines = true;
+    h.state_mut().saved.fiber_long_lines = true;
     h.state_mut().find_fiber_axes(false);
     wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
     let lines = super::annotate::fiber_readout_lines(&h.state().active_pane().fibers);
@@ -492,7 +514,7 @@ fn render_shots() {
     t.state_mut().perform(&ctx, Action::OpenImage(id, three));
     t.state_mut().saved.crosshair = true;
     t.state_mut().saved.crosshair_style.anchor = "fiber".into();
-    t.state_mut().fiber.long_lines = true;
+    t.state_mut().saved.fiber_long_lines = true;
     t.state_mut().find_fiber_axes(false);
     wait(&mut t, "fiber axes", |a| a.active_pane().fibers.len() == 3);
     t.state_mut().panels.set_open(PanelId::Histogram, true);
@@ -500,4 +522,8 @@ fn render_shots() {
     shot(&mut t, "5_brightest_histogram");
     t.state_mut().panels.set_open(PanelId::Fiber, true);
     shot(&mut t, "6_fiber_panel");
+    t.state_mut().fiber.advanced = true;
+    t.state_mut().overlay_open = true;
+    t.state_mut().overlay_tab = "fiber".into();
+    shot(&mut t, "7_fiber_advanced_overlay");
 }

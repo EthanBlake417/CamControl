@@ -770,9 +770,21 @@ impl App {
     }
 
     pub(crate) fn show_video_frame(&mut self, ctx: &egui::Context, id: u64, frame: Arc<RgbImage>) {
-        if self.pane_opt(id).is_some() {
-            self.pane_mut(id).view.set_image(ctx, frame);
+        if self.pane_opt(id).is_none() {
+            return;
         }
+        self.pane_mut(id).view.set_image(ctx, frame.clone());
+        // Update live: while playing, as often as the measuring keeps up (following the fibers,
+        // frames that come while it's busy are skipped); a paused or stepped-to frame, always.
+        if self.fiber.live {
+            let playing = self.player.as_ref().is_some_and(|p| p.pane == id && p.playing);
+            self.request_fibers(id, frame, if playing { FiberKind::Live } else { FiberKind::Image });
+        }
+    }
+
+    /// Whether this view is showing a video's frames.
+    fn plays_video(&self, id: u64) -> bool {
+        self.player.as_ref().is_some_and(|p| p.pane == id)
     }
 
     pub(crate) fn player_actions(&mut self, actions: Vec<PlayerAction>) {
@@ -874,7 +886,7 @@ impl App {
                 match Player::open(&path, id) {
                     Err(e) => self.warn("CamControl", format!("Could not play {}: {e}", path.display())),
                     Ok((mut player, first)) => {
-                        self.pane_mut(id).view.set_image(ctx, first);
+                        self.pane_mut(id).view.set_image(ctx, first.clone());
                         let p = self.pane_mut(id);
                         p.title = file_name(&path);
                         p.path = Some(path.clone());
@@ -882,6 +894,9 @@ impl App {
                         p.fibers.clear();
                         player.play();
                         self.player = Some(player);
+                        if self.fiber.live {
+                            self.request_fibers(id, first, FiberKind::Live);
+                        }
                         if id == self.active {
                             self.gallery.set_open_path(Some(&path));
                         }
@@ -967,6 +982,18 @@ impl App {
     pub(crate) fn view_event(&mut self, id: u64, e: ViewEvent) {
         match e {
             ViewEvent::Activated => self.set_active(id),
+            ViewEvent::Drawn(k, points) if self.picking_rod => {
+                self.picking_rod = false;
+                self.tool = None;
+                if k == "circle_centre" && points.len() >= 2 {
+                    let r = (points[1].0 - points[0].0).hypot(points[1].1 - points[0].1).round();
+                    self.fiber.detection.min_rod_px = r;
+                    self.message(format!("Smallest rod: {r:.0} px radius"), Some(5.0));
+                    if self.fiber.live {
+                        self.find_fiber_axes(true);
+                    }
+                }
+            }
             ViewEvent::Drawn(k, points) => {
                 let cal = self.calibration.clone();
                 let p = self.pane_mut(id);
@@ -986,6 +1013,7 @@ impl App {
             ViewEvent::ToolExit => {
                 self.tool = None;
                 self.counting = false;
+                self.picking_rod = false;
             }
             ViewEvent::CountAdd(x, y) => {
                 if self.counting {
@@ -1261,7 +1289,7 @@ impl App {
         let (ip, dp) = (Self::beside(&path, "image"), Self::beside(&path, "axes"));
         let r = export::write_tables(&[sheet], &path, false)
             .and_then(|_| image.save(&ip).map_err(|e| e.to_string()))
-            .and_then(|_| super::annotate::render_fiber_axes(&image, &axes, self.fiber.drawing()).save(&dp).map_err(|e| e.to_string()));
+            .and_then(|_| super::annotate::render_fiber_axes(&image, &axes, self.fiber_drawing()).save(&dp).map_err(|e| e.to_string()));
         match r {
             Ok(()) => self.message(format!("Exported {} fibers to {}, {} and {}", axes.len(), file_name(&path), file_name(&ip), file_name(&dp)), Some(8.0)),
             Err(e) => self.warn("Export fiber axes", format!("Export failed: {e}")),
@@ -1335,7 +1363,13 @@ impl App {
             if !p.live || (req.kind == FiberKind::Live && !self.fiber.live) {
                 return;
             }
-        } else if p.live || !p.image().is_some_and(|i| Arc::ptr_eq(&i, &req.image)) {
+        } else if p.live {
+            return;
+        } else if req.kind == FiberKind::Live && self.plays_video(req.pane) {
+            if !self.fiber.live {
+                return; // a playing video's frame: shown even though the video has moved on
+            }
+        } else if !p.image().is_some_and(|i| Arc::ptr_eq(&i, &req.image)) {
             return; // not the image shown any more
         }
         // Left to right, then top to bottom, so numbers stay put between live updates.
@@ -1428,7 +1462,7 @@ impl App {
         let pane = &self.panes[i];
         let Some(link) = pane.camera.as_ref() else { return };
         let on = link.recording && pane.live && self.saved.recording.draw_analysis && !pane.fibers.is_empty();
-        let drawing = self.fiber.drawing();
+        let drawing = self.fiber_drawing();
         let same = match &link.overlay_sent {
             None => !on,
             Some(o) => on && o.drawing == drawing && o.axes == pane.fibers,
@@ -1458,14 +1492,6 @@ impl App {
         }
         self.tl_info = Some((0, count, crate::camera::worker::now_epoch()));
         self.tl_status = "Starting...".into();
-    }
-
-    // --- grid and crosshair -------------------------------------------------------------------------
-
-    pub(crate) fn show_overlay_settings(&mut self, tab: &str) {
-        if tab == "crosshair" { self.saved.crosshair = true } else { self.saved.grid = true }
-        self.overlay_tab = tab.into();
-        self.overlay_open = true;
     }
 
     // --- settings files --------------------------------------------------------------------------------

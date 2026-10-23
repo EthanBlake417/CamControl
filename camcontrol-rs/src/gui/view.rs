@@ -576,14 +576,15 @@ impl ImageView {
             annotate::draw_marks(&mut canvas, counter, &to_screen, MARK_RADIUS_PX);
         }
         if !overlays.fibers.is_empty() {
-            let reach = rect.width() + rect.height(); // long lines run off the view
-            annotate::draw_fiber_axes(&mut canvas, overlays.fibers, &to_screen, zoom as f64, &style, overlays.fiber_selected, overlays.fiber_drawing, reach);
+            let area = ((rect.left(), rect.top()), (rect.right(), rect.bottom())); // long lines to the view's edges, as the crosshair
+            annotate::draw_fiber_axes(&mut canvas, overlays.fibers, &to_screen, zoom as f64, &style, overlays.fiber_selected, overlays.fiber_drawing, area);
         }
         if let Some(c) = overlays.crosshair {
-            // On a fiber: its centre, with the lines across the whole view to compare with its axes.
+            // On a fiber: where its axis lines cross, with the lines across the whole view to compare with its axes.
             let fiber = if c.anchor == "fiber" { overlays.fibers.get(overlays.fiber_selected.unwrap_or(0)) } else { None };
             let (area, mid) = if let Some(f) = fiber {
-                let p = to_screen(f.cx, f.cy);
+                let (ax, ay) = f.axis_point();
+                let p = to_screen(ax, ay);
                 (rect, Pos2::new(p.0, p.1))
             } else if c.anchor == "window" {
                 (rect, rect.center())
@@ -593,14 +594,25 @@ impl ImageView {
                 (area, area.center())
             };
             let (col, w, d) = (c.rgba(), c.width as f32, c.dash());
-            canvas.line((mid.x, area.top()), (mid.x, area.bottom()), col, w, d);
-            canvas.line((area.left(), mid.y), (area.right(), mid.y), col, w, d);
-            if c.circle > 0 {
-                canvas.ellipse((mid.x, mid.y), c.circle as f32, c.circle as f32, Some(col), w, d, None);
+            // With the axis lines outside the fiber, the crosshair on it stays outside too (no ring).
+            if fiber.is_some() && overlays.fiber_drawing.long_lines {
+                // Its lines skip every fiber, as the axis lines do.
+                let circles: Vec<_> = overlays.fibers.iter().map(|f| (to_screen(f.cx, f.cy), (f.radius * zoom as f64) as f32)).collect();
+                for (a, b) in [((mid.x, area.top()), (mid.x, area.bottom())), ((area.left(), mid.y), (area.right(), mid.y))] {
+                    for (p, q) in annotate::outside_circles(a, b, &circles) {
+                        canvas.line(p, q, col, w, d);
+                    }
+                }
+            } else {
+                canvas.line((mid.x, area.top()), (mid.x, area.bottom()), col, w, d);
+                canvas.line((area.left(), mid.y), (area.right(), mid.y), col, w, d);
+                if c.circle > 0 {
+                    canvas.ellipse((mid.x, mid.y), c.circle as f32, c.circle as f32, Some(col), w, d, None);
+                }
             }
         }
         // The angles stay in the view's top-left corner, whatever the zoom.
-        annotate::draw_fiber_readout(&mut canvas, overlays.fibers, (rect.left() + 8.0, rect.top() + 8.0), annotate::READOUT_PX);
+        annotate::draw_fiber_readout(&mut canvas, overlays.fibers, &overlays.fiber_drawing, (rect.left() + 8.0, rect.top() + 8.0), annotate::READOUT_PX);
 
         self.mouse = over.map(|p| self.to_image(p));
         self.hover = over.and_then(|cursor| {

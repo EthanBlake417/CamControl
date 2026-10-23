@@ -93,12 +93,27 @@ pub struct Detection {
     pub min_size: f64,
     /// Panda rod outlines: smallest rod radius considered, % of the fiber radius
     /// (smaller round things, such as dust or the core, are never taken for a rod).
+    /// Used when min_rod_px is 0.
     pub min_rod: f64,
+    /// The same in image pixels (0: not set), as drawn on the view; each fiber
+    /// gets it as its own share of its radius.
+    pub min_rod_px: f64,
 }
 
 impl Default for Detection {
     fn default() -> Self {
-        Self { threshold: None, smoothing: 1.0, look_at: "both".into(), min_size: 8.0, min_rod: DEFAULT_MIN_ROD }
+        Self { threshold: None, smoothing: 1.0, look_at: "both".into(), min_size: 8.0, min_rod: DEFAULT_MIN_ROD, min_rod_px: 0.0 }
+    }
+}
+
+impl Detection {
+    /// Smallest rod radius for a fiber of this radius (pixels), % of the radius.
+    pub fn min_rod_for(&self, radius: f64) -> f64 {
+        if self.min_rod_px > 0.0 && radius > 0.0 {
+            (100.0 * self.min_rod_px / radius).clamp(DEFAULT_MIN_ROD, MAX_MIN_ROD)
+        } else {
+            self.min_rod
+        }
     }
 }
 
@@ -128,7 +143,7 @@ pub struct FiberAxis {
 }
 
 impl FiberAxis {
-    fn new(cx: f64, cy: f64, radius: f64, slow_deg: f64, elongation: f64, fiber_type: &str, n_parts: usize) -> Self {
+    pub fn new(cx: f64, cy: f64, radius: f64, slow_deg: f64, elongation: f64, fiber_type: &str, n_parts: usize) -> Self {
         Self {
             cx,
             cy,
@@ -1511,7 +1526,7 @@ fn shape_fits(g: &Grads, cx: f64, cy: f64, rods: &[(f64, f64, f64)]) -> [(String
 
 fn measure_auto(image: &RgbImage, cx: f64, cy: f64, radius: f64, detection: &Detection) -> FiberAxis {
     let grads = rod_gradients(image, cx, cy, radius);
-    let found = measure_rods(image, cx, cy, radius, Some(&grads), detection.min_rod);
+    let found = measure_rods(image, cx, cy, radius, Some(&grads), detection.min_rod_for(radius));
     if !found.clear() {
         // Washed-out rods: a clear apple core still shows the axes.
         if let Some(core) = apple_core(image, cx, cy, radius).filter(AppleCore::clear) {
@@ -1745,7 +1760,7 @@ pub fn measure_axis(image: &RgbImage, cx: f64, cy: f64, radius: f64, method: &st
         return measure_auto(image, cx, cy, radius, detection);
     }
     if method == "rods" {
-        return measure_rods(image, cx, cy, radius, None, detection.min_rod);
+        return measure_rods(image, cx, cy, radius, None, detection.min_rod_for(radius));
     }
     if method == "core" {
         return match apple_core(image, cx, cy, radius) {

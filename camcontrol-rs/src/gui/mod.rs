@@ -58,7 +58,7 @@ use gallery::Gallery;
 use player::Player;
 use settings::Saved;
 use stripes::{Edge, PanelId, PanelLayout, STRIPE};
-use style::{CrosshairStyle, GridStyle};
+use style::{CrosshairStyle, FiberLineStyle, GridStyle};
 use view::{ImageView, Overlays, ViewEvent};
 
 const SETTINGS_KEY: &str = "camcontrol";
@@ -173,7 +173,6 @@ pub struct FiberSettings {
     pub method: String,
     pub parts_centre: bool,
     pub show_parts: bool,
-    pub long_lines: bool,
     pub centre_only: bool,
     pub use_circles: bool,
     pub advanced: bool,
@@ -182,9 +181,15 @@ pub struct FiberSettings {
     pub shown_threshold: f64,
 }
 
-impl FiberSettings {
-    pub fn drawing(&self) -> annotate::FiberDrawing {
-        annotate::FiberDrawing { show_parts: self.show_parts, long_lines: self.long_lines }
+impl App {
+    /// How fiber axes are drawn: the Fiber axis panel's and the overlay settings' choices.
+    pub(crate) fn fiber_drawing(&self) -> annotate::FiberDrawing {
+        annotate::FiberDrawing {
+            show_parts: self.fiber.show_parts,
+            long_lines: self.saved.fiber_long_lines,
+            slow: self.saved.fiber_lines.slow(),
+            fast: self.saved.fiber_lines.fast(),
+        }
     }
 }
 
@@ -208,6 +213,8 @@ pub struct App {
     pub(crate) tool: Option<String>,
     pub(crate) calibration: Calibration,
     pub(crate) counting: bool,
+    /// The next circle drawn on a view sets Smallest rod (Fiber axis panel) instead of becoming a measurement.
+    pub(crate) picking_rod: bool,
     pub(crate) count_class: usize,
     pub(crate) class_names: Vec<String>,
     pub(crate) fiber: FiberSettings,
@@ -271,6 +278,7 @@ impl App {
         saved.panels.repair();
         saved.grid_style = GridStyle::from_value(&serde_json::to_value(&saved.grid_style).unwrap());
         saved.crosshair_style = CrosshairStyle::from_value(&serde_json::to_value(&saved.crosshair_style).unwrap());
+        saved.fiber_lines = FiberLineStyle::from_value(&serde_json::to_value(&saved.fiber_lines).unwrap());
         let logo = image::load_from_memory(include_bytes!("../../../assets/get_logo.png")).ok().map(|i| {
             let i = i.to_rgba8();
             cc.egui_ctx.load_texture("logo", egui::ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], i.as_raw()), Default::default())
@@ -280,7 +288,6 @@ impl App {
             method: saved.fiber_method.clone(),
             parts_centre: saved.fiber_parts_centre,
             show_parts: saved.fiber_show_parts,
-            long_lines: saved.fiber_long_lines,
             centre_only: saved.fiber_centre_only,
             use_circles: true,
             advanced: saved.fiber_advanced,
@@ -313,6 +320,7 @@ impl App {
             tool: None,
             calibration: Calibration::pixels(),
             counting: false,
+            picking_rod: false,
             count_class: 0,
             class_names: default_names(),
             fiber,
@@ -572,13 +580,9 @@ impl App {
                     self.toggle_live(live);
                 }
                 ui.checkbox(&mut self.saved.grid, "Grid  (G)");
-                if ui.button("Grid settings...").clicked() {
-                    self.show_overlay_settings("grid");
-                    ui.close_menu();
-                }
                 ui.checkbox(&mut self.saved.crosshair, "Crosshair  (C)");
-                if ui.button("Crosshair settings...").clicked() {
-                    self.show_overlay_settings("crosshair");
+                if ui.button("Grid, crosshair and fiber axes settings...").clicked() {
+                    self.overlay_open = true;
                     ui.close_menu();
                 }
                 ui.separator();
@@ -845,7 +849,7 @@ impl App {
             let grid = self.saved.grid.then_some(&self.saved.grid_style);
             let crosshair = self.saved.crosshair.then_some(&self.saved.crosshair_style);
             let active = self.active;
-            let (cal, fiber_drawing) = (&self.calibration, self.fiber.drawing());
+            let (cal, fiber_drawing) = (&self.calibration, self.fiber_drawing());
             let idx = self.panes.iter().position(|p| p.id == *id).unwrap();
             let pane = &mut self.panes[idx];
             let overlays = Overlays {
@@ -920,7 +924,8 @@ impl App {
             }
         }
         if self.overlay_open {
-            self.overlay_open = dialogs::overlay_window(ctx, &mut self.overlay_tab, &mut self.saved.grid_style, &mut self.saved.crosshair_style);
+            let s = &mut self.saved;
+            self.overlay_open = dialogs::overlay_window(ctx, &mut self.overlay_tab, &mut s.grid_style, &mut s.crosshair_style, &mut s.fiber_long_lines, &mut s.fiber_lines);
         }
         if let Some(id) = self.choose_source {
             let mut open = true;
@@ -1017,7 +1022,6 @@ impl App {
         self.saved.fiber_centre_only = self.fiber.centre_only;
         self.saved.fiber_parts_centre = self.fiber.parts_centre;
         self.saved.fiber_show_parts = self.fiber.show_parts;
-        self.saved.fiber_long_lines = self.fiber.long_lines;
         self.saved.histogram_log = self.histogram.log;
         self.saved.histogram_colors = self.histogram.colors;
         self.saved.fiber_detection = self.fiber.detection.clone();

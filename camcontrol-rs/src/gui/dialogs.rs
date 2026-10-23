@@ -7,7 +7,7 @@ use eframe::egui;
 use image::RgbImage;
 use serde_json::{json, Value};
 
-use super::style::{color_hex, parse_color, CrosshairStyle, GridStyle, CROSSHAIR_ANCHORS, LINE_STYLES};
+use super::style::{color_hex, parse_color, CrosshairStyle, FiberLineStyle, GridStyle, CROSSHAIR_ANCHORS, LINE_STYLES};
 use crate::capture::IMAGE_EXTENSIONS;
 use crate::processing::{fluorescence, focus_stack, hdr, stitch};
 
@@ -244,17 +244,39 @@ fn color_button(ui: &mut egui::Ui, color: &mut String) -> bool {
 
 /// The non-modal Grid and crosshair window; the overlays follow every change.
 /// Returns true while open.
-pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyle, crosshair: &mut CrosshairStyle) -> bool {
+pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyle, crosshair: &mut CrosshairStyle,
+                      outside: &mut bool, fiber: &mut FiberLineStyle) -> bool {
     let mut open = true;
     let mut close = false;
-    egui::Window::new("Grid and crosshair").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+    egui::Window::new("Grid, crosshair and fiber axes").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.selectable_value(tab, "grid".into(), "Grid");
             ui.selectable_value(tab, "crosshair".into(), "Crosshair");
+            ui.selectable_value(tab, "fiber".into(), "Fiber axes");
         });
         ui.separator();
         egui::Grid::new("overlay").num_columns(2).show(ui, |ui| {
-            if tab == "crosshair" {
+            if tab == "fiber" {
+                ui.label("Lines:");
+                ui.checkbox(outside, "Outside the fiber").on_hover_text(
+                    "Draw each fiber's axis lines only outside the fibers, from the fiber's edge to the edges of the view\n\
+                     (as the crosshair), so they can be compared with the crosshair, the grid or lines in the image\n\
+                     without covering the fiber. With the crosshair centred on the fiber, its lines also stop at the\n\
+                     fibers' edges. Also used for exported drawings (to the picture's edges) and videos.");
+                ui.end_row();
+                ui.label("Slow axis:");
+                color_button(ui, &mut fiber.slow_color);
+                ui.end_row();
+                ui.label("Opacity:");
+                ui.add(egui::Slider::new(&mut fiber.slow_opacity, 5..=100).suffix("%"));
+                ui.end_row();
+                ui.label("Fast axis:");
+                color_button(ui, &mut fiber.fast_color);
+                ui.end_row();
+                ui.label("Opacity:");
+                ui.add(egui::Slider::new(&mut fiber.fast_opacity, 5..=100).suffix("%"));
+                ui.end_row();
+            } else if tab == "crosshair" {
                 ui.label("Centred on:");
                 let label = CROSSHAIR_ANCHORS.iter().find(|a| a.0 == crosshair.anchor).map(|a| a.1).unwrap_or("");
                 egui::ComboBox::from_id_salt("anchor").selected_text(label).show_ui(ui, |ui| {
@@ -304,9 +326,19 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
                 ui.end_row();
             }
         });
+        if tab == "fiber" {
+            ui.label(egui::RichText::new("The colors are also used for the angles in the readout.").weak());
+        }
         ui.horizontal(|ui| {
             if ui.button("Defaults").on_hover_text("Back to the standard look").clicked() {
-                if tab == "crosshair" { *crosshair = CrosshairStyle::default() } else { *grid = GridStyle::default() }
+                match tab.as_str() {
+                    "crosshair" => *crosshair = CrosshairStyle::default(),
+                    "fiber" => {
+                        *outside = false;
+                        *fiber = FiberLineStyle::default();
+                    }
+                    _ => *grid = GridStyle::default(),
+                }
             }
             if ui.button("Close").clicked() {
                 close = true;

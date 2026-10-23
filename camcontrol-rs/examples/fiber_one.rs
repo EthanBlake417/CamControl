@@ -29,7 +29,7 @@ fn main() {
     println!("live update (following): {:.0} ms, angles {:?}", t.elapsed().as_secs_f64() * 1000.0,
              followed.iter().map(|f| format!("{:.2}", f.slow_deg)).collect::<Vec<_>>());
     if let Some(out) = std::env::var_os("FIBER_OUT") {
-        camcontrol::gui::annotate::render_fiber_axes(&img, &found, camcontrol::gui::annotate::FiberDrawing { show_parts: true, long_lines: false }).save(out).unwrap();
+        camcontrol::gui::annotate::render_fiber_axes(&img, &found, camcontrol::gui::annotate::FiberDrawing { show_parts: true, ..Default::default() }).save(out).unwrap();
     }
 }
 

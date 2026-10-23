@@ -17,7 +17,7 @@ use crate::camera::{format_exposure, frame_sizes, ADJUSTABLE, EXPOSURE_US};
 use crate::capture::{next_capture_path, scaled_size};
 use crate::measure::{compute, fmt, is_circle, KINDS};
 use crate::processing::count::MAX_CLASSES;
-use crate::processing::fiber_axis::{brightest_centre, method_label, Detection, DEFAULT_MIN_ROD, LOOK_AT, MAX_MIN_ROD, METHODS};
+use crate::processing::fiber_axis::{brightest_centre, method_label, Detection, LOOK_AT, METHODS};
 use crate::video::VIDEO_FORMATS;
 
 const BIG_BUTTON: f32 = 40.0;
@@ -604,51 +604,59 @@ impl App {
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 ui.set_width(210.0);
-                if primary(ui, "Find axes", true, egui::vec2(200.0, 30.0)).on_hover_text("Measure the fibers in the image in the view.").clicked() {
-                    self.find_fiber_axes(false);
-                }
+                ui.horizontal(|ui| {
+                    if primary(ui, "Find axes", true, egui::vec2(130.0, 30.0)).on_hover_text("Measure the fibers in the image in the view.").clicked() {
+                        self.find_fiber_axes(false);
+                    }
+                    if ui.add(egui::Button::new("Clear").min_size(egui::vec2(62.0, 30.0))).on_hover_text("Remove the axes from the view.").clicked() {
+                        self.active_pane_mut().fibers.clear();
+                    }
+                });
                 if ui.checkbox(&mut self.fiber.live, "Update live").on_hover_text(
-                    "Keep measuring the live view (a few times a second),\ne.g. while rotating a fiber to line up its axis,\nand measure each saved image as it's opened.").changed() && self.fiber.live
+                    "Keep measuring the live view (a few times a second),\ne.g. while rotating a fiber to line up its axis;\nmeasure each saved image as it's opened, and the frames of a video\nas it plays (as often as it keeps up) or as you step through it.").changed() && self.fiber.live
                 {
                     self.find_fiber_axes(true);
                 }
                 ui.checkbox(&mut self.fiber.show_parts, "Show stress parts").on_hover_text(
                     "Shade the stress parts the axis was measured from, with a cross at each one's centre,\nand ring the point the axis turns about. Also used for the exported drawing.");
-                ui.checkbox(&mut self.fiber.long_lines, "Axis lines across the view").on_hover_text(
-                    "Carry each fiber's axis lines on (thinner) to the edges of the view, to compare them with\nthe crosshair, the grid or lines in the image. For a crosshair on the fiber, choose\n\"Fiber centre\" in View > Overlay settings > Crosshair. Also used for exports and videos.");
                 changed |= ui.checkbox(&mut self.fiber.centre_only, "Only the centre fiber").on_hover_text(
                     "Of the fibers found automatically, measure only the one nearest the middle of the image\n(e.g. the lit fiber in a V-groove, with its neighbours ignored). Faster for Update live.").changed();
-                ui.checkbox(&mut self.fiber.use_circles, "Use circle measurements").on_hover_text(
-                    "If there are Circle measurements, measure the fibers inside them\ninstead of finding fibers automatically.");
                 ui.horizontal(|ui| {
-                    ui.label("Smallest rod:");
-                    let r = ui.add(egui::DragValue::new(&mut self.fiber.detection.min_rod).range(DEFAULT_MIN_ROD..=MAX_MIN_ROD).speed(0.5).suffix("%"))
-                        .on_hover_text("Panda rod outlines: round things smaller than this (radius, % of the fiber's radius)\n\
-                                        are never taken for a stress rod, e.g. dust, bubbles or the core.\n\
-                                        18% (the smallest) tries every size; raise it when a speck is outlined instead of a rod.");
-                    tune |= r.changed();
-                });
-                ui.horizontal(|ui| {
-                    if ui.button("Clear").clicked() {
-                        self.active_pane_mut().fibers.clear();
-                    }
-                    if ui.button("Export...").on_hover_text("Save the table as Excel or CSV, plus the image with the axes drawn on.").clicked() {
-                        self.export_fiber_axes();
-                    }
+                    ui.label("Method:");
+                    egui::ComboBox::from_id_salt("method").selected_text(method_label(&self.fiber.method)).show_ui(ui, |ui| {
+                        for (name, label) in METHODS {
+                            changed |= ui.selectable_value(&mut self.fiber.method, name.to_string(), label).on_hover_text(method_tip(name)).changed();
+                        }
+                    }).response.on_hover_text("How the axis angle is worked out. Hover over a choice for details.\nAutomatic picks the method for each fiber.");
                 });
                 ui.checkbox(&mut self.fiber.advanced, "Show advanced settings").on_hover_text(
-                    "The method and the stress part detection settings.\nNot needed normally: Automatic picks the method for each fiber.");
+                    "Smallest rod, turning about the stress parts, circle measurements and the stress part detection settings.\nNot needed normally.");
                 if self.fiber.advanced {
                     ui.horizontal(|ui| {
-                        ui.label("Method:");
-                        egui::ComboBox::from_id_salt("method").selected_text(method_label(&self.fiber.method)).show_ui(ui, |ui| {
-                            for (name, label) in METHODS {
-                                changed |= ui.selectable_value(&mut self.fiber.method, name.to_string(), label).on_hover_text(method_tip(name)).changed();
+                        ui.label("Smallest rod:");
+                        let d = &mut self.fiber.detection;
+                        let r = ui.add(egui::DragValue::new(&mut d.min_rod_px).range(0.0..=5000.0).speed(1.0)
+                                .custom_formatter(|v, _| if v <= 0.0 { "any".into() } else { format!("{v:.0} px") }))
+                            .on_hover_text("Panda rod outlines: round things with a smaller radius than this (image pixels) are never\n\
+                                            taken for a stress rod, e.g. dust, bubbles or the core. \"any\" (0) tries every size;\n\
+                                            raise it when a speck is outlined instead of a rod. Each fiber gets it as a share of\n\
+                                            its own radius (18% to 40%).");
+                        tune |= r.changed();
+                        let picking = self.picking_rod;
+                        if ui.add(egui::Button::new("Draw").selected(picking)).on_hover_text(
+                            "Draw it on the view: click the centre of the smallest rod (or anything that size),\nthen its edge. Esc cancels.").clicked() {
+                            self.picking_rod = !picking;
+                            self.tool = (!picking).then(|| "circle_centre".to_string());
+                            self.counting = false;
+                            if !picking {
+                                self.message("Smallest rod: click the centre of a rod, then its edge (Esc cancels).", Some(8.0));
                             }
-                        }).response.on_hover_text("How the axis angle is worked out. Hover over a choice for details.");
+                        }
                     });
                     changed |= ui.add_enabled(self.fiber.method != "rods", egui::Checkbox::new(&mut self.fiber.parts_centre, "Turn about stress parts"))
                         .on_hover_text("Measure the axis about the centre of the stress parts instead of the fiber centre\n(Mirror symmetry and Second moments; for stress parts off the fiber's middle).").changed();
+                    ui.checkbox(&mut self.fiber.use_circles, "Use circle measurements").on_hover_text(
+                        "If there are Circle measurements, measure the fibers inside them\ninstead of finding fibers automatically.");
                 }
             });
             if self.fiber.advanced {

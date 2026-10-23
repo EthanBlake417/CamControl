@@ -44,6 +44,52 @@ impl Default for GridStyle {
     }
 }
 
+/// Colors of the fibers' slow and fast axis lines (and of their angles in the readout).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FiberLineStyle {
+    pub slow_color: String,
+    pub slow_opacity: i64,
+    pub fast_color: String,
+    pub fast_opacity: i64,
+}
+
+impl Default for FiberLineStyle {
+    fn default() -> Self {
+        Self { slow_color: "#ff00c8".into(), slow_opacity: 100, fast_color: "#ffc800".into(), fast_opacity: 100 }
+    }
+}
+
+impl FiberLineStyle {
+    pub fn from_value(data: &Value) -> Self {
+        let mut v = serde_json::to_value(Self::default()).unwrap();
+        merge_fields(&mut v, data);
+        for k in ["slow_opacity", "fast_opacity"] {
+            if let Some(n) = v[k].as_f64() {
+                v[k] = (n as i64).into();
+            }
+        }
+        let mut s: Self = serde_json::from_value(v).unwrap_or_default();
+        let d = Self::default();
+        if parse_color(&s.slow_color).is_none() {
+            s.slow_color = d.slow_color;
+        }
+        if parse_color(&s.fast_color).is_none() {
+            s.fast_color = d.fast_color;
+        }
+        s.slow_opacity = s.slow_opacity.clamp(5, 100);
+        s.fast_opacity = s.fast_opacity.clamp(5, 100);
+        s
+    }
+
+    pub fn slow(&self) -> Color {
+        rgba(&self.slow_color, self.slow_opacity)
+    }
+
+    pub fn fast(&self) -> Color {
+        rgba(&self.fast_color, self.fast_opacity)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CrosshairStyle {
     pub width: f64,
@@ -179,5 +225,7 @@ mod tests {
         assert_eq!(GridStyle { square: true, columns: 16, ..Default::default() }.rows_for(1920, 1080), 9);
         let c = CrosshairStyle::from_value(&serde_json::json!({"anchor": "window", "circle": -5}));
         assert_eq!((c.anchor.as_str(), c.circle), ("window", 0));
+        let f = FiberLineStyle::from_value(&serde_json::json!({"slow_color": "#0000ff", "fast_color": "red", "fast_opacity": 50.0}));
+        assert_eq!((f.slow(), f.fast()), ([0, 0, 255, 255], [255, 200, 0, 127]));
     }
 }

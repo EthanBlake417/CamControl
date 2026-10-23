@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::stripes::PanelLayout;
-use super::style::{CrosshairStyle, GridStyle};
+use super::style::{CrosshairStyle, FiberLineStyle, GridStyle};
 use crate::processing::fiber_axis::Detection;
 
 pub const MAX_RECENT: usize = 8;
@@ -80,7 +80,9 @@ pub struct Saved {
     pub fiber_centre_only: bool,
     pub fiber_parts_centre: bool,
     pub fiber_show_parts: bool,
+    /// Axis lines outside the fibers only, to the edges of the picture (and the crosshair on a fiber outside it only).
     pub fiber_long_lines: bool,
+    pub fiber_lines: FiberLineStyle,
     pub histogram_log: bool,
     pub histogram_colors: bool,
     pub fiber_detection: Detection,
@@ -121,6 +123,7 @@ impl Default for Saved {
             fiber_parts_centre: false,
             fiber_show_parts: true,
             fiber_long_lines: false,
+            fiber_lines: FiberLineStyle::default(),
             histogram_log: false,
             histogram_colors: false,
             fiber_detection: Detection::default(),
