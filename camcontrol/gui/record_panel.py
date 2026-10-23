@@ -62,6 +62,11 @@ class RecordPanel(QObject):
         self.video_limit.setSuffix(" s")
         self.video_limit.setSpecialValueText("no limit")
         form.addRow("Stop after", self.video_limit)
+        self.draw_analysis = QCheckBox("Draw fiber axes on the video")
+        self.draw_analysis.setChecked(True)
+        self.draw_analysis.setToolTip("Records the fiber axes and the angle readout as shown in the view.\n"
+                                      "Turn on Update live in Fiber axis so they follow the camera.")
+        form.addRow(self.draw_analysis)
         self.record_button = QPushButton("Record")
         self.record_button.setCheckable(True)
         self.record_button.setMinimumHeight(BIG_BUTTON_HEIGHT)
@@ -155,7 +160,8 @@ class RecordPanel(QObject):
     def state(self) -> dict:
         """For saving in QSettings and settings files."""
         return {"video_format": self.video_format.currentText(), "video_fps": self.video_fps.value(),
-                "video_limit": self.video_limit.value(), "tl_interval": self.tl_interval.value(),
+                "video_limit": self.video_limit.value(), "draw_analysis": self.draw_analysis.isChecked(),
+                "tl_interval": self.tl_interval.value(),
                 "tl_unit": self.tl_unit.currentIndex(), "tl_count": self.tl_count.value(),
                 "tl_video": self.tl_video.isChecked(), "tl_video_fps": self.tl_video_fps.value()}
 
@@ -171,6 +177,8 @@ class RecordPanel(QObject):
             self.tl_unit.setCurrentIndex(int(s["tl_unit"]))
         if "tl_video" in s:
             self.tl_video.setChecked(bool(s["tl_video"]))
+        if isinstance(s.get("draw_analysis"), bool):
+            self.draw_analysis.setChecked(s["draw_analysis"])
 
     def _update_total(self):
         n = self.tl_count.value()

@@ -156,6 +156,12 @@ class CountPanel(QWidget):
         self.counter.marks.clear()
         self._refresh()
 
+    def set_names(self, names: list[str]):
+        """Class names (e.g. remembered from last time); the rest keep theirs."""
+        for edit, name in zip(self._name_edits, names):
+            if name.strip():
+                edit.setText(name)
+
     def _rename(self, i: int, text: str):
         self.counter.names[i] = text.strip() or f"Class {i + 1}"
 

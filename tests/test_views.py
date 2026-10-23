@@ -5,10 +5,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QFileDialog
 
 import fakes
+from camcontrol.camera import EXPOSURE_US
+from camcontrol.image_io import read_image_details
 from conftest import ROOT, run_for, run_until
 
 A, B = ("FakeCam A", 0), ("FakeCam B", 0)
@@ -165,8 +168,11 @@ def test_result_and_save(window, qapp, tmp_path, monkeypatch):
     target = tmp_path / "saved.tif"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(target), ""))
     w.save_image()
-    assert target.is_file() and json.loads(target.with_suffix(".json").read_text())["processing"] == "Test"
+    # The details go inside the image (no .json beside it), and show in the status bar.
+    assert target.is_file() and not target.with_suffix(".json").exists()
+    assert read_image_details(target)["processing"] == "Test"
     assert p.result is None and p.path == str(target)
+    assert p.details is not None and "Test" in p.details[1]
 
 
 def test_video_in_a_view(window, qapp, tmp_path):
@@ -258,3 +264,123 @@ def test_grid_and_crosshair_on_every_view(window, qapp):
         assert p.view.show_grid and p.view.show_crosshair
         assert p.view.grid_style.columns == 5 and p.view.crosshair_style.anchor == "window"
     assert p3.view.grid_style == w.grid_style
+
+
+def test_right_click_shows_the_view_menu(window, qapp):
+    from PySide6.QtCore import QPoint
+    w = window
+    p1, p2 = two_cameras(w, qapp)
+    w.set_active(p1)
+    shown = []
+    w.view_menu.exec = lambda *a: shown.append(a)  # (PySide: patching the class doesn't take)
+    QTest.mouseClick(p2.view.viewport(), Qt.MouseButton.RightButton, pos=QPoint(50, 50))
+    assert len(shown) == 1 and w.active is p2, "the menu acts on the view clicked"
+    assert w.overlay_settings_action in w.view_menu.actions()
+
+
+def test_remembered_between_sessions(window_factory, qapp):
+    w = window_factory(save_on_close=True)
+    f = w.fiber_panel
+    f.live_check.setChecked(True)
+    f.use_circles.setChecked(False)
+    f.min_rod_spin.setValue(40)
+    w.fiber_log_panel.record_check.setChecked(True)
+    w.histogram_panel.log_check.setChecked(True)
+    w.count_panel._name_edits[1].setText("Dust")
+    w.views.multi_layout = "column"
+    w.show_overlay_settings("fiber")
+    tab = w._overlay_dialog.fiber_tab
+    tab.outside.setChecked(True)
+    tab.show_axes.setCurrentIndex(tab.show_axes.findData("slow"))
+    w.close()
+    w2 = window_factory()
+    f2 = w2.fiber_panel
+    assert f2.live_check.isChecked() and not f2.use_circles.isChecked() and f2.detection().min_rod_px == 40
+    assert w2.fiber_log_panel.record_check.isChecked() and w2.histogram_panel.log_check.isChecked()
+    assert w2.count_panel.counter.names[1] == "Dust" and w2.views.multi_layout == "column"
+    assert w2.fiber_outside and w2.fiber_lines.show_axes == "slow"
+    assert w2.panes[0].view.fiber_drawing.long_lines and not w2.panes[0].view.fiber_drawing.show_fast
+    w2.show_overlay_settings()
+    assert w2._overlay_dialog.current_tab() == "fiber"
+
+
+def test_fiber_settings_in_settings_files(window_factory, qapp):
+    w = window_factory()
+    f = w.fiber_panel
+    f.set_method("core")
+    f.centre_only_check.setChecked(True)
+    f.min_rod_spin.setValue(25)
+    w.fiber_outside = True
+    w.fiber_lines.slow_color = "#123456"
+    data = json.loads(json.dumps(w.current_settings()))
+    fiber = data["fiber"]
+    assert fiber["method"] == "core" and fiber["centre_only"] and fiber["outside_lines"]
+    assert fiber["detection"]["min_rod_px"] == 25 and fiber["lines"]["slow_color"] == "#123456"
+    w2 = window_factory()
+    w2.apply_settings(data)
+    assert w2.fiber_panel.method() == "core" and w2.fiber_panel.centre_only_check.isChecked()
+    assert w2.fiber_panel.detection().min_rod_px == 25 and w2.fiber_outside
+    assert w2.fiber_lines.slow_color == "#123456"
+    # Unknown or bad values are left out.
+    w2.apply_settings({"camcontrol_settings": 1, "fiber": {"method": "nonsense", "detection": {"smoothing": "x", "new": 1}}})
+    assert w2.fiber_panel.method() == "core" and w2.fiber_panel.detection().smoothing == 1.0
+
+
+def test_smallest_rod_drawn_on_the_view(window, qapp):
+    w = window
+    w.fiber_panel.advanced_check.setChecked(True)
+    w.fiber_panel.draw_rod_button.setChecked(True)
+    assert all(p.view.tool == "circle_centre" for p in w.panes)
+    w.active.view.measurement_drawn.emit("circle_centre", [(100.0, 100.0), (130.0, 140.0)])
+    assert w.fiber_panel.detection().min_rod_px == 50
+    assert not w.fiber_panel.draw_rod_button.isChecked() and w.active.view.tool is None
+    assert not w.measure_panel.measurements, "not kept as a measurement"
+    # Esc cancels.
+    w.fiber_panel.draw_rod_button.setChecked(True)
+    w.active.view.tool_exit_requested.emit()
+    assert not w.fiber_panel.draw_rod_button.isChecked() and not w._picking_rod
+
+
+def test_fiber_log_and_crosshair_on_the_fiber(window, qapp):
+    w = window
+    assert run_until(qapp, lambda: w.active.view.image is not None)
+    w.fiber_log_panel.record_check.setChecked(True)
+    w.find_fiber_axes()
+    assert run_until(qapp, lambda: w.fiber_panel.axes, 20)
+    assert run_until(qapp, lambda: w.fiber_log_panel.log.entries, 5)
+    assert w.fiber_log_panel.log.entries[0].fiber == 1
+    view = w.active.view
+    w.crosshair_style.anchor = "fiber"
+    w.crosshair_action.setChecked(True)
+    w._apply_overlays()
+    assert view._crosshair_fiber() is w.fiber_panel.axes[0]
+    view.grab()  # draws: readout, crosshair on the fiber
+
+
+def test_fiber_axes_go_to_a_recording(window, qapp):
+    w = window
+    assert run_until(qapp, lambda: w.active.view.image is not None)
+    pane = w.active
+    sent = []
+    pane.camera.worker.set_record_overlay = sent.append
+    pane.camera.recording = True
+    w.find_fiber_axes()
+    assert run_until(qapp, lambda: sent and sent[-1] is not None, 20)
+    axes, drawing = sent[-1]
+    assert axes == w.fiber_panel.axes
+    w.record_panel.draw_analysis.setChecked(False)
+    w._sync_record_overlay(pane)
+    assert sent[-1] is None
+
+
+def test_exposure_set_as_a_time(window, qapp):
+    w = window
+    assert run_until(qapp, lambda: w.exposure_ms_box.isVisibleTo(w))
+    assert not w.sliders["exposure"].isVisibleTo(w)
+    assert abs(w.exposure_ms_spin.value() - 156.25) < 0.01
+    w.exposure_ms_spin.setValue(300)
+    run_for(qapp, 0.3)
+    worker = next(wk for wk in fakes.WORKERS if wk.isRunning())
+    assert worker.controls[EXPOSURE_US] == 300000
+    data = json.loads(json.dumps(w.current_settings()))
+    assert data["cameras"]["FakeCam A"][EXPOSURE_US] == 300000

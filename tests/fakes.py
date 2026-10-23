@@ -56,8 +56,9 @@ class FakeWorker(QThread):
         h, w = frame.shape[:2]
         self.opened.emit({"name": DEVICES[self.index][0], "size": (w, h),
                           "modes": [{"width": w, "height": h, "fps": 30.0, "format": "MJPG"}],
-                          "ranges": {"exposure": {"min": -13, "max": 0}, "gain": {"min": 0, "max": 100}}})
-        self.settings_changed.emit({"exposure": -6, "gain": 10})
+                          "ranges": {"exposure": {"min": -13, "max": 0}, "gain": {"min": 0, "max": 100},
+                                     "exposure_us": {"min": 1221, "max": 10000000, "default": 156250}}})
+        self.settings_changed.emit({"exposure": -6, "gain": 10, "exposure_us": 156250})
         while self._running:
             while self._queue:
                 cmd = self._queue.pop(0)

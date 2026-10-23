@@ -12,15 +12,21 @@ or not the GUI keeps up.
 
 With a flat-field set (set_flat_field), live frames, captures, videos and
 time-lapse images are corrected here, on this thread, before anything else.
+With a record overlay set (set_record_overlay), recorded video frames get
+the fiber axes and the angle readout drawn on, as on screen.
 """
 
 import queue
 import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 from PySide6.QtCore import QThread, Signal
+from PySide6.QtGui import QImage
 
-from camcontrol.camera import Camera, exposure_seconds
+from camcontrol.camera import Camera
+from camcontrol.gui.fiber_panel import paint_fiber_axes
 from camcontrol.capture import grab_average, next_capture_path, save_capture
 from camcontrol.recording import VIDEO_FORMATS, TimeLapse, VideoRecorder, images_to_video
 
@@ -54,6 +60,7 @@ class CameraWorker(QThread):
         self._last_progress = 0.0
         self._timelapse: TimeLapse | None = None
         self._timelapse_opts: dict = {}
+        self._overlay = None  # (fiber axes, FiberDrawing) drawn on recorded frames, or None
 
     # --- called from the GUI thread ------------------------------------------
 
@@ -72,6 +79,10 @@ class CameraWorker(QThread):
 
     def stop_recording(self):
         self._commands.put(("record_stop",))
+
+    def set_record_overlay(self, overlay):
+        """(fiber axes, FiberDrawing) to draw on recorded frames, or None."""
+        self._commands.put(("overlay", overlay))
 
     def start_timelapse(self, timelapse: TimeLapse, capture_opts: dict):
         """capture_opts: n_frames, scale, fmt, folder, name (as for capture())."""
@@ -145,6 +156,8 @@ class CameraWorker(QThread):
                 self._start_recording(*cmd[1:])
             elif kind == "record_stop":
                 self._stop_recording()
+            elif kind == "overlay":
+                self._overlay = cmd[1]
             elif kind == "timelapse":
                 self._stop_timelapse(None)
                 self._timelapse, self._timelapse_opts = cmd[1], cmd[2]
@@ -170,9 +183,10 @@ class CameraWorker(QThread):
     def _capture(self, cam: Camera, n_frames, scale, fmt, folder, name,
                  extra: dict | None = None, prefix: str = "cap", announce: bool = True) -> str | None:
         """Average, correct and save one image. Returns its path, or None on failure."""
+        exposure_us = cam.exposure_us
+        exposure_s = exposure_us * 1e-6 if exposure_us is not None else None
         if announce:
-            exposure = cam.exposure
-            estimate = n_frames * max(exposure_seconds(exposure) if exposure is not None else 0, 1 / 25)
+            estimate = n_frames * max(exposure_s or 0, 1 / 25)
             self.capture_started.emit(n_frames, estimate)
         try:
             image, got = grab_average(cam, n_frames)
@@ -193,6 +207,7 @@ class CameraWorker(QThread):
                 name=name,
                 prefix=prefix,
                 extra=extra,
+                exposure_s=exposure_s,
             )
         except Exception as e:  # report any failure to the GUI instead of dying
             self.error.emit(f"Capture failed: {e}")
@@ -216,6 +231,8 @@ class CameraWorker(QThread):
     def _record(self, frame):
         rec = self._recorder
         try:
+            if self._overlay is not None and frame.ndim == 3:
+                frame = self._draw_overlay(frame)
             rec.add(frame)
         except Exception as e:
             self.error.emit(f"Recording failed: {e}")
@@ -227,6 +244,14 @@ class CameraWorker(QThread):
             self.recording_progress.emit(rec.elapsed, rec.frames_written)
         if rec.finished:
             self._stop_recording()
+
+    def _draw_overlay(self, frame):
+        """A copy of frame with the fiber axes and readout drawn on (QPainter on a QImage: fine off the GUI thread)."""
+        axes, drawing = self._overlay
+        bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)  # Qt's RGB32 layout in memory
+        h, w = frame.shape[:2]
+        paint_fiber_axes(QImage(bgra.data, w, h, bgra.strides[0], QImage.Format.Format_RGB32), axes, drawing)
+        return np.ascontiguousarray(bgra[..., :3])  # painted in place
 
     def _stop_recording(self):
         rec = self._recorder

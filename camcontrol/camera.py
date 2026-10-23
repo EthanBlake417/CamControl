@@ -51,10 +51,17 @@ Long exposures (beyond the camera's 1.25 s):
     so the picture still updates every 1.25 s.
   - grab_exposure() (captures) sums N fresh frames: one true long exposure.
 
+Exposure as a time ("exposure_us", in µs, a pseudo control beside "exposure"):
+  The camera only takes whole log2 steps, so a time is made from the step
+  just below it, brightened in software by up to 2x; past the camera's
+  longest, from any number of frames added (up to MAX_FRAMES_SUMMED). See
+  plan_exposure. Saved as "exposure_us" beside "exposure" in settings files.
+
 Run this file directly for a quick check that the camera opens:
     python -m camcontrol.camera
 """
 
+import math
 import os
 import time
 from collections import deque
@@ -77,6 +84,8 @@ ADJUSTABLE = ["exposure", "gain", "contrast", "saturation", "sharpness"]
 # Exposure steps offered past the camera's maximum, done by adding frames
 # (see "Long exposures" above). 4 steps: up to 16 frames, ~20 s.
 EXTRA_EXPOSURE_STEPS = 4
+MAX_FRAMES_SUMMED = 2 ** EXTRA_EXPOSURE_STEPS
+EXPOSURE_US = "exposure_us"  # the exposure as a time in µs: a pseudo control beside "exposure"
 # The camera's real exposure range (Phase 0), used if it reports a broken one.
 EXPOSURE_RANGE = (-13, -3)
 EXPOSURE_DEFAULT = -6
@@ -94,6 +103,19 @@ def format_exposure(value: float) -> str:
     """Human-readable exposure, e.g. '39 ms' or '1.25 s'."""
     s = exposure_seconds(value)
     return f"{s:.2f} s" if s >= 1 else f"{s * 1000:.0f} ms"
+
+
+def plan_exposure(us: float, hw_min: int, hw_max: int) -> tuple[int, int, float]:
+    """How to make an exposure time (µs) from the camera's exposure values
+    hw_min..hw_max: (value, frames summed, brightness factor). Times past its
+    longest add frames; times between its steps brighten the step below."""
+    s = us * 1e-6
+    longest = exposure_seconds(hw_max)
+    if s > longest:
+        n = min(max(math.ceil(s / longest - 1e-9), 1), MAX_FRAMES_SUMMED)
+        return hw_max, n, min(s / (longest * n), 1.0)
+    v = min(max(math.floor(math.log2(s / 10) + 1e-9), hw_min), hw_max)
+    return v, 1, min(max(s / exposure_seconds(v), 0.0), 2.0)
 
 
 def frame_sizes(modes: list[dict]) -> list[tuple[int, int, float | None]]:
@@ -171,8 +193,16 @@ class Camera:
         # Offer longer exposures than the camera can do, by adding frames.
         self.hw_exposure_max = exp["max"] if exp else None
         if exp:
-            self.ranges["exposure"] = {**exp, "max": exp["max"] + EXTRA_EXPOSURE_STEPS}
-        self.frames_summed = 1  # 1 = a normal exposure; 2, 4, 8, 16 = long exposure
+            self.ranges["exposure"] = exp = {**exp, "max": exp["max"] + EXTRA_EXPOSURE_STEPS}
+
+            def us(v):
+                return exposure_seconds(v) * 1e6
+            self.ranges[EXPOSURE_US] = {"min": math.ceil(us(exp["min"])), "max": math.floor(us(exp["max"])),
+                                        "step": 1, "default": round(us(exp.get("default", EXPOSURE_DEFAULT)))}
+        else:
+            self.ranges[EXPOSURE_US] = None
+        self.frames_summed = 1  # 1 = a normal exposure; more = long exposure
+        self.brightness = 1.0   # software brightening making an exposure time between the camera's steps
         self._recent: deque[np.ndarray] = deque()  # last frames_summed frames, for read()
         self._sum: np.ndarray | None = None         # their sum (int32)
 
@@ -208,7 +238,7 @@ class Camera:
         last frames_summed frames, updated with every new frame."""
         frame = self.read_raw()
         if frame is None or self.frames_summed == 1:
-            return frame
+            return self._brighten(frame)
         if self._sum is None or self._sum.shape != frame.shape:
             self._reset_sum()
             self._sum = np.zeros(frame.shape, np.int32)
@@ -217,8 +247,13 @@ class Camera:
         if len(self._recent) > self.frames_summed:
             self._sum -= self._recent.popleft()
         # Until enough frames have arrived, scale up so brightness is right.
-        scale = self.frames_summed / len(self._recent)
+        scale = self.frames_summed / len(self._recent) * self.brightness
         return np.clip(self._sum * scale, 0, 255).astype(np.uint8)
+
+    def _brighten(self, frame):
+        if frame is None or self.brightness == 1:
+            return frame
+        return np.clip(frame * np.float32(self.brightness) + 0.5, 0, 255).astype(np.uint8)
 
     def grab_exposure(self, max_attempts: int | None = None):
         """One complete exposure from fresh frames (for captures), or None.
@@ -226,7 +261,7 @@ class Camera:
         as they would in a real long exposure."""
         n = self.frames_summed
         if n == 1:
-            return self.read_raw()
+            return self._brighten(self.read_raw())
         total = None
         got = 0
         for _ in range(max_attempts or n * 2 + 3):
@@ -239,7 +274,7 @@ class Camera:
                 break
         if total is None:
             return None
-        total = total * (n / got)  # if a frame was missed, scale to the full exposure
+        total = total * (n / got * self.brightness)  # if a frame was missed, scale to the full exposure
         return np.clip(total, 0, 255).astype(np.uint8)
 
     def _reset_sum(self):
@@ -251,9 +286,12 @@ class Camera:
     def get(self, name: str) -> int:
         if self.ranges.get(name) is None:
             raise RuntimeError(f"This camera has no {name} control")
+        if name == EXPOSURE_US:
+            value = self.controls.get("exposure")[0]
+            return round(exposure_seconds(value) * self.frames_summed * self.brightness * 1e6)
         value = self.controls.get(name)[0]
         if name == "exposure" and self.frames_summed > 1:
-            value += self.frames_summed.bit_length() - 1  # + log2(frames summed)
+            value += round(math.log2(self.frames_summed))  # + log2(frames summed)
         return value
 
     def set(self, name: str, value: float) -> int:
@@ -261,8 +299,18 @@ class Camera:
         r = self.ranges.get(name)
         if r is None:
             raise RuntimeError(f"This camera has no {name} control")
+        if name == EXPOSURE_US:
+            v, frames, self.brightness = plan_exposure(max(r["min"], min(r["max"], value)),
+                                                       self.ranges["exposure"]["min"], self.hw_exposure_max)
+            if frames != self.frames_summed:
+                self.frames_summed = frames
+                self._reset_sum()
+            self.controls.set("exposure", v, flags=0)  # the workaround: a no-flags write first
+            self.controls.set("exposure", v)
+            return self.get(name)
         value = max(r["min"], min(r["max"], round(value)))
         if name == "exposure":
+            self.brightness = 1.0
             # Past the camera's maximum: longest real exposure, frames added.
             extra = max(0, value - self.hw_exposure_max) if self.hw_exposure_max is not None else 0
             if 2 ** extra != self.frames_summed:
@@ -276,12 +324,17 @@ class Camera:
 
     def values(self) -> dict[str, int]:
         """Current value of every adjustable control the camera has."""
-        return {name: self.get(name) for name in ADJUSTABLE if self.ranges.get(name) is not None}
+        return {name: self.get(name) for name in ADJUSTABLE + [EXPOSURE_US] if self.ranges.get(name) is not None}
 
     # Shortcuts for the two used most. None if the camera doesn't have them.
     @property
     def exposure(self) -> int | None:
         return self.get("exposure") if self.ranges.get("exposure") else None
+
+    @property
+    def exposure_us(self) -> int | None:
+        """The exposure time in µs (frames summed and brightening included)."""
+        return self.get(EXPOSURE_US) if self.ranges.get(EXPOSURE_US) else None
 
     def set_exposure(self, value: float) -> int:
         return self.set("exposure", value)

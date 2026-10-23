@@ -7,6 +7,7 @@ coordinates (sub-pixel floats), so they stay put when zooming or panning.
 Mouse, no tool selected:
     wheel         zoom around the cursor
     left drag     pan
+    right click   the View menu (context_menu_requested)
 
 Mouse and keys, with a measurement tool selected:
     left click    add a point (line/circle/angle/rectangle finish by themselves)
@@ -29,13 +30,13 @@ While counting (Counting panel):
 import math
 
 import numpy as np
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView
 
 from camcontrol.calibration import PIXELS, Calibration
 from camcontrol.gui.count_panel import draw_marks
-from camcontrol.gui.fiber_panel import draw_fiber_axes
+from camcontrol.gui.fiber_panel import READOUT_PX, FiberDrawing, draw_fiber_axes, draw_fiber_readout, outside_circles
 from camcontrol.gui.overlay_settings import CrosshairStyle, GridStyle
 from camcontrol.gui.measure_draw import (
     MEASURE_COLOR,
@@ -61,6 +62,7 @@ class ImageView(QGraphicsView):
     count_remove = Signal(float, float, float)    # counting: right click at (x, y), max distance
     count_undo = Signal()                         # counting: Backspace
     activated = Signal()                          # clicked: becomes the image the panels work on
+    context_menu_requested = Signal(QPoint)       # right click with no tool: show the View menu there (global)
 
     ZOOM_STEP = 1.25
     MIN_ZOOM = 0.05
@@ -101,7 +103,7 @@ class ImageView(QGraphicsView):
         # Fiber axes to draw (from the Fiber axis panel) and the selected one.
         self.fiber_axes = []
         self.fiber_selected: int | None = None
-        self.show_fiber_parts = True
+        self.fiber_drawing = FiberDrawing(show_parts=True)
 
         self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
@@ -209,7 +211,8 @@ class ImageView(QGraphicsView):
                 painter.drawLine(QPointF(0, h * i / rows), QPointF(w, h * i / rows))
 
         c = self.crosshair_style
-        if self.show_crosshair and c.anchor == "image":
+        on_fiber = self._crosshair_fiber()
+        if self.show_crosshair and (c.anchor == "image" or c.anchor == "fiber" and on_fiber is None):
             self._draw_crosshair(painter, QRectF(0, 0, w, h), c.circle / self.zoom)
 
         # Measurements: drawn in window pixels, so lines and text keep the
@@ -227,23 +230,43 @@ class ImageView(QGraphicsView):
             draw_measurement(painter, preview, self.calibration, to_out, self.zoom, PREVIEW_COLOR, style)
         if self.counter is not None:
             draw_marks(painter, self.counter, to_out, MARK_RADIUS_PX)
-        if self.fiber_axes:
+        window = QRectF(self.viewport().rect())
+        if self.fiber_axes:  # long lines reach the view's edges, as the crosshair does
             draw_fiber_axes(painter, self.fiber_axes, to_out, self.zoom, style, self.fiber_selected,
-                            self.show_fiber_parts)
+                            self.fiber_drawing, window)
         if self.show_crosshair and c.anchor == "window":  # stays put when zooming and panning
-            self._draw_crosshair(painter, QRectF(self.viewport().rect()), c.circle)
+            self._draw_crosshair(painter, window, c.circle)
+        elif self.show_crosshair and on_fiber is not None:
+            # Where the fiber's axis lines cross, with lines across the whole view to compare
+            # with its axes. With the axis lines outside the fibers, so are its lines (no ring).
+            mid = to_out(QPointF(*on_fiber.axis_point))
+            skip = [(to_out(QPointF(f.cx, f.cy)), f.radius * self.zoom) for f in self.fiber_axes]                 if self.fiber_drawing.long_lines else None
+            self._draw_crosshair(painter, window, 0 if skip else c.circle, mid, skip)
+        # The angles stay in the view's top-left corner, whatever the zoom.
+        draw_fiber_readout(painter, self.fiber_axes, self.fiber_drawing, QPointF(8, 8), READOUT_PX)
         painter.restore()
 
-    def _draw_crosshair(self, painter: QPainter, area: QRectF, ring: float):
-        """Lines through the middle of area, right across it, and a ring of radius ring."""
+    def _crosshair_fiber(self):
+        """The fiber the crosshair is centred on ("fiber" anchor): the selected one, else the first."""
+        if self.crosshair_style.anchor != "fiber" or not self.fiber_axes:
+            return None
+        i = self.fiber_selected if self.fiber_selected is not None and self.fiber_selected < len(self.fiber_axes) else 0
+        return self.fiber_axes[i]
+
+    def _draw_crosshair(self, painter: QPainter, area: QRectF, ring: float, mid: QPointF | None = None,
+                        skip: list | None = None):
+        """Lines through mid (default: the middle of area), right across area, and a
+        ring of radius ring. skip: circles (centre, radius) the lines stop at."""
         c = self.crosshair_style
         pen = QPen(c.qcolor(), c.width, c.pen_style())
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.setBrush(Qt.BrushStyle.NoBrush)
-        mid = area.center()
-        painter.drawLine(QPointF(mid.x(), area.top()), QPointF(mid.x(), area.bottom()))
-        painter.drawLine(QPointF(area.left(), mid.y()), QPointF(area.right(), mid.y()))
+        mid = area.center() if mid is None else mid
+        for a, b in ((QPointF(mid.x(), area.top()), QPointF(mid.x(), area.bottom())),
+                     (QPointF(area.left(), mid.y()), QPointF(area.right(), mid.y()))):
+            for p, q in (outside_circles(a, b, skip) if skip else [(a, b)]):
+                painter.drawLine(p, q)
         if ring > 0:
             painter.drawEllipse(mid, ring, ring)
 
@@ -333,6 +356,9 @@ class ImageView(QGraphicsView):
             if event.button() == Qt.MouseButton.RightButton:
                 self._finish()  # finishes an open shape; otherwise just clears it
                 return
+        if event.button() == Qt.MouseButton.RightButton:
+            self.context_menu_requested.emit(event.globalPosition().toPoint())
+            return
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event):

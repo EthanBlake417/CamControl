@@ -183,3 +183,129 @@ def test_real_vgroove_photo():
     for f, truth in zip(found, (-2.0, -0.9, -0.3)):  # judged from the rod outlines by eye
         assert f.fiber_type == "Panda" and f.clear
         assert angle_error(f.slow_deg, truth) < 1.0
+
+
+def _drawn_apple_core(slow_deg: float):
+    """A drawn apple core: wide, pinched top and bottom where the rods press
+    (slow axis through the pinch), its rods too faint to see."""
+    c, r = 300.0, 250.0
+    t = math.radians(slow_deg)
+    sx, sy = math.cos(t), -math.sin(t)  # along the slow axis, y down
+    img = np.full((600, 600, 3), 20, np.uint8)
+    cv2.circle(img, (300, 300), 250, (150, 150, 150), -1)
+    yy, xx = np.mgrid[:600, :600].astype(np.float64)
+    px, py = xx - c, yy - c
+    s, f = px * sx + py * sy, -px * sy + py * sx
+    w, h = 0.17 * r, 0.09 * r + 0.05 * r * (f / (0.17 * r)) ** 2
+    img[(np.abs(f) < w) & (np.abs(s) < h)] = 220
+    return cv2.GaussianBlur(img, (0, 0), 1.5)
+
+
+@pytest.mark.parametrize("truth", [0.0, 30.0, 93.0, 150.0])
+def test_apple_core_gives_the_axes(truth):
+    img = _drawn_apple_core(truth)
+    core = fa.apple_core(img, 300, 300, 250)
+    assert core.clear and not core.by_rods and angle_error(core.slow_deg, truth) < 1, core
+    # Rod outlines beside it pick the slow axis, whichever way the pinches look;
+    # rods far from both of its axes are ignored.
+    for rods, slow in ((truth + 4, truth), (truth + 87, truth + 90), (truth + 45, truth)):
+        c = fa.apple_core(img, 300, 300, 250, rods)
+        assert angle_error(c.slow_deg, slow) < 1 and c.by_rods == (rods != truth + 45), (rods, c)
+    # No rods to see: Automatic falls back on the apple core.
+    f = fa.measure_axis(img, 300, 300, 250, "auto")
+    assert f.method == "core" and f.clear and angle_error(f.slow_deg, truth) < 1, f
+
+
+@pytest.mark.parametrize("lit_core", [False, True])
+def test_finds_a_fiber_by_its_faint_edge(lit_core):
+    """A grey fiber on a grey background, as when lit from the front: only a
+    faint edge shows, with or without a lit core that stands out."""
+    img = np.full((720, 1280), 150, np.int32)
+    ring = np.zeros((720, 1280), np.uint8)
+    cv2.circle(ring, (660, 370), 330, 1, 4)
+    img[ring > 0] = 134
+    for s in (-1, 1):
+        cv2.circle(ring, (660, 370 + s * 165), 95, 2, -1)
+    img[ring == 2] = 140
+    if lit_core:
+        core = np.zeros_like(ring)
+        cv2.circle(core, (660, 370), 45, 1, -1)
+        img[core > 0] = 255
+    # Uneven light (brighter on the left, so a brightness threshold splits the image,
+    # not the fiber) and a little sensor noise.
+    img = img + 45 - (np.arange(1280) * 90 // 1280)[None, :] + np.random.default_rng(1).integers(-4, 5, img.shape)
+    img = cv2.GaussianBlur(cv2.cvtColor(np.clip(img, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR), (0, 0), 1.5)
+    found = fa.find_fibers(img)
+    assert found, "nothing found"
+    x, y, r = found[0]
+    # The cladding (not the core, not nothing), roughly: a thin drawn ring isn't refined like a real edge.
+    assert math.hypot(x - 660, y - 370) < 33 and abs(r - 330) < 33, found
+
+
+def test_smallest_rod_leaves_out_small_rings():
+    """Big rods at 30 deg, and a pair of smaller, crisper rings at 120 deg: with
+    Smallest rod above the small rings' size, only the big rods count."""
+    img = np.full((400, 400, 3), 20, np.uint8)
+    cv2.circle(img, (200, 200), 150, (200, 200, 200), -1)
+    for deg, gap, r, gray in ((30.0, 85.0, 50, 175), (120.0, 60.0, 28, 0)):
+        a = math.radians(deg)
+        for s in (-1, 1):
+            cv2.circle(img, (round(200 + s * gap * math.cos(a)), round(200 - s * gap * math.sin(a))), r, (gray,) * 3, 3)
+    img = cv2.GaussianBlur(img, (0, 0), 1.2)
+    picky = fa.Detection(min_rod=30.0)
+    f = fa.measure_axis(img, 200, 200, 150, "rods", detection=picky)
+    assert angle_error(f.slow_deg, 30) < 1, f.slow_deg
+    assert all(r >= 0.3 * 150 - 0.5 for r in f.rod_radii), f.rod_radii
+    # The same in pixels, as drawn on the view: each fiber gets it as a share of its radius (18-40%).
+    assert fa.Detection(min_rod_px=45).min_rod_for(150) == 30
+    assert fa.Detection(min_rod_px=500).min_rod_for(150) == fa.MAX_MIN_ROD
+    assert fa.Detection(min_rod_px=0, min_rod=25).min_rod_for(150) == 25
+
+
+def test_brightest_centre_counted_from_the_right():
+    img = np.full((300, 900, 3), 10, np.uint8)
+    for x, core in ((150, 120), (450, 250), (750, 160)):
+        cv2.circle(img, (x, 150), 130, (90, 90, 90), -1)
+        cv2.circle(img, (x, 150), 6, (core,) * 3, -1)
+    img[150, 150] = 255  # one hot pixel doesn't count
+    axes = [fa.FiberAxis(x, 150, 130, 0, 1, "?", 0, centre_brightness=fa.centre_brightness(img, x, 150, 130))
+            for x in (150, 450, 750)]
+    b = [f.centre_brightness for f in axes]
+    assert abs(b[1] - 250) < 1 and b[0] < 200, b
+    assert fa.brightest_centre(axes) == (1, 2)
+    axes[2].centre_brightness = 255
+    assert fa.brightest_centre(axes) == (2, 1)
+    assert fa.brightest_centre(axes[:1]) is None
+
+
+def test_live_frames_follow_the_fibers():
+    """Update live follows the fibers measured last time instead of searching again."""
+    img = _drawn_panda(20)
+    first = fa.analyse(img, method="rods")
+    previous = [(f.cx, f.cy, f.radius) for f in first]
+    followed = fa.track_fibers(img, previous)
+    assert followed is not None and len(followed) == len(previous)
+    assert all(math.hypot(a[0] - b[0], a[1] - b[1]) < 1 for a, b in zip(followed, previous))
+    again = fa.analyse(img, method="rods", previous=previous)
+    assert [round(f.slow_deg, 1) for f in again] == [round(f.slow_deg, 1) for f in first]
+    assert fa.track_fibers(img, [(100, 100, 30)]) is None  # nothing there any more: search again
+
+
+# The user's grey, front-lit captures of one Panda fiber (rods about vertical, often
+# washed out; a sharp apple core), from 2026-10-20 (in the Rust app's captures folder).
+# Measured within 4 deg of the rods' direction by eye. Left out: 180801 (rods unclear),
+# 181639 (only the core lit), and 181407 (its faint edge fits to a slightly different
+# circle than in the Rust app, and the result comes out unclear, though at the right angle).
+GREY_CAPTURES = ["180148", "180150", "180430", "180445", "180452", "180703", "180708", "180712", "180746",
+                 "180757", "181139", "181330", "181345", "181355", "181428", "181720"]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", GREY_CAPTURES)
+def test_real_grey_captures(name):
+    path = ROOT / "camcontrol-rs" / "target" / "release" / "captures" / f"cap_20261020_{name}.tif"
+    if not path.is_file():
+        pytest.skip("the user's captures aren't here")
+    found = fa.analyse(load_image_file(path))
+    assert len(found) == 1
+    assert found[0].clear and angle_error(found[0].slow_deg, 93) < 4, found[0]

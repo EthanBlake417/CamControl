@@ -13,7 +13,8 @@ So capture here works the same way:
     (1920x1080 becomes 3264x1836). Scaling up adds pixels, not detail, and
     changes the µm/px scale, so the save size is recorded in the metadata.
 
-Each capture writes an image plus a .json sidecar with the settings used.
+Each capture's settings are saved inside the image (see
+image_io.save_image_file); older captures have a .json file beside them.
 Files are named name-001.tif, name-002.tif, ... when a name is given, or
 by date and time when it isn't (see next_capture_path).
 
@@ -21,7 +22,6 @@ Run directly to take one averaged capture without the viewer:
     python -m camcontrol.capture
 """
 
-import json
 import re
 from datetime import datetime
 from pathlib import Path
@@ -117,10 +117,12 @@ def save_capture(
     name: str = "",
     prefix: str = "cap",
     extra: dict | None = None,
+    exposure_s: float | None = None,
 ) -> Path:
-    """Save an image (scaled up by scale, if not 1) plus a JSON sidecar.
+    """Save an image (scaled up by scale, if not 1) with its settings inside.
 
-    extra: more entries for the sidecar (e.g. the flat-field used).
+    extra: more entries for the settings (e.g. the flat-field used).
+    exposure_s: the exposure time (s), if known; else worked out from exposure.
 
     See next_capture_path() for how the file is named. Returns the image path.
     """
@@ -135,22 +137,21 @@ def save_capture(
         # Bicubic is a good general-purpose choice for scaling up.
         image = cv2.resize(image, save_size, interpolation=cv2.INTER_CUBIC)
 
-    save_image_file(path, image)
-
     meta = {
         "timestamp": now.isoformat(timespec="seconds"),
         "source_size": [src_w, src_h],
         "saved_size": list(save_size),
         "upscaled": save_size != (src_w, src_h),
         "exposure_value": exposure,
-        "exposure_seconds_approx": exposure_seconds(exposure) if exposure is not None else None,
+        "exposure_seconds_approx": exposure_s if exposure_s is not None else (
+            exposure_seconds(exposure) if exposure is not None else None),
         "gain": gain,
         "frames_averaged": frames_averaged,
         # Filled in once calibration (Phase 2) exists.
         "calibration": None,
         **(extra or {}),
     }
-    path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+    save_image_file(path, image, meta)
     return path
 
 

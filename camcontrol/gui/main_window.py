@@ -16,7 +16,9 @@ Shortcuts:
     Ctrl+E      export measurements
     Ctrl+K      one view / several views
     Ctrl+Shift+K add a view
-    Ctrl+1..5   show / hide the Controls / Measurements / Captures / Counting / Fiber axis panel
+    Ctrl+1..7   show / hide the Controls / Measurements / Captures / Counting / Fiber axis /
+                Fiber log / Histogram panel
+    right click the View menu, for the view clicked
 
 Views: each has its own source, live/frozen state, measurements, counting
 marks and fiber axes. The panels work on the active view (the one clicked
@@ -29,6 +31,7 @@ show their result in the active view, unsaved, until you press Ctrl+S.
 """
 
 import json
+import math
 import os
 import re
 import time
@@ -42,6 +45,7 @@ from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QComboBox,
     QDockWidget,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -61,14 +65,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from camcontrol.camera import ADJUSTABLE, format_exposure, frame_sizes
+from camcontrol.camera import ADJUSTABLE, EXPOSURE_US, format_exposure, frame_sizes
 from camcontrol.capture import CAPTURE_DIR, HD2_SCALE, clean_name, next_capture_path, scaled_size
 from camcontrol.export import export_table, measurement_rows
 from camcontrol import settings_file
 from camcontrol.gui.camera_link import CameraLink
 from camcontrol.gui.count_panel import CountPanel, render_marks
-from camcontrol.gui.fiber_panel import FiberPanel, render_fiber_axes
-from camcontrol.gui.overlay_settings import CrosshairStyle, GridStyle, OverlayDialog
+from camcontrol.gui.fiber_log import FiberLogPanel
+from camcontrol.gui.fiber_panel import FiberDrawing, FiberPanel, render_fiber_axes, sort_axes
+from camcontrol.gui.histogram import HistogramPanel
+from camcontrol.gui.overlay_settings import CrosshairStyle, FiberLineStyle, GridStyle, OverlayDialog
 from camcontrol.gui.gallery import GalleryPanel
 from camcontrol.gui.image_view import ImageView
 from camcontrol.gui.jobs import Job, run_job
@@ -86,11 +92,11 @@ from camcontrol.gui.record_panel import RecordPanel
 from camcontrol.gui.tool_stripes import ToolStripes
 from camcontrol.gui.video_player import VideoPlayer
 from camcontrol.gui.views import LAYOUTS, ViewsArea, grid_image
-from camcontrol.image_io import is_video, load_image_file, save_image_file
+from camcontrol.image_io import details_summary, is_video, load_image_file, read_image_details, save_image_file
 from camcontrol.paths import LOGO
 from camcontrol.measure import CIRCLE_KINDS, compute
 from camcontrol.processing.count import Counter
-from camcontrol.processing.fiber_axis import Detection
+from camcontrol.processing.fiber_axis import METHODS, Detection
 from camcontrol.processing.fiber_axis import analyse as analyse_fibers
 from camcontrol.processing.flatfield import FlatField
 from camcontrol.uvc_controls import list_video_devices
@@ -104,6 +110,7 @@ SAVE_SCALES = [
 ]
 FORMATS = [("TIFF", "tif"), ("PNG", "png")]
 FLAT_DIR = CAPTURE_DIR.parent / "flats"  # flat-field references taken in the app
+EXPOSURE_SLIDER_STEPS = 1000  # positions of the logarithmic exposure time slider
 FIBER_LIVE_INTERVAL_S = 0.25  # how often "Update live" re-measures fiber axes (each live view)
 # Process menu / Captures right-click tools: key -> dialog class.
 PROCESS_DIALOGS = {
@@ -129,6 +136,25 @@ class Pane:
     title: str = ""                   # what it shows when not live: a file name, a result's title
     result: dict | None = None        # an unsaved processing result: short_name, meta
     fiber_last: float = 0.0           # when its live frames were last measured (Update live)
+    details: tuple | None = None      # the file's saved capture details: (one-line summary, full JSON)
+
+
+def detection_from(data) -> Detection:
+    """Detection settings from saved ones: unknown keys left out, bad values the default."""
+    if not isinstance(data, dict):
+        return Detection()
+    d = Detection()
+    for key, default in asdict(Detection()).items():
+        value = data.get(key, default)
+        if key == "threshold":
+            ok = value is None or isinstance(value, (int, float)) and not isinstance(value, bool)
+        elif key == "look_at":
+            ok = isinstance(value, str)
+        else:
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool)
+        if ok:
+            setattr(d, key, value if key == "look_at" or value is None else float(value))
+    return d
 
 
 def camera_list() -> list[tuple[str, int]]:
@@ -201,12 +227,18 @@ class MainWindow(QMainWindow):
         self.measure_panel = MeasurePanel()
         self.count_panel = CountPanel()
         self.fiber_panel = FiberPanel()
+        self.fiber_log_panel = FiberLogPanel()
+        self.histogram_panel = HistogramPanel()
+        self._picking_rod = False  # Smallest rod > Draw: the next Circle (centre) drawn sets it
         self._capturing: set = set()        # cameras taking a photo now (Capture waits for them)
         self._fiber_job: Job | None = None  # fiber measuring running in the background (one at a time)
         self._fiber_waiting: dict = {}      # pane -> request made while it was busy (the newest per view)
         self._fiber_generation = 0  # counts settings changes: results measured with older settings are dropped
         self.grid_style, self.crosshair_style = GridStyle(), CrosshairStyle()  # on every view (_apply_overlays)
-        self._overlay_dialog: OverlayDialog | None = None  # Grid and crosshair window, made when first opened
+        self.fiber_lines = FiberLineStyle()  # fiber axis colors and which are shown
+        self.fiber_outside = False           # axis lines only outside the fibers, to the view's edges
+        self._overlay_dialog: OverlayDialog | None = None  # Grid, crosshair and fiber axes window, made when first opened
+        self._overlay_tab = "grid"  # its tab shown last
         self.panes: list[Pane] = []
         self.active: Pane | None = None      # the view the panels work on
         self.controlled: Pane | None = None  # the view whose camera Controls work on
@@ -219,6 +251,8 @@ class MainWindow(QMainWindow):
         self._build_measure_dock()
         self._build_count_dock()
         self._build_fiber_dock()
+        self._build_fiber_log_dock()
+        self._build_histogram_dock()
         self._build_gallery_dock()
         self._build_status_bar()
         self._build_views()
@@ -250,10 +284,9 @@ class MainWindow(QMainWindow):
 
         self.live_action = self._action("&Live", "L", self._toggle_live, checkable=True)
         self.grid_action = self._action("&Grid", "G", self._apply_overlays, checkable=True)
-        self.grid_settings_action = self._action("Grid &settings...", None, lambda: self.show_overlay_settings("grid"))
         self.crosshair_action = self._action("C&rosshair", "C", self._apply_overlays, checkable=True)
-        self.crosshair_settings_action = self._action("Crosshair s&ettings...", None,
-                                                      lambda: self.show_overlay_settings("crosshair"))
+        self.overlay_settings_action = self._action("Grid, crosshair and fiber a&xes settings...", None,
+                                                    lambda: self.show_overlay_settings())
         self.fit_action = self._action("&Fit to window", "F", lambda: [p.view.fit() for p in self._targets()])
         self.actual_action = self._action("&100%", "1", lambda: [p.view.actual_size() for p in self._targets()])
         self.zoom_in_action = self._action("Zoom &in", "Ctrl+=", lambda: self.active.view.zoom_in())
@@ -308,9 +341,8 @@ class MainWindow(QMainWindow):
         m.addSeparator()
         m.addAction(self.quit_action)
 
-        m = self.menuBar().addMenu("&View")
-        m.addActions([self.live_action, self.grid_action, self.grid_settings_action, self.crosshair_action,
-                      self.crosshair_settings_action])
+        m = self.view_menu = self.menuBar().addMenu("&View")
+        m.addActions([self.live_action, self.grid_action, self.crosshair_action, self.overlay_settings_action])
         m.addSeparator()
         m.addActions([self.fit_action, self.actual_action, self.zoom_in_action, self.zoom_out_action])
         m.addSeparator()
@@ -356,6 +388,7 @@ class MainWindow(QMainWindow):
         panel.export_requested.connect(self.export_measurements)
         # Measuring and counting both use clicks, so only one is on at a time.
         panel.tool_changed.connect(lambda tool: tool and self.count_panel.set_counting(False))
+        panel.tool_changed.connect(self._measure_tool_changed)
 
         self.measure_dock = self._add_dock("Measurements", "measure_dock", panel,
                                            Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+2")
@@ -381,18 +414,80 @@ class MainWindow(QMainWindow):
         panel = self.fiber_panel
         panel.find_requested.connect(self.find_fiber_axes)
         panel.method_changed.connect(self._fiber_settings_changed)
-        panel.changed.connect(lambda: self.active.view.set_fiber_axes(panel.axes, panel.selected()))
-        panel.export_requested.connect(self.export_fiber_axes)
-        panel.live_changed.connect(lambda on: on and self.find_fiber_axes())
-        panel.show_parts_check.toggled.connect(self._show_fiber_parts)
+        panel.changed.connect(self._on_fiber_axes_changed)
+        panel.live_changed.connect(lambda on: on and self.find_fiber_axes(quiet=True))
+        panel.show_parts_check.toggled.connect(self._apply_fiber_drawing)
+        panel.draw_rod_requested.connect(self._pick_rod)
         self.fiber_dock = self._add_dock("Fiber axis", "fiber_dock", panel,
                                          Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+5")
         self.fiber_dock.hide()  # same edge as Measurements; its stripe button opens it
 
-    def _show_fiber_parts(self, on: bool):
+    def _on_fiber_axes_changed(self):
+        panel = self.fiber_panel
+        self.active.fiber_axes = panel.axes
+        self.active.view.set_fiber_axes(panel.axes, panel.selected())
+        self._sync_record_overlay(self.active)
+
+    def _build_fiber_log_dock(self):
+        self.fiber_log_dock = self._add_dock("Fiber log", "fiber_log_dock", self.fiber_log_panel,
+                                             Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+6")
+        self.fiber_log_dock.hide()  # its stripe button opens it
+
+    def _build_histogram_dock(self):
+        self.histogram_dock = self._add_dock("Histogram", "histogram_dock", self.histogram_panel,
+                                             Qt.DockWidgetArea.BottomDockWidgetArea, "Ctrl+7")
+        self.histogram_dock.hide()
+        self.histogram_dock.visibilityChanged.connect(lambda on: on and self._update_histogram(self.active))
+
+    def _update_histogram(self, pane, live: bool = False):
+        """Recount the histogram if it shows and pane is the active view."""
+        if pane is self.active and pane is not None and self.histogram_dock.isVisible():
+            self.histogram_panel.set_image(pane.view.image, live)
+
+    def fiber_drawing(self) -> FiberDrawing:
+        """How fiber axes are drawn now: on the views, exports and videos."""
+        return FiberDrawing.from_style(self.fiber_lines, self.fiber_panel.show_parts_check.isChecked(),
+                                       self.fiber_outside)
+
+    def _apply_fiber_drawing(self):
+        drawing = self.fiber_drawing()
         for pane in self.panes:
-            pane.view.show_fiber_parts = on
+            pane.view.fiber_drawing = drawing
             pane.view.viewport().update()
+            self._sync_record_overlay(pane)
+
+    def _sync_record_overlay(self, pane):
+        """Tell a recording camera which fiber axes to draw on its video ("Draw fiber axes on the video")."""
+        link = pane.camera if pane is not None else None
+        if link is None or link.worker is None or not link.recording:
+            return
+        axes = self.fiber_panel.axes if pane is self.active else pane.fiber_axes
+        on = pane.live and self.record_panel.draw_analysis.isChecked() and bool(axes)
+        link.worker.set_record_overlay((list(axes), self.fiber_drawing()) if on else None)
+
+    def _pick_rod(self, on: bool):
+        """Smallest rod > Draw: the next Circle (centre) drawn on a view sets it (and isn't kept)."""
+        self._picking_rod = on
+        if on:
+            self.count_panel.set_counting(False)
+            for pane in self.panes:
+                pane.view.set_tool("circle_centre")
+            self.statusBar().showMessage("Smallest rod: click the centre of a rod, then its edge (Esc cancels).", 8000)
+        else:
+            self.measure_panel.set_tool(None)  # and so every view's
+
+    def _measure_tool_changed(self, tool):
+        """A measuring tool picked while drawing the smallest rod: that stops."""
+        if self._picking_rod and tool is not None:
+            self._picking_rod = False
+            button = self.fiber_panel.draw_rod_button
+            button.blockSignals(True)
+            button.setChecked(False)
+            button.blockSignals(False)
+
+    def _show_view_menu(self, pos):
+        """Right-click on a view: the View menu (the click made it the active view)."""
+        self.view_menu.exec(pos)
 
     def _build_gallery_dock(self):
         self.gallery.open_requested.connect(self.open_image_path)
@@ -512,6 +607,8 @@ class MainWindow(QMainWindow):
             row = QHBoxLayout()
             row.addWidget(slider)
             row.addWidget(label)
+            if name == "exposure":
+                row.addWidget(self._build_exposure_time())
             form.addRow(name.capitalize(), row)
             self.sliders[name] = slider
             self.value_labels[name] = label
@@ -617,6 +714,76 @@ class MainWindow(QMainWindow):
         self.controls_dock = self._add_dock("Controls", "controls_dock", panel,
                                             Qt.DockWidgetArea.RightDockWidgetArea, "Ctrl+1", scroll=True)
 
+    def _build_exposure_time(self) -> QWidget:
+        """Exposure as a time in ms, for cameras that have it (shown instead of the
+        step slider): a logarithmic slider, so short and long times both fit, and a
+        number to type."""
+        box = QWidget()
+        row = QHBoxLayout(box)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.exposure_ms_slider = QSlider(Qt.Orientation.Horizontal)
+        self.exposure_ms_slider.setRange(0, EXPOSURE_SLIDER_STEPS)
+        self.exposure_ms_spin = QDoubleSpinBox(decimals=2, suffix=" ms")
+        self.exposure_ms_spin.setKeyboardTracking(False)  # sent when typed in (Enter, or leaving the box)
+        self.exposure_ms_spin.setMinimumWidth(100)
+        self.exposure_ms_slider.valueChanged.connect(
+            lambda pos: self._set_exposure_ms(self._exposure_ms_at(pos), from_slider=True))
+        self.exposure_ms_spin.valueChanged.connect(lambda ms: self._set_exposure_ms(ms))
+        row.addWidget(self.exposure_ms_slider, stretch=1)
+        row.addWidget(self.exposure_ms_spin)
+        box.hide()
+        self.exposure_ms_box = box
+        return box
+
+    def _exposure_ms_range(self) -> tuple[float, float]:
+        return self.exposure_ms_spin.minimum(), max(self.exposure_ms_spin.maximum(), self.exposure_ms_spin.minimum() * 1.001)
+
+    def _exposure_ms_at(self, pos: int) -> float:
+        lo, hi = self._exposure_ms_range()
+        return lo * (hi / lo) ** (pos / EXPOSURE_SLIDER_STEPS)
+
+    def _show_exposure_ms(self, ms: float):
+        """Put the slider and the number at ms, without sending it."""
+        lo, hi = self._exposure_ms_range()
+        for w in (self.exposure_ms_slider, self.exposure_ms_spin):
+            w.blockSignals(True)
+        self.exposure_ms_spin.setValue(ms)
+        self.exposure_ms_slider.setValue(round(EXPOSURE_SLIDER_STEPS * math.log(max(ms, lo) / lo) / math.log(hi / lo)))
+        for w in (self.exposure_ms_slider, self.exposure_ms_spin):
+            w.blockSignals(False)
+
+    def _set_exposure_ms(self, ms: float, from_slider: bool = False):
+        if from_slider:
+            self.exposure_ms_spin.blockSignals(True)
+            self.exposure_ms_spin.setValue(ms)
+            self.exposure_ms_spin.blockSignals(False)
+        else:
+            self._show_exposure_ms(ms)
+        link = self._link()
+        if link is not None and link.worker is not None:
+            link.worker.set_control(EXPOSURE_US, round(ms * 1000))
+
+    def _update_exposure_time(self, link):
+        """The ms control for a camera with exposure times, else the step slider."""
+        r = link.ranges.get(EXPOSURE_US) if link is not None and link.open else None
+        self.exposure_ms_box.setVisible(r is not None)
+        self.sliders["exposure"].setVisible(r is None)
+        self.value_labels["exposure"].setVisible(r is None)
+        if r is None:
+            return
+        spin = self.exposure_ms_spin
+        spin.blockSignals(True)
+        spin.setRange(r["min"] / 1000, r["max"] / 1000)
+        spin.setSingleStep(0.1)
+        spin.blockSignals(False)
+        us = link.values.get(EXPOSURE_US, r.get("default", r["min"]))
+        self._show_exposure_ms(us / 1000)
+        step = link.values.get("exposure")
+        spin.setToolTip("Exposure time. Type a number of milliseconds, or use the slider.\n"
+                        "The camera itself only doubles or halves its exposure; times in between are\n"
+                        "made by brightening the next shorter step in software (up to 2x), and times\n"
+                        "past its longest by adding frames." + (f"\nCamera exposure value now: {step}" if step is not None else ""))
+
     def _build_status_bar(self):
         self.fps_label = QLabel()
         self.size_label = QLabel()
@@ -626,7 +793,11 @@ class MainWindow(QMainWindow):
         # What the active view is showing: live, frozen, or which file.
         self.source_label = QLabel()
         self.source_label.setStyleSheet("font-weight: bold")
-        for w in (self.cursor_label, self.zoom_label, self.size_label, self.fps_label, self.source_label):
+        # The settings saved with the file shown (hover: all of them).
+        self.details_label = QLabel()
+        self.details_label.setStyleSheet("color: gray;")
+        for w in (self.details_label, self.cursor_label, self.zoom_label, self.size_label, self.fps_label,
+                  self.source_label):
             self.statusBar().addPermanentWidget(w)
 
     # --- settings ---------------------------------------------------------------
@@ -645,10 +816,22 @@ class MainWindow(QMainWindow):
         self.fiber_panel.centre_only_check.setChecked(s.value("fiber/centre_only", False, type=bool))
         self.fiber_panel.parts_centre_check.setChecked(s.value("fiber/parts_centre", False, type=bool))
         self.fiber_panel.show_parts_check.setChecked(s.value("fiber/show_parts", True, type=bool))
+        self.fiber_panel.use_circles.setChecked(s.value("fiber/use_circles", True, type=bool))
         try:
-            self.fiber_panel.set_detection(Detection(**json.loads(s.value("fiber/detection", "{}"))))
+            self.fiber_panel.set_detection(detection_from(json.loads(s.value("fiber/detection", "{}"))))
         except (ValueError, TypeError):
             pass
+        self.fiber_panel.live_check.setChecked(s.value("fiber/live", False, type=bool))
+        self.fiber_log_panel.record_check.setChecked(s.value("fiber_log/record", False, type=bool))
+        self.histogram_panel.log_check.setChecked(s.value("histogram/log", False, type=bool))
+        self.histogram_panel.colors_check.setChecked(s.value("histogram/colors", False, type=bool))
+        try:
+            names = json.loads(s.value("count/names", "[]"))
+            if isinstance(names, list):
+                self.count_panel.set_names([str(n) for n in names])
+        except (ValueError, TypeError):
+            pass
+        self._overlay_tab = s.value("view/overlay_tab", "grid")
         try:
             self.record_panel.set_state(json.loads(s.value("recording/state", "{}")))
         except (ValueError, TypeError):
@@ -666,11 +849,14 @@ class MainWindow(QMainWindow):
         self.grid_action.setChecked(s.value("view/grid", False, type=bool))
         self.crosshair_action.setChecked(s.value("view/crosshair", False, type=bool))
         for key, kind, name in (("view/grid_style", GridStyle, "grid_style"),
-                                ("view/crosshair_style", CrosshairStyle, "crosshair_style")):
+                                ("view/crosshair_style", CrosshairStyle, "crosshair_style"),
+                                ("view/fiber_lines", FiberLineStyle, "fiber_lines")):
             try:
                 setattr(self, name, kind.from_dict(json.loads(s.value(key, "{}"))))
             except (TypeError, ValueError, AttributeError):
                 pass  # unreadable: keep the default look
+        self.fiber_outside = s.value("view/fiber_outside", False, type=bool)
+        self._apply_fiber_drawing()
 
         # The views and what each showed. Settings from before views existed
         # hold just the camera (camera/name, camera/n): one view with it.
@@ -691,6 +877,8 @@ class MainWindow(QMainWindow):
         self.set_active(self._new_pane())
         self._restore_views(specs)
         self.views.set_linked(s.value("views/link", True, type=bool))
+        if s.value("views/multi_layout", "") in LAYOUTS and s.value("views/multi_layout") != "single":
+            self.views.multi_layout = s.value("views/multi_layout")
         self._set_layout(s.value("views/layout", "single"), add=False)
         self._apply_overlays()
 
@@ -766,6 +954,16 @@ class MainWindow(QMainWindow):
         s.setValue("fiber/parts_centre", self.fiber_panel.parts_centre_check.isChecked())
         s.setValue("fiber/show_parts", self.fiber_panel.show_parts_check.isChecked())
         s.setValue("fiber/detection", json.dumps(asdict(self.fiber_panel.detection())))
+        s.setValue("fiber/live", self.fiber_panel.live_check.isChecked())
+        s.setValue("fiber/use_circles", self.fiber_panel.use_circles.isChecked())
+        s.setValue("fiber_log/record", self.fiber_log_panel.record_check.isChecked())
+        s.setValue("histogram/log", self.histogram_panel.log_check.isChecked())
+        s.setValue("histogram/colors", self.histogram_panel.colors_check.isChecked())
+        s.setValue("count/names", json.dumps(self.count_panel.counter.names))
+        s.setValue("views/multi_layout", self.views.multi_layout)
+        s.setValue("view/overlay_tab", self._overlay_dialog.current_tab() if self._overlay_dialog else self._overlay_tab)
+        s.setValue("view/fiber_outside", self.fiber_outside)
+        s.setValue("view/fiber_lines", json.dumps(self.fiber_lines.to_dict()))
         s.setValue("view/grid", self.grid_action.isChecked())
         s.setValue("view/grid_style", json.dumps(self.grid_style.to_dict()))
         s.setValue("view/crosshair_style", json.dumps(self.crosshair_style.to_dict()))
@@ -799,7 +997,9 @@ class MainWindow(QMainWindow):
         view.set_measurements(pane.measurements, self.measure_panel.calibration)
         view.activated.connect(lambda p=pane: self.set_active(p))
         view.measurement_drawn.connect(self._on_measurement_drawn)
+        view.tool_exit_requested.connect(lambda: self.fiber_panel.draw_rod_button.setChecked(False))
         view.tool_exit_requested.connect(lambda: self.measure_panel.set_tool(None))
+        view.context_menu_requested.connect(self._show_view_menu)
         view.set_counter(pane.counter)
         # The click made this view active first, so the panel holds its marks.
         view.count_add.connect(self.count_panel.add)
@@ -812,7 +1012,7 @@ class MainWindow(QMainWindow):
             view.set_tool(self.active.view.tool)
             if self.active.view.count_class is not None:
                 view.set_count_class(self.active.view.count_class)
-        view.show_fiber_parts = self.fiber_panel.show_parts_check.isChecked()
+        view.fiber_drawing = self.fiber_drawing()
         view.set_overlays(self.grid_action.isChecked(), self.grid_style,
                           self.crosshair_action.isChecked(), self.crosshair_style)
 
@@ -1133,6 +1333,7 @@ class MainWindow(QMainWindow):
             slider.blockSignals(False)
             if name in link.values:
                 self._show_value(name, link.values[name])
+        self._update_exposure_time(link)
         self.slider_box.setEnabled(is_open)
         self.record_panel.set_enabled(is_open)
         recording = link is not None and link.recording
@@ -1265,6 +1466,7 @@ class MainWindow(QMainWindow):
         if pane is None or not pane.live:
             return
         pane.view.set_image(frame)
+        self._update_histogram(pane, live=True)
         if pane is self.active:
             fps = link.fps()
             if fps:
@@ -1284,6 +1486,8 @@ class MainWindow(QMainWindow):
     def _on_camera_settings(self, link: CameraLink, values: dict):
         if link is not self._link():
             return
+        if EXPOSURE_US in values and not self.exposure_ms_slider.isSliderDown() and not self.exposure_ms_spin.hasFocus():
+            self._update_exposure_time(link)
         for name, value in values.items():
             slider = self.sliders.get(name)
             if slider is None:
@@ -1404,6 +1608,9 @@ class MainWindow(QMainWindow):
             title += f"   [{Path(self.settings_path).stem}]"
         self.setWindowTitle(title)
         self.gallery.set_open_path(pane.path)  # framed in Captures
+        details = pane.details if not pane.live else None
+        self.details_label.setText(details[0] if details else "")
+        self.details_label.setToolTip(details[1] if details else "")
         self.live_action.setChecked(pane.live)
         self.live_action.setEnabled(pane.camera is not None)
         if pane.view.image is not None:
@@ -1468,6 +1675,10 @@ class MainWindow(QMainWindow):
         pane.view.set_image(image)
         pane.path, pane.result = path, result
         pane.title = title or (Path(path).name if path else "")
+        details = read_image_details(path) if path else None
+        summary = details_summary(details) if details else ""
+        pane.details = (summary, json.dumps(details, indent=2)) if summary else None
+        self._update_histogram(pane)
         self._update_source(pane)
         self._measure_opened_image(pane)
 
@@ -1483,7 +1694,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "CamControl", f"Could not play {path}")
             return
         self.player.show()
-        pane.path, pane.title, pane.result = path, Path(path).name, None
+        pane.path, pane.title, pane.result, pane.details = path, Path(path).name, None, None
         self._update_source(pane)
         self.player.play()
 
@@ -1492,9 +1703,14 @@ class MainWindow(QMainWindow):
         if pane is None or pane not in self.panes:
             return
         pane.view.set_image(frame)
+        self._update_histogram(pane, live=True)
         if pane is self.active:
             h, w = frame.shape[:2]
             self.size_label.setText(f"{w} x {h}")
+        # Update live: while playing, as often as the measuring keeps up (following the fibers;
+        # frames that come while it's busy are skipped); a paused or stepped-to frame, always.
+        if self.fiber_panel.live_check.isChecked():
+            self._request_fibers(pane, frame, "live" if self.player.playing else "image")
 
     def _close_video(self):
         self.player.close_video()
@@ -1531,6 +1747,7 @@ class MainWindow(QMainWindow):
         self.fiber_panel.set_axes(pane.fiber_axes)
         self.views.set_active(pane.view)
         self.zoom_label.setText(f"{pane.view.zoom * 100:.0f}%")
+        self._update_histogram(pane)
         self._choose_controlled()
         self._update_source(pane)
         self._update_capture_enabled()
@@ -1574,14 +1791,15 @@ class MainWindow(QMainWindow):
                 meta["video_frame"] = self.player.position + 1
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            save_image_file(path, image)
-            path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
+            save_image_file(path, image, meta)
         except Exception as e:
             QMessageBox.warning(self, "Save image", f"Save failed: {e}")
             return
         self.statusBar().showMessage(f"Saved {path}", 5000)
         if pane.result:  # it's a file now
             pane.result, pane.path, pane.title = None, str(path), path.name
+            summary = details_summary(meta)
+            pane.details = (summary, json.dumps(meta, indent=2)) if summary else None
             self._update_source(pane)
         self.gallery.refresh(select=str(path))
 
@@ -1728,6 +1946,12 @@ class MainWindow(QMainWindow):
     # --- measurements ---------------------------------------------------------------
 
     def _on_measurement_drawn(self, kind: str, points: list):
+        if self._picking_rod:
+            if kind == "circle_centre" and len(points) >= 2:
+                r = round(((points[1][0] - points[0][0]) ** 2 + (points[1][1] - points[0][1]) ** 2) ** 0.5)
+                self.fiber_panel.set_min_rod(r)  # stops drawing it, and re-measures
+                self.statusBar().showMessage(f"Smallest rod: {r} px radius", 5000)
+            return
         error = self.measure_panel.add(kind, points)
         if error:
             self.statusBar().showMessage(error, 5000)
@@ -1802,7 +2026,10 @@ class MainWindow(QMainWindow):
         settings changed) or "find" (Find axes: say how many were found).
         One runs at a time; a request made meanwhile waits, replacing any other
         waiting one for the same view, so the newest image and settings win."""
-        request = (pane, image, kind, pane.live, self._fiber_generation, self._fiber_analysis(pane))
+        # Live frames follow the fibers measured last time (much faster than finding them again).
+        axes = self.fiber_panel.axes if pane is self.active else pane.fiber_axes
+        previous = [(f.cx, f.cy, f.radius) for f in axes] if kind == "live" and axes else None
+        request = (pane, image, kind, pane.live, self._fiber_generation, self._fiber_analysis(pane, previous))
         if self._fiber_job is not None:
             if kind != "live":
                 self._fiber_waiting[pane] = request
@@ -1824,9 +2051,15 @@ class MainWindow(QMainWindow):
         if from_camera:
             if not pane.live or (kind == "live" and not self.fiber_panel.live_check.isChecked()):
                 return
-        elif pane.view.image is not image or pane.live:
+        elif pane.live:
+            return
+        elif kind == "live" and self._video_pane is pane:
+            if not self.fiber_panel.live_check.isChecked():
+                return  # a playing video's frame: shown even though the video has moved on
+        elif pane.view.image is not image:
             return
         self._show_fiber_axes(pane, axes)
+        self.fiber_log_panel.record(sort_axes(axes))  # if Record each update is on
         if kind == "find":
             if axes:
                 unclear = sum(not f.clear for f in axes)
@@ -1870,9 +2103,10 @@ class MainWindow(QMainWindow):
         if self.fiber_panel.live_check.isChecked():
             self._request_fibers(pane, pane.view.image, "image")
 
-    def _fiber_analysis(self, pane: Pane):
+    def _fiber_analysis(self, pane: Pane, previous: list | None = None):
         """A function measuring the fiber axes of an image with pane's circles
-        and the panel's settings as they are now. Safe to call from another thread."""
+        and the panel's settings as they are now. Safe to call from another thread.
+        previous: the fibers measured on the last live frame, to follow."""
         circles = None
         if self.fiber_panel.use_circles.isChecked():
             # Fibers marked with Circle measurements (in pixels, whatever the calibration).
@@ -1886,14 +2120,15 @@ class MainWindow(QMainWindow):
         detection = self.fiber_panel.detection()
         centre_only = self.fiber_panel.centre_only_check.isChecked()
         return lambda image: analyse_fibers(image, circles or None, method=method, parts_centre=parts_centre,
-                                            detection=detection, centre_only=centre_only)
+                                            detection=detection, centre_only=centre_only, previous=previous)
 
     def _show_fiber_axes(self, pane: Pane, axes: list):
         if pane is self.active:
             self.fiber_panel.set_axes(axes)
         else:  # e.g. live updates of one view while another is active
-            pane.fiber_axes = axes
-            pane.view.set_fiber_axes(axes)
+            pane.fiber_axes = sort_axes(axes)
+            pane.view.set_fiber_axes(pane.fiber_axes)
+            self._sync_record_overlay(pane)
 
     def find_fiber_axes(self, quiet: bool = False):
         """Measure the fiber axes in the active view (every view with Link views on)."""
@@ -1936,7 +2171,7 @@ class MainWindow(QMainWindow):
             image_path = path.with_name(f"{path.stem}_image.png")
             drawn_path = path.with_name(f"{path.stem}_axes.png")
             to_qimage(image).save(str(image_path))
-            render_fiber_axes(image, panel.axes, panel.show_parts_check.isChecked()).save(str(drawn_path))
+            render_fiber_axes(image, panel.axes, self.fiber_drawing()).save(str(drawn_path))
         except Exception as e:  # e.g. the file is open in Excel
             QMessageBox.warning(self, "Export fiber axes", f"Export failed: {e}")
             return
@@ -1992,12 +2227,14 @@ class MainWindow(QMainWindow):
                      "crosshair": self.crosshair_action.isChecked(), "crosshair_style": self.crosshair_style.to_dict()},
             "views": {"layout": self.views.layout_name, "link": self.views.link_check.isChecked(),
                       "views": self._view_specs()},
+            "fiber": self._fiber_settings(),
         }
         # Each camera's control values (what it last reported, or what's waiting for it).
         cameras = dict(self._camera_values)
         for link in self._links():
             if link.key and link.values:
-                cameras[camera_label(link.key)] = {n: v for n, v in link.values.items() if n in self.sliders}
+                cameras[camera_label(link.key)] = {n: v for n, v in link.values.items()
+                                                   if n in self.sliders or n == EXPOSURE_US}
         if cameras:
             data["cameras"] = cameras
         link = self._link()  # also as "camera", as files from before views had it
@@ -2079,9 +2316,41 @@ class MainWindow(QMainWindow):
         self._remember_settings_file(path)
         self.statusBar().showMessage(f"Saved settings to {path}", 6000)
 
+    def _fiber_settings(self) -> dict:
+        """The Fiber axis panel's settings and the Fiber axes tab's, for settings files (as the Rust app's)."""
+        f = self.fiber_panel
+        return {"method": f.method(), "live": f.live_check.isChecked(), "show_parts": f.show_parts_check.isChecked(),
+                "centre_only": f.centre_only_check.isChecked(), "use_circles": f.use_circles.isChecked(),
+                "parts_centre": f.parts_centre_check.isChecked(), "advanced": f.advanced_check.isChecked(),
+                "detection": asdict(f.detection()), "outside_lines": self.fiber_outside,
+                "lines": self.fiber_lines.to_dict()}
+
+    def _apply_fiber_settings(self, data: dict):
+        """A settings file's "fiber" section (what's there and valid); re-measures with it."""
+        f = self.fiber_panel
+        if data.get("method") in METHODS:
+            f.set_method(data["method"])
+        for key, check in (("show_parts", f.show_parts_check), ("centre_only", f.centre_only_check),
+                           ("use_circles", f.use_circles), ("parts_centre", f.parts_centre_check),
+                           ("advanced", f.advanced_check)):
+            if isinstance(data.get(key), bool):
+                check.setChecked(data[key])
+        if isinstance(data.get("detection"), dict):
+            f.set_detection(detection_from(data["detection"]))
+        if isinstance(data.get("outside_lines"), bool):
+            self.fiber_outside = data["outside_lines"]
+        if isinstance(data.get("lines"), dict):
+            self.fiber_lines = FiberLineStyle.from_dict(data["lines"])
+        if isinstance(data.get("live"), bool):
+            f.live_check.setChecked(data["live"])
+        self._apply_overlays()
+        self._fiber_settings_changed()
+
     def apply_settings(self, data: dict) -> list[str]:
         """Apply a settings file's contents. Returns notes about anything that couldn't be applied."""
         problems = []
+        if isinstance(data.get("fiber"), dict):
+            self._apply_fiber_settings(data["fiber"])
         views = data.get("views")
         if isinstance(views, dict):
             if isinstance(views.get("views"), list) and views["views"]:
@@ -2155,41 +2424,52 @@ class MainWindow(QMainWindow):
         return problems
 
     def _apply_camera_values(self, link: CameraLink, values: dict):
-        for name, value in values.items():
-            if name not in self.sliders or link.ranges.get(name) is None:
+        # The exposure time (if saved) after the exposure step: it's the more exact of the two.
+        for name, value in sorted(values.items(), key=lambda kv: kv[0] == EXPOSURE_US):
+            if (name not in self.sliders and name != EXPOSURE_US) or link.ranges.get(name) is None:
                 continue
-            if link is self._link():
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                continue
+            if link is self._link() and name in self.sliders:
                 self.sliders[name].setValue(int(value))  # sends it to the camera via _on_slider
             elif link.worker is not None:
                 link.worker.set_control(name, int(value))
 
     # --- grid and crosshair ---------------------------------------------------------------
 
-    def show_overlay_settings(self, tab: str = "grid"):
-        """The Grid and crosshair window (non-modal; the overlays follow its changes),
-        on tab "grid" or "crosshair". Turns that overlay on."""
-        (self.crosshair_action if tab == "crosshair" else self.grid_action).setChecked(True)
+    def show_overlay_settings(self, tab: str | None = None):
+        """The Grid, crosshair and fiber axes window (non-modal; the overlays follow
+        its changes), on tab "grid", "crosshair" or "fiber" (default: the one shown last).
+        Asked for the grid or crosshair tab, turns that overlay on."""
+        if tab in ("grid", "crosshair"):
+            (self.crosshair_action if tab == "crosshair" else self.grid_action).setChecked(True)
         if self._overlay_dialog is None:
-            self._overlay_dialog = OverlayDialog(self.grid_style, self.crosshair_style, self)
+            self._overlay_dialog = OverlayDialog(self.grid_style, self.crosshair_style, self.fiber_outside,
+                                                 self.fiber_lines, self)
             self._overlay_dialog.changed.connect(self._set_overlay_styles)
+            self._overlay_dialog.show_tab(self._overlay_tab)
         self._apply_overlays()
-        self._overlay_dialog.show_tab(tab)
+        if tab is not None:
+            self._overlay_dialog.show_tab(tab)
         self._overlay_dialog.show()
         self._overlay_dialog.raise_()
         self._overlay_dialog.activateWindow()
 
-    def _set_overlay_styles(self, grid: GridStyle, crosshair: CrosshairStyle):
+    def _set_overlay_styles(self, grid: GridStyle, crosshair: CrosshairStyle, outside: bool, fiber: FiberLineStyle):
         self.grid_style, self.crosshair_style = grid, crosshair
+        self.fiber_outside, self.fiber_lines = outside, fiber
         self._apply_overlays()
 
     def _apply_overlays(self):
-        """Grid and crosshair, as the View menu and the settings say, on every view."""
+        """Grid, crosshair and fiber axis lines, as the View menu and the settings say, on every view."""
         for pane in self.panes:
             pane.view.set_overlays(self.grid_action.isChecked(), self.grid_style,
                                    self.crosshair_action.isChecked(), self.crosshair_style)
+        self._apply_fiber_drawing()
         dialog = self._overlay_dialog
-        if dialog is not None and dialog.styles() != (self.grid_style, self.crosshair_style):
-            dialog.set_styles(self.grid_style, self.crosshair_style)  # e.g. a settings file was opened
+        now = (self.grid_style, self.crosshair_style, self.fiber_outside, self.fiber_lines)
+        if dialog is not None and dialog.styles() != now:
+            dialog.set_styles(*now)  # e.g. a settings file was opened
 
     # --- video and time-lapse -----------------------------------------------------------
 
@@ -2206,6 +2486,8 @@ class MainWindow(QMainWindow):
     def _on_recording_changed(self, link: CameraLink, on: bool, path: str):
         if link is self._link():
             self.record_panel.set_recording(on, path)
+        if on:
+            self._sync_record_overlay(self._pane_of_link(link))
         if on:
             self.statusBar().showMessage(f"Recording to {Path(path).name}...")
         elif path:
