@@ -15,7 +15,7 @@ use super::gallery::{self, GalleryAction};
 use super::player::{Player, PlayerAction};
 use super::settings::{self, AVERAGE_CHOICES, FORMATS};
 use super::stripes::PanelId;
-use super::style::{CrosshairStyle, GridStyle};
+use super::style::{CrosshairStyle, FiberLineStyle, GridStyle};
 use super::view::ViewEvent;
 use super::views::{self, LAYOUTS, MAX_VIEWS};
 use super::{Action, App, FiberKind, FiberRequest, Pane, ProcessJob, ResultInfo, FIBER_LIVE_INTERVAL};
@@ -760,6 +760,10 @@ impl App {
         let p = self.pane_mut(id);
         p.view.set_image(&ctx, image);
         p.title = if title.is_empty() { path.as_deref().map(file_name).unwrap_or_default() } else { title };
+        // The details saved with the file, for the status bar.
+        p.details = path.as_deref().and_then(capture::read_image_details).map(|m| {
+            (capture::details_summary(&m), serde_json::to_string_pretty(&m).unwrap_or_default())
+        }).filter(|d| !d.0.is_empty());
         p.path = path;
         p.result = result;
         if id == self.active {
@@ -842,7 +846,7 @@ impl App {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = capture::save_image(&path, &image).and_then(|_| capture::write_sidecar(&path, &meta)) {
+        if let Err(e) = capture::save_image_with(&path, &image, Some(&meta)) {
             self.warn("Save image", format!("Save failed: {e}"));
             return;
         }
@@ -1576,6 +1580,7 @@ impl App {
             "view": {"grid": s.grid, "grid_style": serde_json::to_value(&s.grid_style).unwrap(),
                      "crosshair": s.crosshair, "crosshair_style": serde_json::to_value(&s.crosshair_style).unwrap()},
             "views": {"layout": self.layout, "link": self.link, "views": self.view_specs()},
+            "fiber": self.fiber_settings_value(),
         });
         // Each camera's control values (what it last reported, or what's waiting for it).
         let mut cameras: Map<String, Value> = self.camera_values.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
@@ -1591,6 +1596,44 @@ impl App {
             data["cameras"] = Value::Object(cameras);
         }
         data
+    }
+
+    /// The Fiber axis panel's settings and the Fiber axes tab's, for settings files.
+    fn fiber_settings_value(&self) -> Value {
+        let f = &self.fiber;
+        json!({
+            "method": f.method, "live": f.live, "show_parts": f.show_parts, "centre_only": f.centre_only,
+            "use_circles": f.use_circles, "parts_centre": f.parts_centre, "advanced": f.advanced,
+            "detection": serde_json::to_value(&f.detection).unwrap(),
+            "outside_lines": self.saved.fiber_long_lines,
+            "lines": serde_json::to_value(&self.saved.fiber_lines).unwrap(),
+        })
+    }
+
+    /// A settings file's "fiber" section (what's there and valid); re-measures with it.
+    fn apply_fiber_settings(&mut self, v: &Value) {
+        let f = &mut self.fiber;
+        if let Some(m) = v["method"].as_str().filter(|m| fiber_axis::METHODS.iter().any(|x| x.0 == *m)) {
+            f.method = m.into();
+        }
+        for (key, slot) in [("live", &mut f.live), ("show_parts", &mut f.show_parts), ("centre_only", &mut f.centre_only),
+                            ("use_circles", &mut f.use_circles), ("parts_centre", &mut f.parts_centre), ("advanced", &mut f.advanced)] {
+            if let Some(b) = v[key].as_bool() {
+                *slot = b;
+            }
+        }
+        if v["detection"].is_object() {
+            if let Ok(d) = serde_json::from_value::<fiber_axis::Detection>(v["detection"].clone()) {
+                f.detection = d;
+            }
+        }
+        if let Some(b) = v["outside_lines"].as_bool() {
+            self.saved.fiber_long_lines = b;
+        }
+        if v["lines"].is_object() {
+            self.saved.fiber_lines = FiberLineStyle::from_value(&v["lines"]);
+        }
+        self.fiber_settings_changed();
     }
 
     /// Apply a settings file's contents. Returns notes about anything that couldn't be applied.
@@ -1690,6 +1733,9 @@ impl App {
         }
         if view["crosshair_style"].is_object() {
             self.saved.crosshair_style = CrosshairStyle::from_value(&view["crosshair_style"]);
+        }
+        if data["fiber"].is_object() {
+            self.apply_fiber_settings(&data["fiber"]);
         }
         problems
     }

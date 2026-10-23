@@ -1,5 +1,6 @@
-//! Still capture: file names, saving with a .json sidecar, averaging frames,
-//! and reading/writing image files (same rules as camcontrol/capture.py).
+//! Still capture: file names, saving with the capture's details (exposure, gain, ...)
+//! written into the image itself, averaging frames, and reading/writing image files
+//! (same rules as camcontrol/capture.py, which writes the details to a .json beside the image).
 //!
 //! Captures average N frames (less noise) and are saved at the camera's size
 //! or scaled up 1.7x to match HD2 files (1920x1080 becomes 3264x1836).
@@ -108,23 +109,141 @@ pub fn load_image(path: &Path) -> Option<RgbImage> {
 
 /// Write an image; the format comes from the file extension (TIFF by default).
 pub fn save_image(path: &Path, img: &RgbImage) -> Result<(), String> {
-    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-    let result = match ext.as_str() {
-        "jpg" | "jpeg" => {
-            let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(std::io::BufWriter::new(file), 95);
-            enc.encode_image(img).map_err(|e| e.to_string())
+    save_image_with(path, img, None)
+}
+
+/// The details as JSON text that's plain ASCII (TIFF text fields must be): anything else as \uXXXX.
+fn ascii_json(meta: &Value) -> String {
+    let mut out = String::new();
+    for c in serde_json::to_string(meta).unwrap_or_default().chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for u in c.encode_utf16(&mut units) {
+                out += &format!("\\u{u:04x}");
+            }
         }
-        "png" | "bmp" | "tif" | "tiff" => img.save(path).map_err(|e| e.to_string()),
-        _ => img.save_with_format(path, image::ImageFormat::Tiff).map_err(|e| e.to_string()),
+    }
+    out
+}
+
+/// Write an image with the capture's details (`meta`, as JSON text) inside it: a TIFF's
+/// ImageDescription field, a PNG "Description" text chunk, or a JPEG comment
+/// (a BMP can't hold them). Image tools such as ImageJ/Fiji or exiftool show them.
+pub fn save_image_with(path: &Path, img: &RgbImage, meta: Option<&Value>) -> Result<(), String> {
+    use std::io::Write;
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let text = meta.map(ascii_json);
+    let create = || std::fs::File::create(path).map(std::io::BufWriter::new).map_err(|e| e.to_string());
+    let result = match ext.as_str() {
+        "jpg" | "jpeg" => (|| {
+            let mut data = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut data, 95).encode_image(img).map_err(|e| e.to_string())?;
+            if let Some(t) = &text {
+                // A comment segment (FF FE, length) right after the start marker; at most 64 KB.
+                let bytes = &t.as_bytes()[..t.len().min(65000)];
+                let len = (bytes.len() + 2) as u16;
+                let mut seg = vec![0xFF, 0xFE, (len >> 8) as u8, len as u8];
+                seg.extend_from_slice(bytes);
+                data.splice(2..2, seg);
+            }
+            create()?.write_all(&data).map_err(|e| e.to_string())
+        })(),
+        "png" => (|| {
+            let mut enc = png::Encoder::new(create()?, img.width(), img.height());
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            if let Some(t) = &text {
+                enc.add_itxt_chunk("Description".into(), t.clone()).map_err(|e| e.to_string())?;
+            }
+            let mut w = enc.write_header().map_err(|e| e.to_string())?;
+            w.write_image_data(img.as_raw()).map_err(|e| e.to_string())?;
+            w.finish().map_err(|e| e.to_string())
+        })(),
+        "bmp" => img.save(path).map_err(|e| e.to_string()),
+        _ => (|| {
+            let mut enc = tiff::encoder::TiffEncoder::new(create()?).map_err(|e| e.to_string())?;
+            let mut image = enc.new_image::<tiff::encoder::colortype::RGB8>(img.width(), img.height()).map_err(|e| e.to_string())?;
+            if let Some(t) = &text {
+                image.encoder().write_tag(tiff::tags::Tag::ImageDescription, t.as_str()).map_err(|e| e.to_string())?;
+            }
+            image.write_data(img.as_raw()).map_err(|e| e.to_string())
+        })(),
     };
     result.map_err(|e| format!("Could not save {}: {e}", path.display()))
 }
 
-/// Write the .json sidecar beside an image.
-pub fn write_sidecar(image_path: &Path, meta: &Value) -> Result<(), String> {
-    std::fs::write(image_path.with_extension("json"), serde_json::to_string_pretty(meta).unwrap_or_default())
-        .map_err(|e| format!("Could not save settings beside {}: {e}", image_path.display()))
+/// The saved details in one line for the status bar, e.g. "2026-10-20 18:17 · 15 ms · gain 30 · 4 frames".
+pub fn details_summary(meta: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(t) = meta["timestamp"].as_str() {
+        parts.push(t.replace('T', " "));
+    }
+    if let Some(s) = meta["exposure_seconds_approx"].as_f64() {
+        let ms = s * 1000.0;
+        parts.push(if ms >= 1000.0 { format!("exposure {} s", (s * 100.0).round() / 100.0) } else { format!("exposure {} ms", (ms * 100.0).round() / 100.0) });
+    }
+    if let Some(g) = meta["gain"].as_f64() {
+        parts.push(format!("gain {g}"));
+    }
+    if let Some(n) = meta["frames_averaged"].as_u64().filter(|&n| n > 1) {
+        parts.push(format!("{n} frames averaged"));
+    }
+    if let Some(n) = meta["frames_summed_per_exposure"].as_u64().filter(|&n| n > 1) {
+        parts.push(format!("{n} frames summed per exposure"));
+    }
+    if meta["upscaled"].as_bool() == Some(true) {
+        parts.push("HD2 size".into());
+    }
+    if let Some(f) = meta["flat_field"].as_str() {
+        parts.push(format!("flat-field {f}"));
+    }
+    if let Some(f) = meta["video_frame"].as_u64() {
+        parts.push(format!("video frame {f}"));
+    }
+    if let Some(s) = meta["source"].as_str().filter(|s| !s.is_empty()) {
+        parts.push(format!("from {s}"));
+    }
+    parts.join("  ·  ")
+}
+
+/// The capture details saved inside an image (see save_image_with); for images saved
+/// before that (or by the Python app), the .json file beside it.
+pub fn read_image_details(path: &Path) -> Option<Value> {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let text: Option<String> = match ext.as_str() {
+        "tif" | "tiff" => (|| {
+            let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+            tiff::decoder::Decoder::new(file).ok()?.get_tag_ascii_string(tiff::tags::Tag::ImageDescription).ok()
+        })(),
+        "png" => (|| {
+            let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+            let reader = png::Decoder::new(file).read_info().ok()?;
+            let info = reader.info();
+            info.utf8_text.iter().find(|c| c.keyword == "Description").and_then(|c| c.get_text().ok())
+                .or_else(|| info.uncompressed_latin1_text.iter().find(|c| c.keyword == "Description").map(|c| c.text.clone()))
+        })(),
+        "jpg" | "jpeg" => (|| {
+            let data = std::fs::read(path).ok()?;
+            let mut i = 2;
+            while i + 4 <= data.len() && data[i] == 0xFF {
+                let (marker, len) = (data[i + 1], ((data[i + 2] as usize) << 8) | data[i + 3] as usize);
+                if marker == 0xFE {
+                    return data.get(i + 4..i + 2 + len).map(|b| String::from_utf8_lossy(b).into_owned());
+                }
+                if marker == 0xDA {
+                    break; // image data: no more headers
+                }
+                i += 2 + len;
+            }
+            None
+        })(),
+        _ => None,
+    };
+    text.and_then(|t| serde_json::from_str::<Value>(&t).ok()).filter(Value::is_object).or_else(|| {
+        serde_json::from_str(&std::fs::read_to_string(path.with_extension("json")).ok()?).ok()
+    })
 }
 
 pub struct CaptureOptions {
@@ -140,7 +259,7 @@ pub struct CaptureOptions {
     pub extra: Map<String, Value>,
 }
 
-/// Save an image (scaled by `scale`, if not 1) plus a JSON sidecar. Returns the image path.
+/// Save an image (scaled by `scale`, if not 1) with its details inside. Returns the image path.
 pub fn save_capture(image: &RgbImage, o: &CaptureOptions) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&o.folder).map_err(|e| format!("Can't make {}: {e}", o.folder.display()))?;
     let now = Local::now();
@@ -154,7 +273,6 @@ pub fn save_capture(image: &RgbImage, o: &CaptureOptions) -> Result<PathBuf, Str
     } else {
         image
     };
-    save_image(&path, to_save)?;
     let mut meta = json!({
         "timestamp": now.format("%Y-%m-%dT%H:%M:%S").to_string(),
         "source_size": [sw, sh],
@@ -169,7 +287,7 @@ pub fn save_capture(image: &RgbImage, o: &CaptureOptions) -> Result<PathBuf, Str
     for (k, v) in &o.extra {
         meta[k] = v.clone();
     }
-    write_sidecar(&path, &meta)?;
+    save_image_with(&path, to_save, Some(&meta))?;
     Ok(path)
 }
 
@@ -227,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn saves_scaled_capture_and_sidecar() {
+    fn saves_scaled_capture_with_its_details() {
         let dir = temp_folder("save");
         let o = CaptureOptions {
             exposure: Some(-6.0), exposure_seconds: Some(0.156), gain: Some(48.0), frames_averaged: 4, scale: HD2_SCALE,
@@ -236,9 +354,30 @@ mod tests {
         let path = save_capture(&RgbImage::new(192, 108), &o).unwrap();
         assert_eq!(path, dir.join("sub").join("x-001.png"));
         assert_eq!(load_image(&path).unwrap().dimensions(), (326, 184));
-        let meta: Value = serde_json::from_str(&std::fs::read_to_string(path.with_extension("json")).unwrap()).unwrap();
+        assert!(!path.with_extension("json").exists(), "no .json beside it any more");
+        let meta = read_image_details(&path).unwrap();
         assert_eq!(meta["frames_averaged"], 4);
         assert_eq!(meta["upscaled"], true);
+        // Every format that can hold them, with text that isn't plain ASCII.
+        let img = RgbImage::from_fn(40, 30, |x, y| image::Rgb([x as u8 * 6, y as u8 * 8, 100]));
+        let meta = json!({"gain": 30.0, "calibration": {"unit": "µm", "per_pixel": 0.5}});
+        for ext in ["tif", "png", "jpg"] {
+            let p = dir.join(format!("d.{ext}"));
+            save_image_with(&p, &img, Some(&meta)).unwrap();
+            assert_eq!(read_image_details(&p).as_ref(), Some(&meta), "{ext}");
+            assert_eq!(load_image(&p).unwrap().dimensions(), (40, 30), "{ext}");
+            if ext != "jpg" {
+                assert_eq!(load_image(&p).unwrap(), img, "{ext}: pixels unchanged");
+            }
+        }
+        // Older captures: the .json beside them still counts.
+        let old = dir.join("old.tif");
+        save_image(&old, &img).unwrap();
+        std::fs::write(old.with_extension("json"), r#"{"gain": 12}"#).unwrap();
+        assert_eq!(read_image_details(&old).unwrap()["gain"], 12);
+        let summary = details_summary(&json!({"timestamp": "2026-10-20T18:17:20", "exposure_seconds_approx": 0.015, "gain": 30.0,
+                                              "frames_averaged": 4, "upscaled": false}));
+        assert_eq!(summary, "2026-10-20 18:17:20  ·  exposure 15 ms  ·  gain 30  ·  4 frames averaged");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

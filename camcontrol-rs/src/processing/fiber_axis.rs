@@ -57,6 +57,8 @@ const APPLE_SYMMETRY: (f64, f64) = (0.8, 0.3); // mirror correlation needed abou
 const APPLE_PINCH: f64 = 0.05;      // the pinched sides' corners reaching this much (share of the middle) further than the others'
 const APPLE_SIDE: f64 = 75.0;       // degrees either side of an axis to trace the outline
 const APPLE_AGREE: f64 = 3.0;       // degrees: rods and apple core agreeing
+const APPLE_ROD_GUIDE: f64 = 10.0;  // degrees: rod outlines this close to one of the core's axes pick it as the slow one
+const APPLE_ROD_QUALITY: f64 = 1.8; // ... if they stand out at least this much (washed out is fine, nothing at all isn't)
 
 /// name, label in the panel
 pub const METHODS: [(&str, &str); 6] = [
@@ -1528,8 +1530,8 @@ fn measure_auto(image: &RgbImage, cx: f64, cy: f64, radius: f64, detection: &Det
     let grads = rod_gradients(image, cx, cy, radius);
     let found = measure_rods(image, cx, cy, radius, Some(&grads), detection.min_rod_for(radius));
     if !found.clear() {
-        // Washed-out rods: a clear apple core still shows the axes.
-        if let Some(core) = apple_core(image, cx, cy, radius).filter(AppleCore::clear) {
+        // Washed-out rods: a clear apple core still shows the axes (the rods, faint as they are, say which is slow).
+        if let Some(core) = apple_core(image, cx, cy, radius, rod_guide(&found)).filter(AppleCore::clear) {
             return core.axis(cx, cy, radius);
         }
     }
@@ -1550,7 +1552,7 @@ fn measure_auto(image: &RgbImage, cx: f64, cy: f64, radius: f64, detection: &Det
     result.fiber_type = other.0.clone();
     // The bright pattern round a Panda's core can fit a wedge or an ellipse better than
     // faint rods do: if the rods and the apple core agree, and the other shape doesn't, keep the rods.
-    if let Some(core) = apple_core(image, cx, cy, radius).filter(AppleCore::clear) {
+    if let Some(core) = apple_core(image, cx, cy, radius, rod_guide(&found)).filter(AppleCore::clear) {
         if axial_diff(core.slow_deg, found.slow_deg) < APPLE_AGREE && axial_diff(core.slow_deg, result.slow_deg) >= APPLE_AGREE {
             return found;
         }
@@ -1571,18 +1573,22 @@ fn axial_diff(a: f64, b: f64) -> f64 {
 #[derive(Clone, Copy, Debug)]
 pub struct AppleCore {
     pub slow_deg: f64,
-    /// Mirror correlation (-1 to 1) about the better and the other axis.
+    /// Its other mirror axis (90° from slow_deg): the fast axis.
+    pub fast_deg: f64,
+    /// Mirror correlation (-1 to 1) about the slow and the fast axis.
     pub symmetry: (f64, f64),
     /// How far the outline reaches along the slow and the fast axis, over its distance where
     /// the axis crosses it: 1 = straight or bulging side, more = pinched (concave).
     pub pinch: (f64, f64),
+    /// The slow axis was picked by the rod outlines beside the core (not by the pinch).
+    pub by_rods: bool,
 }
 
 impl AppleCore {
     pub fn clear(&self) -> bool {
         self.symmetry.0.max(self.symmetry.1) >= APPLE_SYMMETRY.0
             && self.symmetry.0.min(self.symmetry.1) >= APPLE_SYMMETRY.1
-            && self.pinch.0 - self.pinch.1 >= APPLE_PINCH
+            && self.pinch.0 - self.pinch.1 >= APPLE_PINCH // pinched on one pair of sides: an apple core, not a round spot
     }
 
     fn axis(&self, cx: f64, cy: f64, radius: f64) -> FiberAxis {
@@ -1593,8 +1599,16 @@ impl AppleCore {
     }
 }
 
+/// The rod outlines' angle, if they're worth using to orient the apple core.
+fn rod_guide(rods: &FiberAxis) -> Option<f64> {
+    (rods.quality.unwrap_or(0.0) >= APPLE_ROD_QUALITY).then_some(rods.slow_deg)
+}
+
 /// The apple core round (cx, cy), or None if that part of the fiber is off the image.
-pub fn apple_core(image: &RgbImage, cx: f64, cy: f64, radius: f64) -> Option<AppleCore> {
+/// `rods_deg`: the line through the rod outlines found beside it, even faint ones: of the
+/// core's two mirror axes, the one along it is the slow axis (the rods sit beside the
+/// pinches). Without it, or with it far from both axes, the pinches decide.
+pub fn apple_core(image: &RgbImage, cx: f64, cy: f64, radius: f64, rods_deg: Option<f64>) -> Option<AppleCore> {
     let reach = radius * APPLE_REACH;
     if cx - reach < 0.0 || cy - reach < 0.0 || cx + reach > image.width() as f64 || cy + reach > image.height() as f64 || reach < 4.0 {
         return None;
@@ -1681,11 +1695,19 @@ pub fn apple_core(image: &RgbImage, cx: f64, cy: f64, radius: f64) -> Option<App
         total / 2.0
     };
     let (a, b) = (pinch(theta), pinch(theta + 90.0));
-    let (slow, other) = if a >= b { (theta, theta + 90.0) } else { (theta + 90.0, theta) };
+    let by_pinch = if a >= b { (theta, theta + 90.0) } else { (theta + 90.0, theta) };
+    let guide = rods_deg.filter(|&r| axial_diff(r, theta).min(axial_diff(r, theta + 90.0)) <= APPLE_ROD_GUIDE);
+    let (slow, other) = match guide {
+        Some(r) if axial_diff(r, theta) <= axial_diff(r, theta + 90.0) => (theta, theta + 90.0),
+        Some(_) => (theta + 90.0, theta),
+        None => by_pinch,
+    };
     Some(AppleCore {
         slow_deg: slow.rem_euclid(180.0),
+        fast_deg: other.rem_euclid(180.0),
         symmetry: (mirror(slow), mirror(other)),
         pinch: (a.max(b), a.min(b)),
+        by_rods: guide.is_some(),
     })
 }
 
@@ -1763,7 +1785,8 @@ pub fn measure_axis(image: &RgbImage, cx: f64, cy: f64, radius: f64, method: &st
         return measure_rods(image, cx, cy, radius, None, detection.min_rod_for(radius));
     }
     if method == "core" {
-        return match apple_core(image, cx, cy, radius) {
+        let rods = measure_rods(image, cx, cy, radius, None, detection.min_rod_for(radius));
+        return match apple_core(image, cx, cy, radius, rod_guide(&rods)) {
             Some(core) => core.axis(cx, cy, radius),
             None => FiberAxis::new(cx, cy, radius, 0.0, 1.0, "?", 0),
         };
@@ -2143,8 +2166,14 @@ mod tests {
     fn apple_core_gives_the_axes() {
         for truth in [0.0, 30.0, 93.0, 150.0] {
             let img = drawn_apple_core(truth);
-            let core = apple_core(&img, 300.0, 300.0, 250.0).unwrap();
-            assert!(core.clear() && angle_error(core.slow_deg, truth) < 1.0, "{truth}: {core:?}");
+            let core = apple_core(&img, 300.0, 300.0, 250.0, None).unwrap();
+            assert!(core.clear() && !core.by_rods && angle_error(core.slow_deg, truth) < 1.0, "{truth}: {core:?}");
+            // Rod outlines beside it pick the slow axis, whichever way the pinches look;
+            // rods far from both of its axes are ignored.
+            for (rods, slow) in [(truth + 4.0, truth), (truth + 87.0, truth + 90.0), (truth + 45.0, truth)] {
+                let c = apple_core(&img, 300.0, 300.0, 250.0, Some(rods)).unwrap();
+                assert!(angle_error(c.slow_deg, slow) < 1.0 && c.by_rods == (rods != truth + 45.0), "{truth} rods {rods}: {c:?}");
+            }
             // No rods to see: Automatic falls back on the apple core.
             let f = measure_axis(&img, 300.0, 300.0, 250.0, "auto", false, &Detection::default());
             assert!(f.method == "core" && f.clear() && angle_error(f.slow_deg, truth) < 1.0, "{truth}: {f:?}");

@@ -215,6 +215,8 @@ pub struct ImageView {
     pub hover: Option<(u32, u32, [u8; 3])>,
     /// Zoom or position changed by the user this frame (for Link views).
     pub moved: bool,
+    /// The view's area as last shown (for its right-click menu).
+    pub response: Option<egui::Response>,
     rect: Rect,
 }
 
@@ -227,6 +229,7 @@ impl Default for ImageView {
             zoom: 1.0,
             centre: Pos2::ZERO,
             fitting: true,
+            response: None,
             tool: None,
             points: Vec::new(),
             mouse: None,
@@ -419,6 +422,7 @@ impl ImageView {
         self.moved = false;
         let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         self.rect = rect;
+        self.response = Some(response.clone());
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, BACKGROUND);
         let Some(image) = self.image.clone() else {
@@ -445,8 +449,8 @@ impl ImageView {
             )
         });
         let over = hover_pos.filter(|p| rect.contains(*p) && response.hovered());
-        if over.is_some() && pressed.iter().any(|&b| b) {
-            events.push(ViewEvent::Activated);
+        if (over.is_some() && pressed.iter().any(|&b| b)) || response.secondary_clicked() {
+            events.push(ViewEvent::Activated); // a right-click too: its menu acts on this view
         }
         // Wheel: zoom about the point under the cursor.
         if let Some(cursor) = over {

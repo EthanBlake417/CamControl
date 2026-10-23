@@ -83,6 +83,15 @@ pub struct Saved {
     /// Axis lines outside the fibers only, to the edges of the picture (and the crosshair on a fiber outside it only).
     pub fiber_long_lines: bool,
     pub fiber_lines: FiberLineStyle,
+    pub fiber_live: bool,
+    pub fiber_use_circles: bool,
+    pub fiber_log_record: bool,
+    /// Counting class names (empty: Class 1, Class 2, ...).
+    pub count_class_names: Vec<String>,
+    /// The layout "Several views" goes back to.
+    pub multi_layout: String,
+    /// The tab last shown in the grid, crosshair and fiber axes window.
+    pub overlay_tab: String,
     pub histogram_log: bool,
     pub histogram_colors: bool,
     pub fiber_detection: Detection,
@@ -124,6 +133,12 @@ impl Default for Saved {
             fiber_show_parts: true,
             fiber_long_lines: false,
             fiber_lines: FiberLineStyle::default(),
+            fiber_live: false,
+            fiber_use_circles: true,
+            fiber_log_record: false,
+            count_class_names: Vec::new(),
+            multi_layout: "grid".into(),
+            overlay_tab: "grid".into(),
             histogram_log: false,
             histogram_colors: false,
             fiber_detection: Detection::default(),

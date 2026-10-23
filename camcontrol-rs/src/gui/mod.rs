@@ -89,6 +89,8 @@ pub struct Pane {
     pub title: String,
     pub result: Option<ResultInfo>,
     pub fiber_last: Option<Instant>,
+    /// The details saved with the open file (exposure, gain, ...): one line, and all of them.
+    pub details: Option<(String, String)>,
 }
 
 impl Pane {
@@ -108,6 +110,7 @@ impl Pane {
             title: String::new(),
             result: None,
             fiber_last: None,
+            details: None,
         }
     }
 
@@ -182,13 +185,93 @@ pub struct FiberSettings {
 }
 
 impl App {
+    /// The View menu's items: in the menu bar, and on right-clicking a view.
+    pub(crate) fn view_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let ctx = ctx.clone();
+        let fmt = |s: &KeyboardShortcut| ctx.format_shortcut(s);
+        let mut live = self.active_pane().live;
+        if ui.add_enabled(self.active_pane().camera.is_some(), egui::Checkbox::new(&mut live, "Live  (L)")).changed() {
+            self.toggle_live(live);
+        }
+        ui.checkbox(&mut self.saved.grid, "Grid  (G)");
+        ui.checkbox(&mut self.saved.crosshair, "Crosshair  (C)");
+        if ui.button("Grid, crosshair and fiber axes settings...").clicked() {
+            self.overlay_open = true;
+            ui.close_menu();
+        }
+        ui.separator();
+        if ui.add(egui::Button::new("Fit to window").shortcut_text("F")).clicked() {
+            for id in self.targets() {
+                self.pane_mut(id).view.fit();
+            }
+            ui.close_menu();
+        }
+        if ui.add(egui::Button::new("100%").shortcut_text("1")).clicked() {
+            for id in self.targets() {
+                self.pane_mut(id).view.actual_size();
+            }
+            ui.close_menu();
+        }
+        if ui.add(egui::Button::new("Zoom in").shortcut_text(fmt(&ZOOM_IN))).clicked() {
+            self.active_pane_mut().view.zoom_in();
+        }
+        if ui.add(egui::Button::new("Zoom out").shortcut_text(fmt(&ZOOM_OUT))).clicked() {
+            self.active_pane_mut().view.zoom_out();
+        }
+        ui.separator();
+        ui.menu_button("Layout", |ui| {
+            for (name, label) in views::LAYOUTS {
+                if ui.radio(self.layout == name, label).clicked() {
+                    self.set_layout(name, true);
+                    ui.close_menu();
+                }
+            }
+        });
+        let mut multi = self.layout != "single";
+        if ui.checkbox(&mut multi, "Several views  (Ctrl+K)").changed() {
+            let target = if multi { self.multi_layout.clone() } else { "single".into() };
+            self.set_layout(&target, true);
+        }
+        if ui.add(egui::Button::new("Add view").shortcut_text(fmt(&ADD_VIEW))).clicked() {
+            ui.close_menu();
+            self.add_view_and_choose();
+        }
+        if ui.button("Open images in new views...").clicked() {
+            ui.close_menu();
+            self.open_in_new_views_dialog(&ctx);
+        }
+        if ui.add_enabled(self.panes.len() > 1, egui::Button::new("Remove this view")).clicked() {
+            ui.close_menu();
+            let a = self.active;
+            self.remove_view(a, false);
+        }
+        ui.checkbox(&mut self.link, "Link views");
+        ui.menu_button("Source of this view", |ui| {
+            let a = self.active;
+            self.source_menu(ui, &ctx, a);
+        });
+        ui.separator();
+        ui.menu_button("Panels", |ui| {
+            for id in PanelId::ALL {
+                let mut open = self.panels.is_open(id);
+                if ui.checkbox(&mut open, format!("{}  (Ctrl+{})", id.title(), id.shortcut())).changed() {
+                    self.panels.set_open(id, open);
+                }
+            }
+        });
+    }
+
     /// How fiber axes are drawn: the Fiber axis panel's and the overlay settings' choices.
     pub(crate) fn fiber_drawing(&self) -> annotate::FiberDrawing {
         annotate::FiberDrawing {
             show_parts: self.fiber.show_parts,
             long_lines: self.saved.fiber_long_lines,
+            show_slow: self.saved.fiber_lines.show_axes != "fast",
+            show_fast: self.saved.fiber_lines.show_axes != "slow",
             slow: self.saved.fiber_lines.slow(),
             fast: self.saved.fiber_lines.fast(),
+            slow_bands: self.saved.fiber_lines.slow_by_angle.bands(self.saved.fiber_lines.slow_opacity),
+            fast_bands: self.saved.fiber_lines.fast_by_angle.bands(self.saved.fiber_lines.fast_opacity),
         }
     }
 }
@@ -284,21 +367,24 @@ impl App {
             cc.egui_ctx.load_texture("logo", egui::ColorImage::from_rgba_unmultiplied([i.width() as usize, i.height() as usize], i.as_raw()), Default::default())
         });
         let fiber = FiberSettings {
-            live: false,
+            live: saved.fiber_live,
             method: saved.fiber_method.clone(),
             parts_centre: saved.fiber_parts_centre,
             show_parts: saved.fiber_show_parts,
             centre_only: saved.fiber_centre_only,
-            use_circles: true,
+            use_circles: saved.fiber_use_circles,
             advanced: saved.fiber_advanced,
             detection: saved.fiber_detection.clone(),
             shown_threshold: 6.0,
         };
+        let multi_layout = if views::LAYOUTS.iter().any(|l| l.0 == saved.multi_layout && l.0 != "single") { saved.multi_layout.clone() } else { "grid".into() };
+        let overlay_tab = if ["grid", "crosshair", "fiber"].contains(&saved.overlay_tab.as_str()) { saved.overlay_tab.clone() } else { "grid".into() };
+        let class_names = if saved.count_class_names.len() == default_names().len() { saved.count_class_names.clone() } else { default_names() };
         let mut gallery = Gallery::new(wake.clone());
         gallery.count = saved.gallery_count.clamp(1, 500);
         std::thread::spawn(crate::processing::fiber_axis::warm_up); // the first Find axes needn't wait
         let mut app = Self {
-            fiber_log: Default::default(),
+            fiber_log: fiber_log::FiberLog { record: saved.fiber_log_record, ..Default::default() },
             histogram: histogram::Histogram::new(saved.histogram_log, saved.histogram_colors),
             panes: Vec::new(),
             active: 0,
@@ -306,7 +392,7 @@ impl App {
             next_pane: 1,
             devices: Vec::new(),
             layout: "single".into(),
-            multi_layout: "grid".into(),
+            multi_layout,
             link: saved.views_link,
             panels: saved.panels.clone(),
             saved,
@@ -315,14 +401,14 @@ impl App {
             tl_status: "Images use the Photo tab's averaging, size and format.".into(),
             tl_info: None,
             overlay_open: false,
-            overlay_tab: "grid".into(),
+            overlay_tab,
             flat: None,
             tool: None,
             calibration: Calibration::pixels(),
             counting: false,
             picking_rod: false,
             count_class: 0,
-            class_names: default_names(),
+            class_names,
             fiber,
             fiber_job: None,
             fiber_waiting: Vec::new(),
@@ -575,76 +661,7 @@ impl App {
                 }
             });
             ui.menu_button("View", |ui| {
-                let mut live = self.active_pane().live;
-                if ui.add_enabled(self.active_pane().camera.is_some(), egui::Checkbox::new(&mut live, "Live  (L)")).changed() {
-                    self.toggle_live(live);
-                }
-                ui.checkbox(&mut self.saved.grid, "Grid  (G)");
-                ui.checkbox(&mut self.saved.crosshair, "Crosshair  (C)");
-                if ui.button("Grid, crosshair and fiber axes settings...").clicked() {
-                    self.overlay_open = true;
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.add(egui::Button::new("Fit to window").shortcut_text("F")).clicked() {
-                    for id in self.targets() {
-                        self.pane_mut(id).view.fit();
-                    }
-                    ui.close_menu();
-                }
-                if ui.add(egui::Button::new("100%").shortcut_text("1")).clicked() {
-                    for id in self.targets() {
-                        self.pane_mut(id).view.actual_size();
-                    }
-                    ui.close_menu();
-                }
-                if ui.add(egui::Button::new("Zoom in").shortcut_text(fmt(&ZOOM_IN))).clicked() {
-                    self.active_pane_mut().view.zoom_in();
-                }
-                if ui.add(egui::Button::new("Zoom out").shortcut_text(fmt(&ZOOM_OUT))).clicked() {
-                    self.active_pane_mut().view.zoom_out();
-                }
-                ui.separator();
-                ui.menu_button("Layout", |ui| {
-                    for (name, label) in views::LAYOUTS {
-                        if ui.radio(self.layout == name, label).clicked() {
-                            self.set_layout(name, true);
-                            ui.close_menu();
-                        }
-                    }
-                });
-                let mut multi = self.layout != "single";
-                if ui.checkbox(&mut multi, "Several views  (Ctrl+K)").changed() {
-                    let target = if multi { self.multi_layout.clone() } else { "single".into() };
-                    self.set_layout(&target, true);
-                }
-                if ui.add(egui::Button::new("Add view").shortcut_text(fmt(&ADD_VIEW))).clicked() {
-                    ui.close_menu();
-                    self.add_view_and_choose();
-                }
-                if ui.button("Open images in new views...").clicked() {
-                    ui.close_menu();
-                    self.open_in_new_views_dialog(&ctx);
-                }
-                if ui.add_enabled(self.panes.len() > 1, egui::Button::new("Remove this view")).clicked() {
-                    ui.close_menu();
-                    let a = self.active;
-                    self.remove_view(a, false);
-                }
-                ui.checkbox(&mut self.link, "Link views");
-                ui.menu_button("Source of this view", |ui| {
-                    let a = self.active;
-                    self.source_menu(ui, &ctx, a);
-                });
-                ui.separator();
-                ui.menu_button("Panels", |ui| {
-                    for id in PanelId::ALL {
-                        let mut open = self.panels.is_open(id);
-                        if ui.checkbox(&mut open, format!("{}  (Ctrl+{})", id.title(), id.shortcut())).changed() {
-                            self.panels.set_open(id, open);
-                        }
-                    }
-                });
+                self.view_menu(ui, &ctx);
             });
             ui.menu_button("Measure", |ui| {
                 if ui.add(egui::Button::new("Export measurements...").shortcut_text(fmt(&EXPORT))).clicked() {
@@ -733,6 +750,10 @@ impl App {
                     ui.label(format!("{} x {}", img.width(), img.height()));
                     ui.separator();
                     ui.label(format!("{:.0}%", pane.view.zoom * 100.0));
+                }
+                if let Some((line, all)) = pane.details.as_ref().filter(|_| !pane.live) {
+                    ui.separator();
+                    ui.add(egui::Label::new(RichText::new(line).weak()).truncate()).on_hover_text(all);
                 }
                 if let Some((x, y, [r, g, b])) = self.panes.iter().find_map(|p| p.view.hover) {
                     ui.separator();
@@ -870,6 +891,13 @@ impl App {
             events.extend(ev.into_iter().map(|e| (*id, e)));
         }
         ui.allocate_rect(area, egui::Sense::hover());
+        // Right-click on a view: the View menu.
+        let ids: Vec<u64> = self.panes.iter().map(|p| p.id).collect();
+        for id in ids {
+            if let Some(r) = self.pane(id).view.response.clone() {
+                r.context_menu(|ui| self.view_menu(ui, ctx));
+            }
+        }
         // Link views: the others follow the one that moved.
         if let Some(src) = moved.filter(|_| self.link && self.panes.len() > 1) {
             if let Some(state) = self.pane(src).view.state() {
@@ -1009,6 +1037,11 @@ impl App {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn save_state_for_test(&mut self) {
+        self.save_state();
+    }
+
     fn save_state(&mut self) {
         self.saved.panels = self.panels.clone();
         self.saved.views = self.view_specs();
@@ -1025,6 +1058,12 @@ impl App {
         self.saved.histogram_log = self.histogram.log;
         self.saved.histogram_colors = self.histogram.colors;
         self.saved.fiber_detection = self.fiber.detection.clone();
+        self.saved.fiber_live = self.fiber.live;
+        self.saved.fiber_use_circles = self.fiber.use_circles;
+        self.saved.fiber_log_record = self.fiber_log.record;
+        self.saved.count_class_names = self.class_names.clone();
+        self.saved.multi_layout = self.multi_layout.clone();
+        self.saved.overlay_tab = self.overlay_tab.clone();
     }
 }
 

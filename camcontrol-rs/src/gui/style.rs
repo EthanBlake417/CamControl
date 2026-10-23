@@ -44,18 +44,94 @@ impl Default for GridStyle {
     }
 }
 
+/// An axis colored by how close its angle is to 0: at most limits[i] degrees either way
+/// (the smallest limit that fits) gives colors[i]; beyond them all, the axis's own color.
+/// "Close" is to `aim`: 0° or 90°, either way (|angle| near it): usually the fast axis
+/// aims at 0° and the slow axis at 90°.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AngleColors {
+    pub on: bool,
+    pub aim: f64,
+    pub limits: [f64; 3],
+    pub colors: [String; 3],
+}
+
+impl Default for AngleColors {
+    fn default() -> Self {
+        Self { on: true, aim: 0.0, limits: [0.5, 1.0, 2.0], colors: ["#00ff00".into(), "#ffff00".into(), "#ff8000".into()] }
+    }
+}
+
+/// An axis's colors by angle, ready to draw: aim (degrees) and (limit, color), smallest limit first.
+pub type AngleBands = (f64, [(f64, Color); 3]);
+
+impl AngleColors {
+    /// The defaults for the slow axis (aiming at 90°) and the fast axis (at 0°).
+    pub fn for_axis(slow: bool) -> Self {
+        Self { aim: if slow { 90.0 } else { 0.0 }, ..Self::default() }
+    }
+
+    /// Field by field, so one bad value doesn't lose the others. Saved before there was
+    /// an aim (all off then): this axis's defaults.
+    fn from_value(data: &Value, slow: bool) -> Self {
+        let mut s = Self::for_axis(slow);
+        if !data.is_object() || data.get("aim").is_none() {
+            return s;
+        }
+        if let Some(a) = data["aim"].as_f64() {
+            s.aim = if a >= 45.0 { 90.0 } else { 0.0 };
+        }
+        if let Some(on) = data["on"].as_bool() {
+            s.on = on;
+        }
+        for i in 0..3 {
+            if let Some(v) = data["limits"][i].as_f64().filter(|v| v.is_finite()) {
+                s.limits[i] = v.clamp(0.0, 90.0);
+            }
+            if let Some(c) = data["colors"][i].as_str().filter(|c| parse_color(c).is_some()) {
+                s.colors[i] = c.into();
+            }
+        }
+        s
+    }
+
+    /// The aim and (limit, color with this opacity), smallest limit first; None when off.
+    pub fn bands(&self, opacity: i64) -> Option<AngleBands> {
+        let mut b: [(f64, Color); 3] = std::array::from_fn(|i| (self.limits[i], rgba(&self.colors[i], opacity)));
+        b.sort_by(|x, y| x.0.total_cmp(&y.0));
+        self.on.then_some((self.aim, b))
+    }
+}
+
+/// name, label: which fiber axes are shown.
+pub const SHOW_AXES: [(&str, &str); 3] = [("slow", "Slow"), ("fast", "Fast"), ("both", "Both")];
+
 /// Colors of the fibers' slow and fast axis lines (and of their angles in the readout).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FiberLineStyle {
+    /// Which axes are drawn (and read out): "both", "slow" or "fast".
+    pub show_axes: String,
     pub slow_color: String,
     pub slow_opacity: i64,
     pub fast_color: String,
     pub fast_opacity: i64,
+    pub slow_by_angle: AngleColors,
+    pub fast_by_angle: AngleColors,
 }
 
 impl Default for FiberLineStyle {
     fn default() -> Self {
-        Self { slow_color: "#ff00c8".into(), slow_opacity: 100, fast_color: "#ffc800".into(), fast_opacity: 100 }
+        Self {
+            show_axes: "both".into(),
+            slow_color: "#ff00c8".into(),
+            slow_opacity: 100,
+            fast_color: "#ffc800".into(),
+            fast_opacity: 100,
+            slow_by_angle: AngleColors::for_axis(true),
+            fast_by_angle: AngleColors::for_axis(false),
+        }
     }
 }
 
@@ -78,6 +154,11 @@ impl FiberLineStyle {
         }
         s.slow_opacity = s.slow_opacity.clamp(5, 100);
         s.fast_opacity = s.fast_opacity.clamp(5, 100);
+        if !SHOW_AXES.iter().any(|a| a.0 == s.show_axes) {
+            s.show_axes = d.show_axes.clone();
+        }
+        s.slow_by_angle = AngleColors::from_value(&data["slow_by_angle"], true);
+        s.fast_by_angle = AngleColors::from_value(&data["fast_by_angle"], false);
         s
     }
 
@@ -227,5 +308,24 @@ mod tests {
         assert_eq!((c.anchor.as_str(), c.circle), ("window", 0));
         let f = FiberLineStyle::from_value(&serde_json::json!({"slow_color": "#0000ff", "fast_color": "red", "fast_opacity": 50.0}));
         assert_eq!((f.slow(), f.fast()), ([0, 0, 255, 255], [255, 200, 0, 127]));
+        // On by default: the slow axis aiming at 90°, the fast at 0°.
+        assert_eq!(f.slow_by_angle.bands(100).map(|b| b.0), Some(90.0));
+        assert_eq!(f.fast_by_angle.bands(100).map(|b| b.0), Some(0.0));
+        let saved = serde_json::to_value(FiberLineStyle {
+            fast_by_angle: AngleColors { on: true, aim: 0.0, limits: [3.0, 0.2, f64::NAN], colors: ["#010203".into(), "bad".into(), "#ffffff".into()] },
+            slow_by_angle: AngleColors { on: false, ..AngleColors::for_axis(true) },
+            ..Default::default()
+        }).unwrap();
+        let back = FiberLineStyle::from_value(&saved);
+        assert_eq!(back.fast_by_angle.limits, [3.0, 0.2, 2.0]);
+        let (aim, b) = back.fast_by_angle.bands(50).unwrap();
+        assert_eq!((aim, b.map(|x| x.0)), (0.0, [0.2, 2.0, 3.0]));
+        assert_eq!(b[0].1, [255, 255, 0, 127]); // the bad color back to its default
+        assert!(back.slow_by_angle.bands(100).is_none(), "turned off stays off");
+        assert_eq!(FiberLineStyle::from_value(&serde_json::json!({"show_axes": "fast"})).show_axes, "fast");
+        assert_eq!(FiberLineStyle::from_value(&serde_json::json!({"show_axes": "sideways"})).show_axes, "both");
+        // Saved by the version before aims (off, no aim): the new defaults.
+        let old = FiberLineStyle::from_value(&serde_json::json!({"slow_by_angle": {"on": false, "limits": [1, 2, 3]}}));
+        assert_eq!(old.slow_by_angle, AngleColors::for_axis(true));
     }
 }

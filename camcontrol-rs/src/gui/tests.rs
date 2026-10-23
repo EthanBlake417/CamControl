@@ -106,6 +106,39 @@ fn open(h: &mut Test, path: &PathBuf) {
     h.run_ok();
 }
 
+/// An image saved with its details: they're shown in the status bar when it's opened.
+#[test]
+fn saved_details_in_the_status_bar() {
+    let (mut h, dir) = harness("details");
+    let path = dir.join("with_details.tif");
+    let meta = serde_json::json!({"timestamp": "2026-10-20T18:17:20", "exposure_seconds_approx": 0.015, "gain": 30.0, "frames_averaged": 4});
+    crate::capture::save_image_with(&path, &RgbImage::new(64, 48), Some(&meta)).unwrap();
+    open(&mut h, &path);
+    let line = h.state().active_pane().details.as_ref().map(|d| d.0.clone()).expect("details read");
+    assert!(line.contains("exposure 15 ms") && line.contains("gain 30"), "{line}");
+    assert!(h.query_by_label(&line).is_some(), "shown in the status bar");
+    let plain = dir.join("plain.png");
+    RgbImage::new(64, 48).save(&plain).unwrap();
+    open(&mut h, &plain);
+    assert!(h.state().active_pane().details.is_none() && h.query_by_label(&line).is_none());
+}
+
+/// Right-click on the image: the View menu's items, acting on that view.
+#[test]
+fn right_click_shows_the_view_menu() {
+    let (mut h, dir) = harness("rightclick");
+    let path = dir.join("panda.png");
+    drawn_panda(&path);
+    open(&mut h, &path);
+    assert!(h.query_by_label("Grid, crosshair and fiber axes settings...").is_none());
+    let p = h.state().active_pane().view.to_screen(200.0, 200.0);
+    click_at(&mut h, p, PointerButton::Secondary);
+    h.run_ok();
+    h.get_by_label("Grid, crosshair and fiber axes settings...").click();
+    h.run_ok();
+    assert!(h.state().overlay_open);
+}
+
 #[test]
 fn starts_empty_and_opens_an_image() {
     let (mut h, dir) = harness("open");
@@ -231,17 +264,49 @@ fn settings_file_round_trip() {
     app.saved.average_idx = 2;
     app.saved.grid = true;
     app.saved.grid_style.columns = 12;
+    app.fiber.live = true;
+    app.fiber.method = "core".into();
+    app.fiber.detection.min_rod_px = 42.0;
+    app.saved.fiber_long_lines = true;
+    app.saved.fiber_lines.slow_by_angle.limits[0] = 0.25;
     let data = app.current_settings();
     assert_eq!(data["capture"]["average"], 8);
     app.saved.name.clear();
     app.saved.average_idx = 0;
     app.saved.grid = false;
     app.saved.grid_style.columns = 8;
+    app.fiber.live = false;
+    app.fiber.method = "auto".into();
+    app.fiber.detection.min_rod_px = 0.0;
+    app.saved.fiber_long_lines = false;
+    app.saved.fiber_lines = Default::default();
     let ctx = app.ctx.clone();
     let path = dir.join("s.json");
     super::settings::save_settings_file(&path, &data).unwrap();
     app.open_settings_path(&ctx, &path, false);
     assert_eq!((app.saved.name.as_str(), app.saved.average_idx, app.saved.grid, app.saved.grid_style.columns), ("sample", 2, true, 12));
+    assert!(app.fiber.live && app.fiber.method == "core" && app.fiber.detection.min_rod_px == 42.0);
+    assert!(app.saved.fiber_long_lines && app.saved.fiber_lines.slow_by_angle.limits[0] == 0.25);
+}
+
+/// Panel choices made in one session are there in the next (the app's own storage).
+#[test]
+fn choices_kept_between_sessions() {
+    let (mut h, _dir) = harness("remember");
+    let app = h.state_mut();
+    app.fiber.live = true;
+    app.fiber.use_circles = false;
+    app.fiber_log.record = true;
+    app.class_names[0] = "Cores".into();
+    app.multi_layout = "row".into();
+    app.overlay_tab = "fiber".into();
+    app.save_state_for_test();
+    let s = &app.saved;
+    assert!(s.fiber_live && !s.fiber_use_circles && s.fiber_log_record);
+    assert_eq!((s.count_class_names[0].as_str(), s.multi_layout.as_str(), s.overlay_tab.as_str()), ("Cores", "row", "fiber"));
+    let back: super::settings::Saved = serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap();
+    assert!(back.fiber_live && !back.fiber_use_circles && back.fiber_log_record);
+    assert_eq!((back.count_class_names, back.multi_layout, back.overlay_tab), (s.count_class_names.clone(), s.multi_layout.clone(), s.overlay_tab.clone()));
 }
 
 #[test]
@@ -291,7 +356,8 @@ fn camera_opens_live_and_captures() {
     wait(&mut t, "the capture", |a| a.capturing.is_empty() && dir.join("shot-001.tif").is_file());
     let img = crate::capture::load_image(&dir.join("shot-001.tif")).unwrap();
     assert_eq!(img.dimensions(), (640, 480));
-    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("shot-001.json")).unwrap()).unwrap();
+    assert!(!dir.join("shot-001.json").exists());
+    let meta = crate::capture::read_image_details(&dir.join("shot-001.tif")).expect("details inside the TIFF");
     assert_eq!(meta["frames_averaged"], 4);
     assert_eq!(meta["exposure_value"], -6.0);
 }
@@ -525,5 +591,16 @@ fn render_shots() {
     t.state_mut().fiber.advanced = true;
     t.state_mut().overlay_open = true;
     t.state_mut().overlay_tab = "fiber".into();
+    t.state_mut().saved.fiber_lines.slow_by_angle.on = true;
     shot(&mut t, "7_fiber_advanced_overlay");
+    t.state_mut().overlay_open = false;
+    for slot in t.state_mut().panels.slots.iter_mut().filter(|s| s.id == PanelId::FiberLog) {
+        slot.edge = super::stripes::Edge::Right;
+    }
+    t.state_mut().panels.set_open(PanelId::FiberLog, true);
+    let fibers = t.state().active_pane().fibers.clone();
+    for _ in 0..6 {
+        t.state_mut().fiber_log.add(&fibers);
+    }
+    shot(&mut t, "8_fiber_log_right");
 }

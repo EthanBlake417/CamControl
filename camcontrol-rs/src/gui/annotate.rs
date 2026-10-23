@@ -6,6 +6,7 @@
 use image::RgbImage;
 
 use crate::calibration::Calibration;
+use super::style::AngleBands;
 use crate::draw::{label, Canvas, Color, Dash, SkiaCanvas, P};
 use crate::measure::{compute, is_circle, summary, Measurement};
 use crate::processing::count::{Counter, CLASS_COLORS};
@@ -31,11 +32,34 @@ pub struct FiberDrawing {
     /// Line colors (with opacity); the readout writes each axis's angle in its color.
     pub slow: Color,
     pub fast: Color,
+    /// Which axes are drawn and read out.
+    pub show_slow: bool,
+    pub show_fast: bool,
+    /// Colors by angle (see style::AngleColors): aim, then (limit in degrees, color), smallest first.
+    pub slow_bands: Option<AngleBands>,
+    pub fast_bands: Option<AngleBands>,
 }
 
 impl Default for FiberDrawing {
     fn default() -> Self {
-        Self { show_parts: false, long_lines: false, slow: SLOW_COLOR, fast: FAST_COLOR }
+        Self { show_parts: false, long_lines: false, slow: SLOW_COLOR, fast: FAST_COLOR, show_slow: true, show_fast: true, slow_bands: None, fast_bands: None }
+    }
+}
+
+impl FiberDrawing {
+    fn by_angle(base: Color, bands: &Option<AngleBands>, deg: f64) -> Color {
+        let Some((aim, bands)) = bands else { return base };
+        let off = (signed_angle(deg).abs() - aim).abs(); // from the aim, either way
+        bands.iter().find(|(limit, _)| off <= *limit).map(|b| b.1).unwrap_or(base)
+    }
+
+    /// This fiber's slow axis color (its own, or by its angle).
+    pub fn slow_color(&self, f: &FiberAxis) -> Color {
+        Self::by_angle(self.slow, &self.slow_bands, f.slow_deg)
+    }
+
+    pub fn fast_color(&self, f: &FiberAxis) -> Color {
+        Self::by_angle(self.fast, &self.fast_bands, f.fast_deg())
     }
 }
 
@@ -247,7 +271,8 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
             let k = (r * 0.25).max(style.marker * 3.0);
             c.ellipse(centre, k, k, Some(READOUT_COLOR), width, Dash::Solid, None);
         }
-        for (deg, color, dash) in [(f.fast_deg(), drawing.fast, Dash::Dash), (f.slow_deg, drawing.slow, Dash::Solid)] {
+        let shown = [(drawing.show_fast, f.fast_deg(), drawing.fast_color(f), Dash::Dash), (drawing.show_slow, f.slow_deg, drawing.slow_color(f), Dash::Solid)];
+        for (deg, color, dash) in shown.into_iter().filter(|a| a.0).map(|a| (a.1, a.2, a.3)) {
             let a = deg.to_radians();
             if drawing.long_lines {
                 // Through the pivot to the edges of the area (as the crosshair), never over a fiber
@@ -281,12 +306,18 @@ pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<V
         .enumerate()
         .map(|(i, f)| {
             let mut line = vec![
-                (format!("{}: ", i + 1), READOUT_COLOR),
-                (format!("slow {}°", fmt_angle(f.slow_deg)), opaque(drawing.slow)),
-                (format!("  fast {}°", fmt_angle(f.fast_deg())), opaque(drawing.fast)),
+                (format!("slow {}°", fmt_angle(f.slow_deg)), opaque(drawing.slow_color(f))),
+                (format!("fast {}°", fmt_angle(f.fast_deg())), opaque(drawing.fast_color(f))),
             ];
+            // Only the axes shown, the number in the first one's color.
+            line.retain(|p| if p.0.starts_with("slow") { drawing.show_slow } else { drawing.show_fast });
+            if line.len() == 2 {
+                line[1].0.insert_str(0, "  ");
+            }
+            let first = line.first().map(|p| p.1).unwrap_or(READOUT_COLOR);
+            line.insert(0, (format!("{}: ", i + 1), first));
             if !f.clear() {
-                line.push((" (unclear)".into(), READOUT_COLOR));
+                line.push((" (unclear)".into(), [230, 230, 230, 255]));
             }
             line
         })
@@ -384,6 +415,32 @@ mod tests {
         assert!(is_blue(410, 200) && is_blue(598, 200) && is_blue(190, 200) && is_blue(1, 200));
         // The neighbour's own slow axis (45°): outside it only.
         assert!(is_blue(520 + 60, 200 - 60) && !is_blue(520 + 20, 200 - 20));
+    }
+
+    #[test]
+    fn axis_colors_by_angle() {
+        let bands = Some((0.0, [(0.5, [0, 255, 0, 255]), (1.0, [255, 255, 0, 255]), (2.0, [255, 128, 0, 255])]));
+        let d = FiberDrawing { slow_bands: bands, ..Default::default() };
+        let at = |deg: f64| FiberAxis::new(0.0, 0.0, 10.0, deg, 2.0, "Panda", 2);
+        assert_eq!(d.slow_color(&at(0.4)), [0, 255, 0, 255]);
+        assert_eq!(d.slow_color(&at(179.6)), [0, 255, 0, 255]); // -0.4°
+        assert_eq!(d.slow_color(&at(1.0)), [255, 255, 0, 255]);
+        assert_eq!(d.slow_color(&at(178.5)), [255, 128, 0, 255]); // -1.5°
+        assert_eq!(d.slow_color(&at(5.0)), SLOW_COLOR);
+        assert_eq!(d.fast_color(&at(0.4)), FAST_COLOR, "the fast axis has its own (off)");
+        let pieces = fiber_readout_pieces(&[at(0.4)], &d);
+        assert_eq!(pieces[0][1].1, [0, 255, 0, 255], "the readout's slow angle in the same color");
+        assert_eq!(pieces[0][0].1, pieces[0][1].1, "the fiber's number too");
+        let only_fast = FiberDrawing { show_slow: false, ..d };
+        let text: String = fiber_readout_pieces(&[at(0.4)], &only_fast)[0].iter().map(|p| p.0.clone()).collect();
+        assert_eq!(text, "1: fast -89.6°");
+        assert_eq!(fiber_readout_lines(&[at(0.4)]), vec!["1: slow +0.4°  fast -89.6°".to_string()]);
+        // Aiming at 90°: -89.6° and +89.6° are 0.4° off; 88.5° is 1.5° off.
+        let d = FiberDrawing { slow_bands: bands.map(|(_, b)| (90.0, b)), ..Default::default() };
+        assert_eq!(d.slow_color(&at(90.4)), [0, 255, 0, 255]);
+        assert_eq!(d.slow_color(&at(89.6)), [0, 255, 0, 255]);
+        assert_eq!(d.slow_color(&at(88.5)), [255, 128, 0, 255]);
+        assert_eq!(d.slow_color(&at(0.2)), SLOW_COLOR);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use eframe::egui;
 use image::RgbImage;
 use serde_json::{json, Value};
 
-use super::style::{color_hex, parse_color, CrosshairStyle, FiberLineStyle, GridStyle, CROSSHAIR_ANCHORS, LINE_STYLES};
+use super::style::{color_hex, parse_color, AngleColors, CrosshairStyle, FiberLineStyle, GridStyle, CROSSHAIR_ANCHORS, LINE_STYLES, SHOW_AXES};
 use crate::capture::IMAGE_EXTENSIONS;
 use crate::processing::{fluorescence, focus_stack, hdr, stitch};
 
@@ -233,6 +233,43 @@ fn line_combo(ui: &mut egui::Ui, id: &str, line: &mut String) -> bool {
     changed
 }
 
+/// An axis's color, opacity and colors by angle, as rows of the Fiber axes tab.
+fn axis_color_rows(ui: &mut egui::Ui, name: &str, color: &mut String, opacity: &mut i64, by_angle: &mut AngleColors) {
+    ui.label(format!("{name} axis:"));
+    color_button(ui, color);
+    ui.end_row();
+    ui.label("Opacity:");
+    ui.add(egui::Slider::new(opacity, 5..=100).suffix("%"));
+    ui.end_row();
+    ui.label("");
+    ui.checkbox(&mut by_angle.on, "Color by angle").on_hover_text(format!(
+        "Color the {} axis by how close its angle is to the aim (0° or 90°, either way: for 90°,\n\
+         +89.7° and -89.7° are both 0.3° off): within the first limit, its first color; else within\n\
+         the second, the second color; else within the third, the third. Beyond them all, the axis\n\
+         color above. The readout's angle takes the same color. Usually the fast axis aims at 0°\n\
+         and the slow axis at 90°.", name.to_lowercase()));
+    ui.end_row();
+    if by_angle.on {
+        ui.label("Aim for:");
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut by_angle.aim, 0.0, "0°");
+            ui.selectable_value(&mut by_angle.aim, 90.0, "±90°");
+        });
+        ui.end_row();
+        let aim = if by_angle.aim > 45.0 { "±90°" } else { "0°" };
+        for i in 0..3 {
+            ui.label("");
+            ui.horizontal(|ui| {
+                ui.label("within");
+                ui.add(egui::DragValue::new(&mut by_angle.limits[i]).range(0.0..=90.0).speed(0.05).max_decimals(2).suffix("°"));
+                ui.label(format!("of {aim}"));
+                color_button(ui, &mut by_angle.colors[i]);
+            });
+            ui.end_row();
+        }
+    }
+}
+
 fn color_button(ui: &mut egui::Ui, color: &mut String) -> bool {
     let mut c = parse_color(color).unwrap_or([255, 255, 255]);
     let changed = ui.color_edit_button_srgb(&mut c).on_hover_text("Choose the line color").changed();
@@ -257,6 +294,13 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
         ui.separator();
         egui::Grid::new("overlay").num_columns(2).show(ui, |ui| {
             if tab == "fiber" {
+                ui.label("Show:");
+                ui.horizontal(|ui| {
+                    for (name, label) in SHOW_AXES {
+                        ui.selectable_value(&mut fiber.show_axes, name.to_string(), label);
+                    }
+                }).response.on_hover_text("Which axes are drawn on the views, exports and videos, and read out.");
+                ui.end_row();
                 ui.label("Lines:");
                 ui.checkbox(outside, "Outside the fiber").on_hover_text(
                     "Draw each fiber's axis lines only outside the fibers, from the fiber's edge to the edges of the view\n\
@@ -264,18 +308,9 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
                      without covering the fiber. With the crosshair centred on the fiber, its lines also stop at the\n\
                      fibers' edges. Also used for exported drawings (to the picture's edges) and videos.");
                 ui.end_row();
-                ui.label("Slow axis:");
-                color_button(ui, &mut fiber.slow_color);
-                ui.end_row();
-                ui.label("Opacity:");
-                ui.add(egui::Slider::new(&mut fiber.slow_opacity, 5..=100).suffix("%"));
-                ui.end_row();
-                ui.label("Fast axis:");
-                color_button(ui, &mut fiber.fast_color);
-                ui.end_row();
-                ui.label("Opacity:");
-                ui.add(egui::Slider::new(&mut fiber.fast_opacity, 5..=100).suffix("%"));
-                ui.end_row();
+                let f = &mut *fiber;
+                axis_color_rows(ui, "Slow", &mut f.slow_color, &mut f.slow_opacity, &mut f.slow_by_angle);
+                axis_color_rows(ui, "Fast", &mut f.fast_color, &mut f.fast_opacity, &mut f.fast_by_angle);
             } else if tab == "crosshair" {
                 ui.label("Centred on:");
                 let label = CROSSHAIR_ANCHORS.iter().find(|a| a.0 == crosshair.anchor).map(|a| a.1).unwrap_or("");
