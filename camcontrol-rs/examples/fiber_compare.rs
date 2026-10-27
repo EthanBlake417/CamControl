@@ -38,7 +38,7 @@ fn main() {
             let d = angle_error(ps, f.slow_deg);
             worst = worst.max(d);
             diffs.push(d);
-            line += &format!(" | py {:7.2} {:10} rs {:7.2} {:10} diff {d:5.2} centre {:4.1}px r {:+5.1}",
+            line += &format!(" | py {:7.2} {:10} rs {:7.2} {:10} diff {d:5.2} center {:4.1}px r {:+5.1}",
                              ps, p["type"].as_str().unwrap(), f.slow_deg, f.fiber_type,
                              (p["cx"].as_f64().unwrap() - f.cx).hypot(p["cy"].as_f64().unwrap() - f.cy),
                              f.radius - p["r"].as_f64().unwrap());

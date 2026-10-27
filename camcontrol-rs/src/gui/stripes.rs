@@ -16,10 +16,12 @@ pub enum PanelId {
     Controls,
     Captures,
     Measurements,
-    Counting,
+    #[serde(alias = "Counting")]
+    Alignment,
     Fiber,
     FiberLog,
-    Histogram,
+    #[serde(alias = "Histogram")]
+    FiberCount,
 }
 
 impl PanelId {
@@ -27,10 +29,10 @@ impl PanelId {
         PanelId::Controls,
         PanelId::Measurements,
         PanelId::Captures,
-        PanelId::Counting,
+        PanelId::Alignment,
         PanelId::Fiber,
         PanelId::FiberLog,
-        PanelId::Histogram,
+        PanelId::FiberCount,
     ];
 
     pub fn title(self) -> &'static str {
@@ -38,10 +40,10 @@ impl PanelId {
             PanelId::Controls => "Controls",
             PanelId::Captures => "Captures",
             PanelId::Measurements => "Measurements",
-            PanelId::Counting => "Counting",
+            PanelId::Alignment => "Alignment",
             PanelId::Fiber => "Fiber axis",
             PanelId::FiberLog => "Fiber log",
-            PanelId::Histogram => "Histogram",
+            PanelId::FiberCount => "Fiber count",
         }
     }
 
@@ -51,10 +53,10 @@ impl PanelId {
             PanelId::Controls => 1,
             PanelId::Measurements => 2,
             PanelId::Captures => 3,
-            PanelId::Counting => 4,
+            PanelId::Alignment => 4,
             PanelId::Fiber => 5,
             PanelId::FiberLog => 6,
-            PanelId::Histogram => 7,
+            PanelId::FiberCount => 7,
         }
     }
 }
@@ -91,10 +93,10 @@ impl Default for PanelLayout {
                 s(PanelId::Captures, Edge::Left, true),
                 s(PanelId::Controls, Edge::Right, true),
                 s(PanelId::Measurements, Edge::Bottom, true),
-                s(PanelId::Counting, Edge::Bottom, false),
+                s(PanelId::Alignment, Edge::Bottom, false),
                 s(PanelId::Fiber, Edge::Bottom, false),
                 s(PanelId::FiberLog, Edge::Bottom, false),
-                s(PanelId::Histogram, Edge::Bottom, false),
+                s(PanelId::FiberCount, Edge::Bottom, false),
             ],
             dragging: None,
             stripe_rects: Vec::new(),
@@ -265,13 +267,23 @@ mod tests {
     #[test]
     fn one_open_per_edge_and_moving() {
         let mut l = PanelLayout::default();
-        l.toggle(PanelId::Counting);
-        assert!(l.is_open(PanelId::Counting) && !l.is_open(PanelId::Measurements));
-        l.move_to(PanelId::Counting, Edge::Left, None);
-        assert!(l.is_open(PanelId::Counting) && !l.is_open(PanelId::Captures));
+        l.toggle(PanelId::Alignment);
+        assert!(l.is_open(PanelId::Alignment) && !l.is_open(PanelId::Measurements));
+        l.move_to(PanelId::Alignment, Edge::Left, None);
+        assert!(l.is_open(PanelId::Alignment) && !l.is_open(PanelId::Captures));
         assert_eq!(l.open_on(Edge::Bottom), None);
         l.slots.push(Slot { id: PanelId::Fiber, edge: Edge::Right, open: true });
         l.repair();
+        assert_eq!(l.slots.len(), PanelId::ALL.len());
+    }
+
+    /// Layouts saved before Counting and Histogram were replaced still load.
+    #[test]
+    fn old_panel_names_load() {
+        let v = serde_json::json!({"slots": [{"id": "Counting", "edge": "Bottom", "open": true}, {"id": "Histogram", "edge": "Left", "open": false}]});
+        let mut l: PanelLayout = serde_json::from_value(v).unwrap();
+        l.repair();
+        assert!(l.is_open(PanelId::Alignment));
         assert_eq!(l.slots.len(), PanelId::ALL.len());
     }
 }

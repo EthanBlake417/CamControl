@@ -191,23 +191,82 @@ fn measuring_a_line_by_clicking() {
     assert_eq!(h.state().tool, None);
 }
 
+/// Readings of a still image (one each), against a reference line; then only the
+/// fibers inside a region of interest; saving the table with the marked-up photo.
 #[test]
-fn counting_marks_by_clicking() {
-    let (mut h, dir) = harness("count");
-    let path = dir.join("panda.png");
-    drawn_panda(&path);
+fn alignment_readings_reference_and_region() {
+    use super::alignment::DrawTarget;
+    let (mut h, dir) = harness("align");
+    let path = dir.join("three.png");
+    three_fibers(&path);
     open(&mut h, &path);
-    h.press_key_modifiers(Modifiers::COMMAND, Key::Num4);
+    h.state_mut().find_fiber_axes(false);
+    wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
+    let id = h.state().active;
+    h.state_mut().alignment.drawing = Some(DrawTarget::Reference);
+    // A line at +30°: every angle shown is measured from it.
+    let (dx, dy) = (100.0 * 30f64.to_radians().cos(), -100.0 * 30f64.to_radians().sin());
+    h.state_mut().view_event(id, super::view::ViewEvent::Drawn("line".into(), vec![(0.0, 300.0), (dx, 300.0 + dy)]));
+    assert!((h.state().alignment.reference_deg().unwrap() - 30.0).abs() < 1e-9);
+    let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
+    assert!(lines[0].starts_with("1: slow -30.0°  fast +60.0°"), "{lines:?}");
+    assert_eq!(lines.last().unwrap(), "Angles from the reference line");
+    h.state_mut().take_readings();
+    let rows = h.state().alignment.rows.clone();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    for r in &rows {
+        assert!(r.n == 1 && r.std == 0.0 && (r.mean - 60.0).abs() < 0.5 && r.reference.is_some(), "fast axis from the line: {r:?}");
+    }
+    assert_eq!(rows.iter().map(|r| r.fiber).collect::<Vec<_>>(), vec![1, 2, 3]);
+    // Only the two fibers whose centers are in the left 640 px.
+    h.state_mut().alignment.drawing = Some(DrawTarget::RegionRect);
+    h.state_mut().view_event(id, super::view::ViewEvent::Drawn("rectangle".into(), vec![(0.0, 0.0), (640.0, 340.0)]));
+    wait(&mut h, "fibers in the region", |a| a.active_pane().fibers.len() == 2);
+    assert!(h.state().active_pane().fibers.iter().all(|f| f.cx < 640.0));
+    h.state_mut().save_alignment(true);
+    let saved: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("alignment_")).collect();
+    assert!(saved.iter().any(|n| n.ends_with(".png")) && saved.iter().any(|n| n.ends_with(".csv")), "{saved:?}");
+}
+
+/// Space takes n readings of the live view's fibers (the next n updates).
+#[test]
+fn alignment_readings_live() {
+    let mut t = live("alignlive");
+    t.state_mut().alignment.n = 3;
+    t.state_mut().panels.set_open(PanelId::Alignment, true);
+    t.press_key(Key::Space);
+    wait(&mut t, "three readings", |a| !a.alignment.rows.is_empty());
+    let r = &t.state().alignment.rows[0];
+    assert_eq!(r.n, 3, "{r:?}");
+    assert!(r.std.is_finite() && r.mean.is_finite(), "{r:?}"); // the fake fiber turns, so the spread depends on timing
+    assert!(t.state().alignment.collecting.is_none());
+}
+
+/// Fibers numbered down from the top one's number; which one is on; saving the image with its details.
+#[test]
+fn fiber_count_numbers_and_saves() {
+    let (mut h, dir) = harness("fibercount");
+    let path = dir.join("three.png");
+    three_fibers(&path);
+    open(&mut h, &path);
+    h.state_mut().saved.count_first = 17;
+    h.state_mut().saved.count_ascending = false;
+    h.press_key_modifiers(Modifiers::COMMAND, Key::Num7);
     h.run_ok();
-    h.get_by_label("Count").click();
-    h.run_ok();
-    assert!(h.state().counting);
-    let p = h.state().active_pane().view.to_screen(200.0, 200.0);
-    click_at(&mut h, p, PointerButton::Primary);
-    click_at(&mut h, p + egui::vec2(40.0, 0.0), PointerButton::Primary);
-    assert_eq!(h.state().active_pane().counter.marks.len(), 2);
-    click_at(&mut h, p, PointerButton::Secondary); // removes the nearest
-    assert_eq!(h.state().active_pane().counter.marks.len(), 1);
+    assert!(h.state().panels.is_open(PanelId::FiberCount));
+    h.state_mut().find_fiber_axes(false);
+    wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
+    let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
+    assert!(lines[0].starts_with("17: ") && lines[2].starts_with("15: "), "{lines:?}");
+    assert_eq!(lines.last().unwrap(), "Fiber 16 is on (brightest center)");
+    h.state_mut().save_fiber_count();
+    let json = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "json") && p.file_name().unwrap().to_string_lossy().starts_with("fibers_"))
+        .expect("details saved");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
+    assert_eq!((v["count"].as_u64(), v["on"].as_i64()), (Some(3), Some(16)));
+    assert!(json.with_extension("png").is_file());
 }
 
 #[test]
@@ -300,12 +359,20 @@ fn choices_kept_between_sessions() {
     app.class_names[0] = "Cores".into();
     app.multi_layout = "row".into();
     app.overlay_tab = "fiber".into();
+    app.alignment.n = 7;
+    app.alignment.reference = Some(((1.0, 2.0), (3.0, 4.0)));
+    app.alignment.region = Some(crate::processing::fiber_axis::Region::Circle { cx: 5.0, cy: 6.0, r: 7.0 });
+    app.saved.count_first = 17;
+    app.saved.recording.photo_markup = true;
     app.save_state_for_test();
     let s = &app.saved;
     assert!(s.fiber_live && !s.fiber_use_circles && s.fiber_log_record);
     assert_eq!((s.count_class_names[0].as_str(), s.multi_layout.as_str(), s.overlay_tab.as_str()), ("Cores", "row", "fiber"));
     let back: super::settings::Saved = serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap();
     assert!(back.fiber_live && !back.fiber_use_circles && back.fiber_log_record);
+    assert_eq!((back.align_n, back.align_reference, back.count_first), (7, Some([1.0, 2.0, 3.0, 4.0]), 17));
+    assert_eq!(back.align_region, Some(crate::processing::fiber_axis::Region::Circle { cx: 5.0, cy: 6.0, r: 7.0 }));
+    assert!(back.recording.photo_markup && !back.recording.tl_markup);
     assert_eq!((back.count_class_names, back.multi_layout, back.overlay_tab), (s.count_class_names.clone(), s.multi_layout.clone(), s.overlay_tab.clone()));
 }
 
@@ -351,7 +418,7 @@ fn camera_opens_live_and_captures() {
     assert_eq!(t.state().source_text(t.state().active).0, "Fake camera · Live");
     t.state_mut().saved.name = "shot".into();
     t.state_mut().saved.average_idx = 1; // 4 frames
-    t.press_key(Key::Space);
+    t.state_mut().capture();
     let dir = t.dir.clone();
     wait(&mut t, "the capture", |a| a.capturing.is_empty() && dir.join("shot-001.tif").is_file());
     let img = crate::capture::load_image(&dir.join("shot-001.tif")).unwrap();
@@ -529,15 +596,12 @@ fn brightest_centre_histogram_and_fiber_crosshair() {
     h.state_mut().find_fiber_axes(false);
     wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
     let lines = super::annotate::fiber_readout_lines(&h.state().active_pane().fibers);
-    assert_eq!(lines.last().unwrap(), "Brightest centre: position 2 from right (fiber 2)", "{lines:?}");
-    h.press_key_modifiers(Modifiers::COMMAND, Key::Num7);
+    assert_eq!(lines.last().unwrap(), "Fiber 2 is on (brightest center)", "{lines:?}");
+    // The histogram is in the Controls panel.
+    assert!(h.state().panels.is_open(PanelId::Controls));
     h.run_ok();
-    assert!(h.state().panels.is_open(PanelId::Histogram));
     let c = h.state().histogram.counts().expect("the open image counted");
     assert_eq!(c[0].iter().sum::<u64>(), 960 * 340);
-    h.get_by_label("Logarithmic").click();
-    h.run_ok();
-    assert!(h.state().histogram.log);
 }
 
 /// Pictures of the window, rendered offscreen (no screen capture), for checking
@@ -574,9 +638,9 @@ fn render_shots() {
         wait(&mut t, "fiber axes", |a| a.panes.iter().all(|p| !p.fibers.is_empty()));
         shot(&mut t, "2_views_fiber");
     }
-    t.state_mut().panels.set_open(PanelId::Counting, true);
+    t.state_mut().panels.set_open(PanelId::Alignment, true);
     t.state_mut().saved.capture_tab = 2;
-    shot(&mut t, "3_counting_timelapse");
+    shot(&mut t, "3_alignment_timelapse");
     t.state_mut().panels.set_open(PanelId::Measurements, true);
     t.state_mut().saved.capture_tab = 1;
     shot(&mut t, "4_measure_video");
@@ -591,9 +655,14 @@ fn render_shots() {
     t.state_mut().saved.fiber_long_lines = true;
     t.state_mut().find_fiber_axes(false);
     wait(&mut t, "fiber axes", |a| a.active_pane().fibers.len() == 3);
-    t.state_mut().panels.set_open(PanelId::Histogram, true);
+    t.state_mut().alignment.reference = Some(((0.0, 320.0), (960.0, 300.0)));
+    t.state_mut().alignment.region = Some(crate::processing::fiber_axis::Region::rect((10.0, 10.0), (950.0, 330.0)));
+    t.state_mut().panels.set_open(PanelId::FiberCount, true);
     t.state_mut().histogram.log = true;
-    shot(&mut t, "5_brightest_histogram");
+    shot(&mut t, "5_fiber_count");
+    t.state_mut().take_readings();
+    t.state_mut().panels.set_open(PanelId::Alignment, true);
+    shot(&mut t, "5b_alignment");
     t.state_mut().panels.set_open(PanelId::Fiber, true);
     shot(&mut t, "6_fiber_panel");
     t.state_mut().fiber.advanced = true;
@@ -608,7 +677,7 @@ fn render_shots() {
     t.state_mut().panels.set_open(PanelId::FiberLog, true);
     let fibers = t.state().active_pane().fibers.clone();
     for _ in 0..6 {
-        t.state_mut().fiber_log.add(&fibers);
+        t.state_mut().fiber_log.add(&fibers, None);
     }
     shot(&mut t, "8_fiber_log_right");
 }

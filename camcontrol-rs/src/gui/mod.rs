@@ -1,16 +1,16 @@
 //! The main window (main_window.py): views in the middle (each showing a
 //! camera, an image file, a video or a processing result), panels on edge
-//! stripes (Controls, Captures, Measurements, Counting, Fiber axis).
+//! stripes (Controls, Captures, Measurements, Alignment, Fiber axis, Fiber log, Fiber count).
 //!
 //! Shortcuts:
-//!     Space       capture                  L     live / freeze
+//!     Space       take readings (Alignment) L    live / freeze
 //!     G           grid                     C     crosshair
 //!     F           fit image to window      1     100%
 //!     Ctrl+= / -  zoom in / out (or the mouse wheel)
 //!     Ctrl+O      open an image or video   Ctrl+S  save the active view's image
 //!     Ctrl+E      export measurements      Ctrl+Shift+S  save settings
 //!     Ctrl+K      one view / several views Ctrl+Shift+K  add a view
-//!     Ctrl+1..7   show / hide Controls / Measurements / Captures / Counting / Fiber axis / Fiber log / Histogram
+//!     Ctrl+1..7   show / hide Controls / Measurements / Captures / Alignment / Fiber axis / Fiber log / Fiber count
 //!     Ctrl+Q      quit
 //!
 //! Each view has its own source, live/frozen state, measurements, counting
@@ -25,6 +25,7 @@ mod dialogs;
 mod fiber_log;
 mod gallery;
 mod histogram;
+pub(crate) mod alignment;
 mod panels;
 mod player;
 mod settings;
@@ -173,6 +174,7 @@ struct FiberRequest {
     parts_centre: bool,
     detection: Detection,
     centre_only: bool,
+    region: Option<crate::processing::fiber_axis::Region>,
 }
 
 pub struct FiberSettings {
@@ -276,6 +278,9 @@ impl App {
             fast: self.saved.fiber_lines.fast(),
             slow_bands: self.saved.fiber_lines.slow_by_angle.bands(self.saved.fiber_lines.slow_opacity),
             fast_bands: self.saved.fiber_lines.fast_by_angle.bands(self.saved.fiber_lines.fast_opacity),
+            first_number: self.saved.count_first,
+            ascending: self.saved.count_ascending,
+            reference: self.alignment.reference_deg(),
         }
     }
 }
@@ -307,6 +312,7 @@ pub struct App {
     pub(crate) fiber: FiberSettings,
     pub(crate) fiber_log: fiber_log::FiberLog,
     pub(crate) histogram: histogram::Histogram,
+    pub(crate) alignment: alignment::Alignment,
     fiber_job: Option<(FiberRequest, Receiver<Vec<FiberAxis>>)>,
     fiber_waiting: Vec<FiberRequest>,
     fiber_generation: u64,
@@ -390,6 +396,7 @@ impl App {
         let mut app = Self {
             fiber_log: fiber_log::FiberLog { record: saved.fiber_log_record, ..Default::default() },
             histogram: histogram::Histogram::new(saved.histogram_log, saved.histogram_colors),
+            alignment: alignment::Alignment::new(saved.align_n, saved.align_region, saved.align_reference),
             panes: Vec::new(),
             active: 0,
             controlled: None,
@@ -569,7 +576,7 @@ impl App {
         }
         let pressed = |k: Key| ctx.input(|i| i.key_pressed(k) && i.modifiers.is_none());
         if pressed(Key::Space) {
-            self.capture();
+            self.take_readings();
         }
         if pressed(Key::L) {
             let on = !self.active_pane().live;
@@ -786,12 +793,16 @@ impl App {
                 self.gallery_actions(ctx, actions);
             }
             PanelId::Measurements => self.measure_panel(ui),
-            PanelId::Counting => self.count_panel(ui),
+            PanelId::Alignment => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.alignment_panel(ui));
+            }
             PanelId::Fiber => {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.fiber_panel(ui));
             }
             PanelId::FiberLog => self.fiber_log_panel(ui),
-            PanelId::Histogram => self.histogram_panel(ui),
+            PanelId::FiberCount => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.fiber_count_panel(ui));
+            }
         }
     }
 
@@ -854,6 +865,7 @@ impl App {
         let mut events: Vec<(u64, ViewEvent)> = Vec::new();
         let keys_ok = !ctx.wants_keyboard_input() && self.modal.is_none();
         let (tool, count) = (self.tool.clone(), self.counting.then_some(self.count_class));
+        let extras = self.view_extras();
         for p in &mut self.panes {
             if p.view.tool != tool {
                 p.view.set_tool(tool.clone());
@@ -887,6 +899,7 @@ impl App {
                 fibers: &pane.fibers,
                 fiber_selected: pane.fiber_selected,
                 fiber_drawing,
+                extras: &extras,
             };
             let ev = pane.view.show(&mut cell, &overlays, keys_ok && pane.id == active);
             if pane.view.moved {
@@ -1065,6 +1078,9 @@ impl App {
         self.saved.fiber_live = self.fiber.live;
         self.saved.fiber_use_circles = self.fiber.use_circles;
         self.saved.fiber_log_record = self.fiber_log.record;
+        self.saved.align_n = self.alignment.n;
+        self.saved.align_region = self.alignment.region;
+        self.saved.align_reference = self.alignment.reference.map(|(a, b)| [a.0, a.1, b.0, b.1]);
         self.saved.count_class_names = self.class_names.clone();
         self.saved.multi_layout = self.multi_layout.clone();
         self.saved.overlay_tab = self.overlay_tab.clone();

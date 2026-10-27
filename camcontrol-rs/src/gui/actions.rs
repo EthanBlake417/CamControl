@@ -46,20 +46,22 @@ pub(crate) fn with_ext(path: PathBuf, allowed: &[&str], default_ext: &str) -> Pa
 }
 
 const FIBER_HEADERS: &[&str] = &["#", "Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity", "Method", "Clear",
-                                 "Threshold (noise x)", "Rod outline found", "Centre x (px)", "Centre y (px)", "Axis x (px)",
-                                 "Axis y (px)", "Diameter (px)", "Centre brightness (0-255)", "Fiber level (0-255)",
+                                 "Threshold (noise x)", "Rod outline found", "Center x (px)", "Center y (px)", "Axis x (px)",
+                                 "Axis y (px)", "Diameter (px)", "Center brightness (0-255)", "Fiber level (0-255)",
                                  "Background level (0-255)", "Contrast (%)", "Edge width (px)", "Noise", "SNR", "Clipped (%)",
-                                 "Bright parts (0-255)", "Quality", "Image"];
+                                 "Bright parts (0-255)", "Quality",
+                                 "Reference line (deg; axes given from it)", "Image"];
 
-fn fiber_row(i: usize, f: &FiberAxis, source: &str) -> Vec<Cell> {
+/// `reference`: the reference line's angle, which the axes are given from.
+fn fiber_row(i: usize, f: &FiberAxis, source: &str, reference: Option<f64>) -> Vec<Cell> {
     let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
     let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
     let (ax, ay) = f.axis_point();
     let mut row = vec![
         Cell::Num((i + 1) as f64),
         Cell::Text(f.fiber_type.clone()),
-        r2(super::annotate::signed_angle(f.slow_deg)),
-        r2(super::annotate::signed_angle(f.fast_deg())),
+        r2(super::annotate::signed_angle(f.slow_deg - reference.unwrap_or(0.0))),
+        r2(super::annotate::signed_angle(f.fast_deg() - reference.unwrap_or(0.0))),
         Cell::Num((f.elongation * 1000.0).round() / 1000.0),
         Cell::Text(method_label(&f.method).into()),
         Cell::Bool(f.clear()),
@@ -69,6 +71,7 @@ fn fiber_row(i: usize, f: &FiberAxis, source: &str) -> Vec<Cell> {
         f.centre_brightness.map(r1).unwrap_or(Cell::Empty),
     ];
     row.extend(super::fiber_log::quality_cells(f.image_quality.as_ref(), true));
+    row.push(reference.map(r2).unwrap_or(Cell::Empty));
     row.push(Cell::Text(source.into()));
     row
 }
@@ -528,7 +531,7 @@ impl App {
                     self.fps_label = fps.map(|f| format!("{f:.1} fps")).unwrap_or_default();
                 }
                 // Fiber axes of the live views, a few times a second, taking turns.
-                if self.fiber.live && self.fiber_job.is_none() {
+                if (self.fiber.live || self.collecting_on(id)) && self.fiber_job.is_none() {
                     let last = self.panes[i].fiber_last;
                     let due = last.is_none_or(|t| t.elapsed().as_secs_f64() >= FIBER_LIVE_INTERVAL);
                     let oldest = self.panes.iter().filter(|p| p.live).all(|p| match (p.fiber_last, last) {
@@ -644,6 +647,7 @@ impl App {
             fmt: FORMATS[self.saved.format_idx.min(1)].1.into(),
             folder: PathBuf::from(&self.saved.folder),
             name: name.into(),
+            markup: self.saved.recording.photo_markup,
         }
     }
 
@@ -992,6 +996,7 @@ impl App {
     pub(crate) fn view_event(&mut self, id: u64, e: ViewEvent) {
         match e {
             ViewEvent::Activated => self.set_active(id),
+            ViewEvent::Drawn(k, points) if self.alignment.drawing.is_some() => self.alignment_drawn(&k, &points),
             ViewEvent::Drawn(k, points) if self.picking_rod => {
                 self.picking_rod = false;
                 self.tool = None;
@@ -1024,6 +1029,7 @@ impl App {
                 self.tool = None;
                 self.counting = false;
                 self.picking_rod = false;
+                self.alignment.drawing = None;
             }
             ViewEvent::CountAdd(x, y) => {
                 if self.counting {
@@ -1049,13 +1055,6 @@ impl App {
             self.confirm("Clear measurements", format!("Delete all {n} measurements?"), vec![Action::ClearMeasurements(id)], vec![]);
         } else {
             self.perform(&self.ctx_clone(), Action::ClearMeasurements(id));
-        }
-    }
-
-    pub(crate) fn clear_marks(&mut self, id: u64) {
-        let n = self.pane(id).counter.marks.len();
-        if n > 0 {
-            self.confirm("Clear marks", format!("Delete all {n} marks?"), vec![Action::ClearMarks(id)], vec![]);
         }
     }
 
@@ -1283,7 +1282,8 @@ impl App {
     }
 
     pub(crate) fn fiber_sheet(&self, source: &str) -> Sheet {
-        let rows = self.active_pane().fibers.iter().enumerate().map(|(i, f)| fiber_row(i, f, source)).collect();
+        let reference = self.alignment.reference_deg();
+        let rows = self.active_pane().fibers.iter().enumerate().map(|(i, f)| fiber_row(i, f, source, reference)).collect();
         Sheet::new("Fiber axes", FIBER_HEADERS, rows)
     }
 
@@ -1331,6 +1331,7 @@ impl App {
             parts_centre: self.fiber.parts_centre,
             detection: self.fiber.detection.clone(),
             centre_only: self.fiber.centre_only,
+            region: self.alignment.region,
         };
         if self.fiber_job.is_some() {
             if kind != FiberKind::Live {
@@ -1343,10 +1344,11 @@ impl App {
         let wake = self.wake();
         let (img, circles, method, pc, det, co) = (req.image.clone(), req.circles.clone(), req.method.clone(), req.parts_centre, req.detection.clone(), req.centre_only);
         let previous = req.previous.clone();
+        let region = req.region;
         std::thread::Builder::new()
             .name("fiber axes".into())
             .spawn(move || {
-                let axes = fiber_axis::analyse_tracking(&img, circles.as_deref(), previous.as_deref(), &method, pc, &det, co);
+                let axes = fiber_axis::analyse_in(&img, circles.as_deref(), previous.as_deref(), &method, pc, &det, co, region.as_ref());
                 let _ = tx.send(axes);
                 wake();
             })
@@ -1370,7 +1372,7 @@ impl App {
         }
         let p = self.pane(req.pane);
         if req.from_camera {
-            if !p.live || (req.kind == FiberKind::Live && !self.fiber.live) {
+            if !p.live || (req.kind == FiberKind::Live && !self.fiber.live && !self.collecting_on(req.pane)) {
                 return;
             }
         } else if p.live {
@@ -1401,12 +1403,13 @@ impl App {
         self.pane_mut(req.pane).fiber_locked = locked;
         self.pane_mut(req.pane).fibers = axes;
         self.record_fibers(req.pane);
+        self.alignment_reading(req.pane);
         if req.kind == FiberKind::Find {
             if n > 0 {
                 let note = if unclear > 0 { format!(" ({unclear} unclear)") } else { String::new() };
                 self.message(format!("Found {n} fiber{}{note}.", if n != 1 { "s" } else { "" }), Some(6.0));
             } else {
-                self.message("No fibers found. Draw a Circle (3 pt or centre) round the fiber in Measurements, then Find axes.", Some(10.0));
+                self.message("No fibers found. Draw a Circle (3 pt or center) round the fiber in Measurements, then Find axes.", Some(10.0));
             }
         }
     }
@@ -1464,24 +1467,22 @@ impl App {
         let (folder, name, r) = (PathBuf::from(&self.saved.folder), clean_name(&self.saved.name), self.saved.recording.clone());
         let Some(link) = self.link() else { return };
         if start {
-            link.send(Cmd::Record { folder, name, fmt: r.video_format.clone(), fps: r.video_fps as f64, max_seconds: r.video_limit as f64 });
+            link.send(Cmd::Record { folder, name, fmt: r.video_format.clone(), fps: r.video_fps as f64, max_seconds: r.video_limit as f64,
+                                    markup: r.draw_analysis });
         } else {
             link.send(Cmd::RecordStop);
         }
     }
 
-    /// Tells a recording camera which fiber axes to draw on the video, when they change.
+    /// Tells a camera what to draw on its video, photos or time-lapse images (the view's
+    /// markup, where Include markup is on), when it changes.
     fn sync_record_overlay(&mut self, i: usize) {
         let pane = &self.panes[i];
         let Some(link) = pane.camera.as_ref() else { return };
-        let on = link.recording && pane.live && self.saved.recording.draw_analysis && !pane.fibers.is_empty();
-        let drawing = self.fiber_drawing();
-        let same = match &link.overlay_sent {
-            None => !on,
-            Some(o) => on && o.drawing == drawing && o.axes == pane.fibers,
-        };
-        if !same {
-            let want = on.then(|| RecordOverlay { axes: pane.fibers.clone(), drawing });
+        let r = &self.saved.recording;
+        let wanted = pane.live && ((link.recording && r.draw_analysis) || (link.timelapse && r.tl_markup) || r.photo_markup);
+        let want: Option<RecordOverlay> = if wanted { Some(self.markup_of(pane.id, Vec::new())).filter(|m| !m.is_empty()) } else { None };
+        if link.overlay_sent != want {
             let link = self.panes[i].camera.as_mut().unwrap();
             link.send(Cmd::RecordOverlay(want.clone()));
             link.overlay_sent = want;
@@ -1497,7 +1498,8 @@ impl App {
         }
         let r = self.saved.recording.clone();
         let tl = TimeLapse::new(r.interval_seconds(), r.tl_count as usize, r.tl_video, r.tl_video_fps as f64, &r.video_format);
-        let req = self.capture_request(&clean_name(&self.saved.name));
+        let mut req = self.capture_request(&clean_name(&self.saved.name));
+        req.markup = r.tl_markup;
         let count = r.tl_count as usize;
         if let Some(link) = self.link_mut() {
             link.timelapse = true;
@@ -1616,6 +1618,11 @@ impl App {
             "detection": serde_json::to_value(&f.detection).unwrap(),
             "outside_lines": self.saved.fiber_long_lines,
             "lines": serde_json::to_value(&self.saved.fiber_lines).unwrap(),
+            "region": serde_json::to_value(self.alignment.region).unwrap(),
+            "reference": self.alignment.reference.map(|(a, b)| [a.0, a.1, b.0, b.1]),
+            "readings": self.alignment.n,
+            "top_number": self.saved.count_first,
+            "ascending": self.saved.count_ascending,
         })
     }
 
@@ -1641,6 +1648,21 @@ impl App {
         }
         if v["lines"].is_object() {
             self.saved.fiber_lines = FiberLineStyle::from_value(&v["lines"]);
+        }
+        if let Some(r) = v.get("region") {
+            self.alignment.region = serde_json::from_value(r.clone()).unwrap_or(None);
+        }
+        if let Some(r) = v.get("reference") {
+            self.alignment.reference = serde_json::from_value::<Option<[f64; 4]>>(r.clone()).ok().flatten().map(|r| ((r[0], r[1]), (r[2], r[3])));
+        }
+        if let Some(n) = v["readings"].as_u64() {
+            self.alignment.n = (n as usize).clamp(1, 1000);
+        }
+        if let Some(n) = v["top_number"].as_i64() {
+            self.saved.count_first = n;
+        }
+        if let Some(b) = v["ascending"].as_bool() {
+            self.saved.count_ascending = b;
         }
         self.fiber_settings_changed();
     }

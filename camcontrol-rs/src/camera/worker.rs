@@ -22,9 +22,8 @@ use serde_json::{json, Map, Value};
 
 use super::{Camera, DeviceKey, Mode, Range, EXPOSURE_US};
 use crate::capture::{self, CaptureOptions};
-use crate::gui::annotate::{render_fiber_axes, FiberDrawing};
+use crate::gui::annotate::{render_markup, Markup};
 use crate::gui::view::texture_tiles;
-use crate::processing::fiber_axis::FiberAxis;
 use crate::processing::flatfield::FlatField;
 use crate::video::{self, VideoRecorder};
 
@@ -37,6 +36,8 @@ pub struct CaptureRequest {
     pub fmt: String,
     pub folder: PathBuf,
     pub name: String,
+    /// Draw the view's markup (RecordOverlay) on the saved image.
+    pub markup: bool,
 }
 
 /// When to take each time-lapse image, and what's been taken.
@@ -79,7 +80,7 @@ pub enum Cmd {
     Control(String, f64),
     Capture(CaptureRequest),
     Flat(Option<Arc<FlatField>>),
-    Record { folder: PathBuf, name: String, fmt: String, fps: f64, max_seconds: f64 },
+    Record { folder: PathBuf, name: String, fmt: String, fps: f64, max_seconds: f64, markup: bool },
     RecordStop,
     /// What to draw on recorded frames (None: nothing).
     RecordOverlay(Option<RecordOverlay>),
@@ -88,11 +89,7 @@ pub enum Cmd {
 }
 
 /// The analysis drawn on recorded frames: the view's latest fiber axes.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RecordOverlay {
-    pub axes: Vec<FiberAxis>,
-    pub drawing: FiberDrawing,
-}
+pub type RecordOverlay = Markup;
 
 #[derive(Clone, Debug)]
 pub struct OpenInfo {
@@ -134,6 +131,8 @@ struct Thread {
     flat: Option<Arc<FlatField>>,
     recorder: Option<VideoRecorder>,
     overlay: Option<RecordOverlay>,
+    /// Draw the overlay on the video being recorded.
+    record_markup: bool,
     last_progress: Option<Instant>,
     timelapse: Option<(TimeLapse, CaptureRequest)>,
 }
@@ -202,7 +201,10 @@ impl Thread {
                 }
                 Cmd::Capture(c) => captures.push(c),
                 Cmd::Flat(f) => self.flat = f,
-                Cmd::Record { folder, name, fmt, fps, max_seconds } => self.start_recording(folder, &name, &fmt, fps, max_seconds),
+                Cmd::Record { folder, name, fmt, fps, max_seconds, markup } => {
+                    self.record_markup = markup;
+                    self.start_recording(folder, &name, &fmt, fps, max_seconds)
+                }
                 Cmd::RecordStop => self.stop_recording(),
                 Cmd::RecordOverlay(o) => self.overlay = o,
                 Cmd::TimeLapse(t, o) => {
@@ -255,6 +257,10 @@ impl Thread {
             image = f.apply(&image);
             extra.insert("flat_field".into(), json!(f.name));
         }
+        if let Some(o) = self.overlay.as_ref().filter(|o| c.markup && !o.is_empty()) {
+            image = render_markup(&image, o);
+            extra.insert("markup".into(), json!(true));
+        }
         let opts = CaptureOptions {
             exposure: exposure.map(|e| e as f64),
             exposure_seconds: seconds,
@@ -294,7 +300,7 @@ impl Thread {
     }
 
     fn record(&mut self, frame: &RgbImage) {
-        let drawn = self.overlay.as_ref().filter(|o| !o.axes.is_empty()).map(|o| render_fiber_axes(frame, &o.axes, o.drawing));
+        let drawn = self.overlay.as_ref().filter(|o| self.record_markup && !o.is_empty()).map(|o| render_markup(frame, o));
         let rec = self.recorder.as_mut().unwrap();
         if let Err(e) = rec.add(drawn.as_ref().unwrap_or(frame)) {
             self.send(Ev::Error(format!("Recording failed: {e}")));
@@ -414,7 +420,7 @@ impl CameraLink {
         self.latest = Arc::new(Mutex::new(Latest::default()));
         self.shown = 0;
         self.overlay_sent = None;
-        let mut t = Thread { events: etx, latest: self.latest.clone(), wake, flat, recorder: None, overlay: None, last_progress: None, timelapse: None };
+        let mut t = Thread { events: etx, latest: self.latest.clone(), wake, flat, recorder: None, overlay: None, record_markup: false, last_progress: None, timelapse: None };
         let (key, s) = (self.key.clone(), stop.clone());
         self.handle = Some(std::thread::Builder::new()
             .name(format!("camera {}", self.key.label()))

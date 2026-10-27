@@ -447,7 +447,7 @@ impl Mask {
     }
 }
 
-/// cv2.getStructuringElement(MORPH_ELLIPSE, (k, k)) as offsets from the centre.
+/// cv2.getStructuringElement(MORPH_ELLIPSE, (k, k)) as offsets from the center.
 pub fn ellipse_kernel(k: usize) -> Vec<(isize, isize)> {
     let r = (k / 2) as isize;
     let c = r as f64;
@@ -663,7 +663,7 @@ fn edt_1d(f: &[f64], d: &mut [f64]) {
 // --- contours ----------------------------------------------------------------------
 
 /// Outer outlines of the set regions (cv2.findContours RETR_EXTERNAL,
-/// CHAIN_APPROX_NONE): pixel centres along each region's border.
+/// CHAIN_APPROX_NONE): pixel centers along each region's border.
 pub fn outer_contours(m: &Mask) -> Vec<Vec<(f64, f64)>> {
     let img = GrayImage::from_raw(m.w as u32, m.h as u32, m.data.iter().map(|&v| if v { 255 } else { 0 }).collect())
         .unwrap();
@@ -894,7 +894,7 @@ pub fn warp_affine_rgb(src: &RgbImage, m: &Affine, w: usize, h: usize, inverse: 
     ])
 }
 
-/// cv2.resize with INTER_LINEAR (pixel centres aligned).
+/// cv2.resize with INTER_LINEAR (pixel centers aligned).
 pub fn resize_linear(src: &ImgF, w: usize, h: usize) -> ImgF {
     let (sx, sy) = (src.w as f64 / w as f64, src.h as f64 / h as f64);
     ImgF::from_fn(w, h, |x, y| {

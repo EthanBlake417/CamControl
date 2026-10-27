@@ -4,8 +4,8 @@
 //!
 //! Mouse, no tool selected:   wheel zooms about the cursor, left drag pans.
 //! With a measurement tool:   left click adds a point (fixed-point shapes
-//!   finish by themselves); Circle (centre) can be dragged out from the
-//!   centre; double-click, right-click or Enter finish a polyline/polygon;
+//!   finish by themselves); Circle (center) can be dragged out from the
+//!   center; double-click, right-click or Enter finish a polyline/polygon;
 //!   Backspace removes the last point; Esc cancels (again: leaves the tool);
 //!   middle drag pans.
 //! While counting:            left click adds a mark, right click removes the
@@ -126,21 +126,21 @@ impl Canvas for EguiCanvas<'_> {
     }
 
     fn ellipse(&mut self, c: P, rx: f32, ry: f32, color: Option<Color>, width: f32, dash: Dash, fill: Option<Color>) {
-        let centre = Pos2::new(c.0, c.1);
+        let center = Pos2::new(c.0, c.1);
         if let Some(f) = fill {
-            self.painter.add(Shape::ellipse_filled(centre, Vec2::new(rx, ry), c32(f)));
+            self.painter.add(Shape::ellipse_filled(center, Vec2::new(rx, ry), c32(f)));
         }
         let Some(col) = color else { return };
         match dashes(dash, width) {
             None => {
-                self.painter.add(Shape::ellipse_stroke(centre, Vec2::new(rx, ry), Stroke::new(width, c32(col))));
+                self.painter.add(Shape::ellipse_stroke(center, Vec2::new(rx, ry), Stroke::new(width, c32(col))));
             }
             Some((d, g)) => {
                 let n = ((rx.max(ry) * 0.5) as usize).clamp(24, 720);
                 let pts: Vec<Pos2> = (0..=n)
                     .map(|i| {
                         let a = i as f32 / n as f32 * std::f32::consts::TAU;
-                        Pos2::new(centre.x + rx * a.cos(), centre.y + ry * a.sin())
+                        Pos2::new(center.x + rx * a.cos(), center.y + ry * a.sin())
                     })
                     .collect();
                 self.painter.extend(Shape::dashed_line(&pts, Stroke::new(width, c32(col)), d, g));
@@ -178,6 +178,8 @@ pub struct Overlays<'a> {
     pub fibers: &'a [FiberAxis],
     pub fiber_selected: Option<usize>,
     pub fiber_drawing: annotate::FiberDrawing,
+    /// Region of interest, reference line, fiber numbers.
+    pub extras: &'a annotate::Extras,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -190,12 +192,12 @@ pub enum ViewEvent {
     CountUndo,
 }
 
-/// Zoom and position, for Link views: (fitting, zoom, centre as a fraction of the image).
+/// Zoom and position, for Link views: (fitting, zoom, center as a fraction of the image).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewState {
     pub fitting: bool,
     pub zoom: f32,
-    pub centre: (f32, f32),
+    pub center: (f32, f32),
     pub image_size: (u32, u32),
 }
 
@@ -204,7 +206,7 @@ pub struct ImageView {
     image: Option<Arc<RgbImage>>,
     nearest: bool,
     pub zoom: f32,
-    centre: Pos2,
+    center: Pos2,
     fitting: bool,
     pub tool: Option<String>,
     points: Vec<Point>,
@@ -227,7 +229,7 @@ impl Default for ImageView {
             image: None,
             nearest: false,
             zoom: 1.0,
-            centre: Pos2::ZERO,
+            center: Pos2::ZERO,
             fitting: true,
             response: None,
             tool: None,
@@ -348,7 +350,7 @@ impl ImageView {
     pub fn state(&self) -> Option<ViewState> {
         let img = self.image.as_ref()?;
         let (w, h) = (img.width() as f32, img.height() as f32);
-        Some(ViewState { fitting: self.fitting, zoom: self.zoom, centre: (self.centre.x / w, self.centre.y / h), image_size: img.dimensions() })
+        Some(ViewState { fitting: self.fitting, zoom: self.zoom, center: (self.center.x / w, self.center.y / h), image_size: img.dimensions() })
     }
 
     /// Show the same part of this image as src shows of its own (Link views).
@@ -361,7 +363,7 @@ impl ImageView {
             self.fitting = false;
             self.zoom = (src.zoom * src.image_size.0 as f32 / w).clamp(MIN_ZOOM, MAX_ZOOM); // same share of the picture
         }
-        self.centre = Pos2::new(src.centre.0 * w, src.centre.1 * h);
+        self.center = Pos2::new(src.center.0 * w, src.center.1 * h);
     }
 
     pub fn set_tool(&mut self, tool: Option<String>) {
@@ -382,12 +384,12 @@ impl ImageView {
 
     /// Where an image point is on screen (as last drawn).
     pub fn to_screen(&self, x: f64, y: f64) -> Pos2 {
-        self.rect.center() + (Pos2::new(x as f32, y as f32) - self.centre) * self.zoom
+        self.rect.center() + (Pos2::new(x as f32, y as f32) - self.center) * self.zoom
     }
 
     fn to_image(&self, p: Pos2) -> Point {
         let (w, h) = self.image.as_ref().map(|i| (i.width() as f64, i.height() as f64)).unwrap_or((0.0, 0.0));
-        let q = self.centre + (p - self.rect.center()) / self.zoom;
+        let q = self.center + (p - self.rect.center()) / self.zoom;
         ((q.x as f64).clamp(0.0, w), (q.y as f64).clamp(0.0, h))
     }
 
@@ -435,7 +437,7 @@ impl ImageView {
         let size = Vec2::new(image.width() as f32, image.height() as f32);
         if self.fitting {
             self.zoom = (rect.width() / size.x).min(rect.height() / size.y).clamp(MIN_ZOOM, MAX_ZOOM);
-            self.centre = (size / 2.0).to_pos2();
+            self.center = (size / 2.0).to_pos2();
         }
 
         let (pressed, released, hover_pos, scroll, double) = ui.input(|i| {
@@ -455,10 +457,10 @@ impl ImageView {
         // Wheel: zoom about the point under the cursor.
         if let Some(cursor) = over {
             if scroll != 0.0 {
-                let under = self.centre + (cursor - rect.center()) / self.zoom;
+                let under = self.center + (cursor - rect.center()) / self.zoom;
                 self.fitting = false;
                 self.zoom = (self.zoom * ZOOM_STEP.powf(scroll / 50.0)).clamp(MIN_ZOOM, MAX_ZOOM);
-                self.centre = under - (cursor - rect.center()) / self.zoom;
+                self.center = under - (cursor - rect.center()) / self.zoom;
                 self.moved = true;
             }
         }
@@ -468,7 +470,7 @@ impl ImageView {
             let d = response.drag_delta();
             if d != Vec2::ZERO {
                 self.fitting = false;
-                self.centre -= d / self.zoom;
+                self.center -= d / self.zoom;
                 self.moved = true;
             }
         }
@@ -505,7 +507,7 @@ impl ImageView {
             }
         }
         if released[0] {
-            // Circle (centre) dragged out from the centre: the release point is the edge.
+            // Circle (center) dragged out from the center: the release point is the edge.
             if let (Some(press), Some(pos), Some("circle_centre")) = (self.press_pos, hover_pos, self.tool.as_deref()) {
                 if self.points.len() == 1 && (pos - press).length() > DRAG_MIN_PX {
                     self.points.push(self.to_image(pos));
@@ -543,10 +545,10 @@ impl ImageView {
             self.set_image(ui.ctx(), image.clone());
         }
 
-        let centre = self.centre;
+        let center = self.center;
         let zoom = self.zoom;
         let to_screen = |x: f64, y: f64| -> P {
-            let p = rect.center() + (Pos2::new(x as f32, y as f32) - centre) * zoom;
+            let p = rect.center() + (Pos2::new(x as f32, y as f32) - center) * zoom;
             (p.x, p.y)
         };
         let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
@@ -583,6 +585,8 @@ impl ImageView {
             let area = ((rect.left(), rect.top()), (rect.right(), rect.bottom())); // long lines to the view's edges, as the crosshair
             annotate::draw_fiber_axes(&mut canvas, overlays.fibers, &to_screen, zoom as f64, &style, overlays.fiber_selected, overlays.fiber_drawing, area);
         }
+        let area = ((rect.left(), rect.top()), (rect.right(), rect.bottom()));
+        annotate::draw_extras(&mut canvas, overlays.extras, overlays.fibers, &overlays.fiber_drawing, &to_screen, zoom as f64, &style, area);
         if let Some(c) = overlays.crosshair {
             // On a fiber: where its axis lines cross, with the lines across the whole view to compare with its axes.
             let fiber = if c.anchor == "fiber" { overlays.fibers.get(overlays.fiber_selected.unwrap_or(0)) } else { None };
@@ -620,7 +624,7 @@ impl ImageView {
 
         self.mouse = over.map(|p| self.to_image(p));
         self.hover = over.and_then(|cursor| {
-            let p = self.centre + (cursor - rect.center()) / self.zoom;
+            let p = self.center + (cursor - rect.center()) / self.zoom;
             let (x, y) = (p.x.floor(), p.y.floor());
             if x < 0.0 || y < 0.0 || x >= size.x || y >= size.y {
                 return None;

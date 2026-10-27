@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 
 use super::stripes::PanelLayout;
 use super::style::{CrosshairStyle, FiberLineStyle, GridStyle};
-use crate::processing::fiber_axis::Detection;
+use crate::processing::fiber_axis::{Detection, Region};
 
 pub const MAX_RECENT: usize = 8;
 pub const AVERAGE_CHOICES: [usize; 5] = [1, 4, 8, 16, 32];
@@ -31,11 +31,15 @@ pub struct RecordState {
     pub tl_count: u32,
     pub tl_video: bool,
     pub tl_video_fps: u32,
+    /// Draw the view's markup on photos and time-lapse images.
+    pub photo_markup: bool,
+    pub tl_markup: bool,
 }
 
 impl Default for RecordState {
     fn default() -> Self {
-        Self { video_format: "MP4".into(), video_fps: 25, video_limit: 0, draw_analysis: true, tl_interval: 10.0, tl_unit: 0, tl_count: 60, tl_video: true, tl_video_fps: 10 }
+        Self { video_format: "MP4".into(), video_fps: 25, video_limit: 0, draw_analysis: true, tl_interval: 10.0, tl_unit: 0, tl_count: 60, tl_video: true, tl_video_fps: 10,
+               photo_markup: false, tl_markup: false }
     }
 }
 
@@ -60,6 +64,8 @@ impl RecordState {
         if let Some(n) = num("tl_count") { self.tl_count = (n as u32).min(100000); }
         if let Some(b) = v["tl_video"].as_bool() { self.tl_video = b; }
         if let Some(n) = num("tl_video_fps") { self.tl_video_fps = (n as u32).clamp(1, 60); }
+        if let Some(b) = v["photo_markup"].as_bool() { self.photo_markup = b; }
+        if let Some(b) = v["tl_markup"].as_bool() { self.tl_markup = b; }
     }
 }
 
@@ -86,6 +92,13 @@ pub struct Saved {
     pub fiber_live: bool,
     pub fiber_use_circles: bool,
     pub fiber_log_record: bool,
+    /// Alignment panel: readings per Take readings, region of interest, reference line (x0, y0, x1, y1).
+    pub align_n: usize,
+    pub align_region: Option<Region>,
+    pub align_reference: Option<[f64; 4]>,
+    /// Fiber count panel: the top fiber's number, and counting up from it.
+    pub count_first: i64,
+    pub count_ascending: bool,
     /// Counting class names (empty: Class 1, Class 2, ...).
     pub count_class_names: Vec<String>,
     /// The layout "Several views" goes back to.
@@ -136,6 +149,11 @@ impl Default for Saved {
             fiber_live: false,
             fiber_use_circles: true,
             fiber_log_record: false,
+            align_n: 10,
+            align_region: None,
+            align_reference: None,
+            count_first: 1,
+            count_ascending: true,
             count_class_names: Vec::new(),
             multi_layout: "grid".into(),
             overlay_tab: "grid".into(),

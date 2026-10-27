@@ -9,9 +9,9 @@ use crate::draw::{Color, Dash};
 /// name, label
 pub const LINE_STYLES: [(&str, &str); 3] = [("solid", "Solid"), ("dash", "Dashed"), ("dot", "Dotted")];
 pub const CROSSHAIR_ANCHORS: [(&str, &str); 3] = [
-    ("image", "Image centre (moves with the image)"),
-    ("window", "Window centre (stays put when zooming and panning)"),
-    ("fiber", "Fiber centre (follows the selected fiber, else fiber 1)"),
+    ("image", "Image center (moves with the image)"),
+    ("window", "Window center (stays put when zooming and panning)"),
+    ("fiber", "Fiber center (follows the selected fiber, else fiber 1)"),
 ];
 
 pub fn parse_color(s: &str) -> Option<[u8; 3]> {

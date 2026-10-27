@@ -150,7 +150,8 @@ fn fmt_percent(p: f64) -> String {
 }
 
 impl App {
-    pub(crate) fn histogram_panel(&mut self, ui: &mut egui::Ui) {
+    /// The histogram of the active view, `height` px tall (in the Controls panel).
+    pub(crate) fn histogram_box(&mut self, ui: &mut egui::Ui, height: f32) {
         let (image, live) = {
             let p = self.active_pane();
             (p.image(), p.live)
@@ -158,7 +159,7 @@ impl App {
         self.histogram.update(image.as_ref(), live);
         let h = &mut self.histogram;
         let mut save = false;
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut h.log, "Logarithmic").on_hover_text(
                 "Show log10 of the percentage: values few pixels have (e.g. clipped at 0 or 255)\nshow beside the common ones.");
             ui.checkbox(&mut h.colors, "Red, green, blue").on_hover_text("Also show each color channel.");
@@ -170,13 +171,11 @@ impl App {
                 ui.label(format!("At 0: {}   At 255: {}", fmt_percent(pct[0]), fmt_percent(pct[255])))
                     .on_hover_text("Pixels at the ends are probably clipped (too dark or too bright to measure).");
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.add_enabled(h.counts().is_some(), egui::Button::new("Save..."))
-                    .on_hover_text("Save the table (each value's percentage and its log10) as Excel or CSV.").clicked()
-                {
-                    save = true;
-                }
-            });
+            if ui.add_enabled(h.counts().is_some(), egui::Button::new("Save..."))
+                .on_hover_text("Save the table (each value's percentage and its log10) as Excel or CSV.").clicked()
+            {
+                save = true;
+            }
         });
         if save {
             self.save_histogram();
@@ -188,7 +187,7 @@ impl App {
         let (log, colors) = (self.histogram.log, self.histogram.colors);
         let shown: Vec<usize> = if colors { vec![0, 1, 2, 3] } else { vec![0] };
         let pct: Vec<[f64; 256]> = counts.iter().map(percents).collect();
-        let size = egui::vec2(ui.available_width(), ui.available_height().max(120.0));
+        let size = egui::vec2(ui.available_width(), height);
         let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
         let painter = ui.painter_at(rect);
         let plot = Rect::from_min_max(rect.min + egui::vec2(58.0, 6.0), rect.max - egui::vec2(10.0, 20.0));

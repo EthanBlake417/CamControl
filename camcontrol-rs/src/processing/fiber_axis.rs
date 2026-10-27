@@ -50,7 +50,7 @@ const OTHER_SHAPE_QUALITY: f64 = 2.4;
 const MIN_SHOWN: f32 = 0.5;         // rod outlines off the image: scored over the part shown, at least this share
 const CORE_SEARCH: f64 = 0.15;      // a visible core spot is looked for within this fraction of the radius
 const CORE_SIGNIFICANCE: f32 = 8.0; // ... standing out this many noise levels from the cladding
-const CORE_SPREAD: f64 = 0.08;      // rod pairs centred further from it than this (fraction of the radius) count less
+const CORE_SPREAD: f64 = 0.08;      // rod pairs centered further from it than this (fraction of the radius) count less
 const CORE_TIE: f32 = 0.9;          // ... among the pairs ranked at least this share of the best
 const APPLE_REACH: f64 = 0.3;       // the apple core is looked at within this fraction of the radius
 const APPLE_SIZE: f64 = 100.0;      // ... on a copy this many pixels across that reach
@@ -67,7 +67,7 @@ pub const METHODS: [(&str, &str); 6] = [
     ("rods", "Panda rod outlines"),
     ("core", "Apple core"),
     ("symmetry", "Mirror symmetry"),
-    ("centres", "Stress part centres"),
+    ("centres", "Stress part centers"),
     ("moments", "Second moments"),
 ];
 
@@ -139,7 +139,7 @@ pub struct FiberAxis {
     pub coverage: Option<f64>,
     pub rod_radii: Vec<f64>,
     pub turned_gain: Option<f64>,
-    /// Brightness (0-255) of the brightest spot near the centre (light in the core), see centre_brightness.
+    /// Brightness (0-255) of the brightest spot near the center (light in the core), see centre_brightness.
     pub centre_brightness: Option<f64>,
     /// Measured from the apple core (see apple_core): whether it was clear.
     pub core_clear: Option<bool>,
@@ -258,8 +258,244 @@ pub fn find_fibers(image: &RgbImage, max_fibers: usize) -> Vec<(f64, f64, f64)> 
         found = find_hough_circles(&gray, 10);
     }
     found = faint_cladding_around(&gray, found);
+    // No edge all round (a step or an outline): not a fiber (the curved edge of the lit
+    // area, shading); then fibers this search missed.
+    let check = EdgeCheck::new(&gray);
+    found.retain(|c| check.has_edge(c));
+    found = more_fibers(&gray, &check, found, max_fibers);
     found.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     found.truncate(max_fibers);
+    found
+}
+
+/// Fibers the first search missed, each kept only with a clear cladding edge
+/// (EdgeCheck::is_fiber) and not overlapping one found: from the bright and dark split
+/// of the image with its lighting evened out (a slope of light across the image splits
+/// the image instead of the fibers), from circles by their edges' shape (no split at
+/// all), and circles the size of the best-edged fiber found (fibers side by side in a
+/// groove are the same size).
+fn more_fibers(gray: &image::GrayImage, check: &EdgeCheck, mut found: Vec<(f64, f64, f64)>, max_fibers: usize) -> Vec<(f64, f64, f64)> {
+    // All on the image with its lighting evened out: the edge fits take the background as
+    // one level, which a slope of light across the image breaks.
+    let flat = flatten_lighting(gray);
+    let gray = &flat;
+    let bright = otsu_mask(gray);
+    let rough: Vec<(f64, f64, f64)> = touching_fibers(gray, &bright, max_fibers).into_iter()
+        .chain(round_regions(gray, &bright))
+        .chain(hough_circles(gray, 10, 800.0, None))
+        .filter(|c| found.iter().all(|k| (c.0 - k.0).hypot(c.1 - k.1) > 0.8 * k.2.max(c.2)))
+        .collect();
+    let fits: Vec<Option<(f64, f64, f64)>> = std::thread::scope(|s| {
+        let jobs: Vec<_> = rough.iter().map(|&c| s.spawn(move || fit_cladding_edge(gray, c.0, c.1, c.2, 360))).collect();
+        jobs.into_iter().map(|j| j.join().unwrap()).collect()
+    });
+    // Fitted (where the fit agrees) and checked, biggest first: of overlapping ones (a fiber
+    // and a stress rod or core inside it) the fiber wins.
+    let mut extra: Vec<(f64, f64, f64)> = rough.iter().zip(fits).filter_map(|(c, f)| match f {
+        Some(f) if (f.2 - c.2).abs() < 0.2 * c.2 && (f.0 - c.0).hypot(f.1 - c.1) < 0.2 * c.2 => Some(f),
+        _ => None,
+    }).filter(|c| check.is_fiber(c)).collect();
+    extra.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
+    for c in extra {
+        if found.len() < max_fibers && found.iter().all(|k| (c.0 - k.0).hypot(c.1 - k.1) > 0.8 * k.2.max(c.2)) {
+            found.push(c);
+        }
+    }
+    same_size_neighbours(gray, check, found, max_fibers)
+}
+
+/// The gray image with its lighting evened out: a smooth surface (quadratic in
+/// x and y) fitted to a small copy, leaving out what stands out from it (fibers),
+/// subtracted, around mid-gray.
+pub fn flatten_lighting(gray: &image::GrayImage) -> image::GrayImage {
+    let (w, h) = (gray.width() as usize, gray.height() as usize);
+    let scale = (160.0 / w.max(h) as f64).min(1.0);
+    let (sw, sh) = ((w as f64 * scale).round().max(2.0) as usize, (h as f64 * scale).round().max(2.0) as usize);
+    let small = ip::resize_area(&ImgF::from_gray(gray), sw, sh);
+    let terms = |u: f64, v: f64| vec![1.0, u, v, u * u, u * v, v * v];
+    let pts: Vec<(f64, f64, f64)> = (0..sh).flat_map(|y| (0..sw).map(move |x| (x, y)))
+        .map(|(x, y)| (2.0 * (x as f64 + 0.5) / sw as f64 - 1.0, 2.0 * (y as f64 + 0.5) / sh as f64 - 1.0, small.at(x, y) as f64))
+        .collect();
+    let mut keep = vec![true; pts.len()];
+    let mut coef = vec![0.0; 6];
+    for _ in 0..4 {
+        let (rows, b): (Vec<Vec<f64>>, Vec<f64>) = pts.iter().zip(&keep).filter(|(_, k)| **k).map(|(p, _)| (terms(p.0, p.1), p.2)).unzip();
+        if rows.len() < 12 {
+            return gray.clone();
+        }
+        let Some(c) = ip::lstsq(&rows, &b) else { return gray.clone() };
+        coef = c;
+        let res: Vec<f64> = pts.iter().map(|p| p.2 - terms(p.0, p.1).iter().zip(&coef).map(|(t, c)| t * c).sum::<f64>()).collect();
+        let spread = 1.4826 * ip::median_f64(&res.iter().map(|r| r.abs()).collect::<Vec<_>>()) + 1.0;
+        for (k, r) in keep.iter_mut().zip(&res) {
+            *k = r.abs() < 2.5 * spread;
+        }
+    }
+    let level = |x: usize, y: usize| {
+        let (u, v) = (2.0 * (x as f64 + 0.5) / w as f64 - 1.0, 2.0 * (y as f64 + 0.5) / h as f64 - 1.0);
+        terms(u, v).iter().zip(&coef).map(|(t, c)| t * c).sum::<f64>()
+    };
+    image::GrayImage::from_fn(w as u32, h as u32, |x, y| {
+        let v = gray.get_pixel(x, y).0[0] as f64 - level(x as usize, y as usize) + 128.0;
+        image::Luma([v.round().clamp(0.0, 255.0) as u8])
+    })
+}
+
+/// A found circle is kept as a fiber only if it's mostly on the image and has a
+/// cladding edge round most of it: brighter (or darker) just inside than just
+/// outside, the same way, on at least EDGE_SUPPORT of the rays, and changing
+/// there much more than just inside or outside (so not a slope of light across
+/// the image). Curved edges of the lit area, shading and dirt don't have that.
+const EDGE_RAYS: usize = 72;
+const EDGE_SUPPORT: f64 = 0.55; // rays with a step the same way
+const SHARP_SUPPORT: f64 = 0.3; // ... and rays where it's an edge, not a slope of light (see support)
+const SLOPE_MARGIN: f32 = 0.8;
+const OUTLINE_SUPPORT: f64 = 0.7; // rays with a step or an outline (first search: see has_edge)
+const ON_IMAGE: f64 = 0.4; // share of the rays that must be on the image (fibers in a groove run off it)
+const MIN_STEP: f32 = 3.0; // gray levels, at least (compressed video shows no noise)
+
+pub struct EdgeCheck {
+    img: ImgF,
+    noise: f32,
+}
+
+impl EdgeCheck {
+    pub fn new(gray: &image::GrayImage) -> Self {
+        let img = ImgF::from_gray(gray);
+        // Pixel noise from neighbours' differences, every few rows.
+        let mut d = Vec::new();
+        for y in (0..img.h).step_by(4) {
+            for x in (0..img.w.saturating_sub(1)).step_by(2) {
+                d.push((img.at(x + 1, y) - img.at(x, y)).abs());
+            }
+        }
+        let noise = if d.is_empty() { 0.0 } else { 1.4826 * ip::median(&d) / std::f32::consts::SQRT_2 };
+        Self { img, noise }
+    }
+
+    /// Over the rays on the image: the share with a step the same way, with an edge standing
+    /// out from the slope of light either side, and with a step or an outline (a thin ring
+    /// darker or brighter than both sides, all the way round the same); and the share of
+    /// rays on the image.
+    pub fn support(&self, c: &(f64, f64, f64)) -> Support {
+        let (cx, cy, r) = *c;
+        let (w, h) = (self.img.w as f64, self.img.h as f64);
+        // Bands along each ray (px from the circle): a gap either side of the edge (room
+        // for a blurred edge and a slightly-off fit), then two bands each side.
+        let gap = (0.06 * r).max(4.0);
+        let band = (0.08 * r).max(3.0);
+        let n = (band.round() as usize).clamp(3, 40);
+        let threshold = MIN_STEP.max(4.0 * self.noise / (n as f32).sqrt());
+        // The outline's darkest or brightest point (3 px smoothed) stands out from noise too.
+        let ring_threshold = MIN_STEP.max(3.0 * self.noise / 3f32.sqrt());
+        // A straight slope of light changes edge / slope = (2 gap + band) / band times
+        // as much across the edge as across one band; an edge must stand out well past that.
+        let slope_ratio = SLOPE_MARGIN * ((2.0 * gap + band) / band) as f32;
+        let mut edges = Vec::new();
+        let mut on = 0;
+        for k in 0..EDGE_RAYS {
+            let a = k as f64 * 2.0 * PI / EDGE_RAYS as f64;
+            let (dx, dy) = (a.cos(), a.sin());
+            let at = |t: f64| (cx + t * dx, cy + t * dy);
+            let (inner, outer) = (r - gap - 2.0 * band, r + gap + 2.0 * band);
+            let (x0, y0) = at(inner.max(0.0));
+            let (x1, y1) = at(outer);
+            if [x0, x1].iter().any(|&x| x < 0.0 || x > w - 1.0) || [y0, y1].iter().any(|&y| y < 0.0 || y > h - 1.0) {
+                continue;
+            }
+            on += 1;
+            let value = |t: f64| {
+                let (x, y) = at(t);
+                ip::sample(&self.img, x as f32, y as f32)
+            };
+            let mean = |from: f64| (0..n).map(|i| value(from + band * (i as f64 + 0.5) / n as f64)).sum::<f32>() / n as f32;
+            let (a_in, b_in) = (mean(inner), mean(r - gap - band));
+            let (c_out, d_out) = (mean(r + gap), mean(r + gap + band));
+            // Across the gap at 1 px steps, smoothed over 3: its darkest and brightest.
+            let m = (2.0 * gap).round().clamp(3.0, 80.0) as usize;
+            let line: Vec<f32> = (0..=m).map(|i| value(r - gap + 2.0 * gap * i as f64 / m as f64)).collect();
+            let smooth: Vec<f32> = (1..line.len() - 1).map(|i| (line[i - 1] + line[i] + line[i + 1]) / 3.0).collect();
+            let sides = (b_in + c_out) / 2.0;
+            let dark = sides - smooth.iter().cloned().fold(f32::INFINITY, f32::min);
+            let light = smooth.iter().cloned().fold(f32::NEG_INFINITY, f32::max) - sides;
+            edges.push((b_in - c_out, (a_in - b_in).abs().max((c_out - d_out).abs()), dark, light));
+        }
+        if edges.is_empty() {
+            return Support::default();
+        }
+        let sign = if ip::median(&edges.iter().map(|e| e.0).collect::<Vec<_>>()) >= 0.0 { 1.0 } else { -1.0 };
+        let dark_ring = ip::median(&edges.iter().map(|e| e.2).collect::<Vec<_>>()) >= ip::median(&edges.iter().map(|e| e.3).collect::<Vec<_>>());
+        let n = edges.len() as f64;
+        let share = |f: &dyn Fn(&(f32, f32, f32, f32)) -> bool| edges.iter().filter(|e| f(e)).count() as f64 / n;
+        let step = |e: &(f32, f32, f32, f32)| e.0 * sign >= threshold;
+        let ring = |e: &(f32, f32, f32, f32)| (if dark_ring { e.2 } else { e.3 }) >= ring_threshold;
+        Support {
+            step: share(&step),
+            sharp: share(&|e| step(e) && e.0 * sign >= slope_ratio * e.1),
+            edge: share(&|e| step(e) || ring(e)),
+            on: on as f64 / EDGE_RAYS as f64,
+        }
+    }
+
+    fn on_image(&self, c: &(f64, f64, f64), s: &Support) -> bool {
+        c.0 >= 0.0 && c.1 >= 0.0 && c.0 < self.img.w as f64 && c.1 < self.img.h as f64 && s.on >= ON_IMAGE
+    }
+
+    /// A clear cladding edge (for circles found by the extra searches).
+    pub fn is_fiber(&self, c: &(f64, f64, f64)) -> bool {
+        let s = self.support(c);
+        self.on_image(c, &s) && s.step >= EDGE_SUPPORT && s.sharp >= SHARP_SUPPORT
+    }
+
+    /// Some edge, a step or an outline, round most of it (for the first search's circles).
+    pub fn has_edge(&self, c: &(f64, f64, f64)) -> bool {
+        let s = self.support(c);
+        self.on_image(c, &s) && s.edge >= OUTLINE_SUPPORT
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Support {
+    pub step: f64,
+    pub sharp: f64,
+    pub edge: f64,
+    pub on: f64,
+}
+
+/// Fibers side by side are the same size: with one found, look for more circles
+/// of that size (the best-edged one's) that the first search missed.
+fn same_size_neighbours(gray: &image::GrayImage, check: &EdgeCheck, mut found: Vec<(f64, f64, f64)>, max_fibers: usize)
+                        -> Vec<(f64, f64, f64)> {
+    let Some(best) = found.iter().copied().max_by(|a, b| check.support(a).sharp.partial_cmp(&check.support(b).sharp).unwrap()) else {
+        return found;
+    };
+    if found.len() >= max_fibers {
+        return found;
+    }
+    let r = best.2;
+    let extra: Vec<(f64, f64)> = fixed_radius_centres(gray, r, max_fibers)
+        .into_iter()
+        // (a much smaller circle there may be a rod or core, which this fiber replaces below)
+        .filter(|&(x, y)| found.iter().all(|f| f.2 < 0.8 * r || (x - f.0).hypot(y - f.1) > 0.8 * (r + f.2)))
+        .collect();
+    let fits: Vec<Option<(f64, f64, f64)>> = std::thread::scope(|s| {
+        let jobs: Vec<_> = extra.iter().map(|&(x, y)| s.spawn(move || fit_cladding_edge(gray, x, y, r, 360))).collect();
+        jobs.into_iter().map(|j| j.join().unwrap()).collect()
+    });
+    for ((x, y), f) in extra.into_iter().zip(fits) {
+        let c = match f {
+            Some(f) if (f.2 - r).abs() < 0.1 * r && (f.0 - x).hypot(f.1 - y) < 0.2 * r => f,
+            _ => continue,
+        };
+        if !check.is_fiber(&c) {
+            continue;
+        }
+        // A much smaller circle inside it is one of its stress rods or its core, not a fiber.
+        found.retain(|k| !(k.2 < 0.8 * c.2 && (c.0 - k.0).hypot(c.1 - k.1) < c.2));
+        if found.len() < max_fibers && found.iter().all(|k| (c.0 - k.0).hypot(c.1 - k.1) > 0.8 * (c.2 + k.2)) {
+            found.push(c);
+        }
+    }
     found
 }
 
@@ -286,7 +522,7 @@ fn faint_cladding_around(gray: &image::GrayImage, found: Vec<(f64, f64, f64)>) -
     kept
 }
 
-/// Just the circle whose centre is nearest the middle of a w x h image.
+/// Just the circle whose center is nearest the middle of a w x h image.
 pub fn nearest_centre(circles: &[(f64, f64, f64)], w: u32, h: u32) -> Vec<(f64, f64, f64)> {
     let (mx, my) = (w as f64 / 2.0, h as f64 / 2.0);
     circles
@@ -516,7 +752,7 @@ pub fn fit_circle(px: &[f64], py: &[f64], min_points: usize) -> Option<(f64, f64
     Some((a, b, r))
 }
 
-/// Centres of circles of this radius (also off the image), strongest first.
+/// Centers of circles of this radius (also off the image), strongest first.
 fn fixed_radius_centres(gray: &image::GrayImage, radius: f64, max_fibers: usize) -> Vec<(f64, f64)> {
     let scale = (60.0 / radius).min(1.0);
     let (w, h) = (gray.width() as f64, gray.height() as f64);
@@ -599,7 +835,7 @@ fn round_regions(gray: &image::GrayImage, bright: &Mask) -> Vec<(f64, f64, f64)>
     found
 }
 
-/// Circles by edges voting along their gradient for centres (as
+/// Circles by edges voting along their gradient for centers (as
 /// cv2.HoughCircles HOUGH_GRADIENT does), on a smaller copy. The last resort.
 /// A fiber on a bright background (lit from the front, or grey) has only a faint
 /// edge, below the usual edge strength: then look again on a smaller, smoother
@@ -666,7 +902,7 @@ fn hough_circles(gray: &image::GrayImage, max_fibers: usize, size: f64, faint: O
             }
         }
     }
-    // Centres: local maxima above the accumulator threshold, at least minDist apart.
+    // Centers: local maxima above the accumulator threshold, at least minDist apart.
     let min_dist = short * 0.15;
     let mut peaks: Vec<(f32, usize, usize)> = Vec::new();
     for y in 1..ah - 1 {
@@ -868,7 +1104,7 @@ fn rod_gradients(image: &RgbImage, cx: f64, cy: f64, radius: f64) -> Grads {
 /// The fiber core, if it shows as a small spot (brighter or darker) near the
 /// middle: a compact peak of a difference of Gaussians, standing out clearly
 /// from the cladding's texture. Rod edges and shading aren't compact, so they
-/// don't count. (crop: the fiber at the search scale, centre at (half, half).)
+/// don't count. (crop: the fiber at the search scale, center at (half, half).)
 fn detect_core(crop: &ImgF, half: usize) -> Option<(f64, f64)> {
     let d = ip::gaussian_blur(crop, 3.0).zip(&ip::gaussian_blur(crop, 10.0), |a, b| a - b);
     let (h, size) = (half as f64, SYMMETRY_SIZE);
@@ -912,7 +1148,7 @@ fn detect_core(crop: &ImgF, half: usize) -> Option<(f64, f64)> {
     if inside < 3.0 * ring.max(0.0) || inside < 0.5 * peak {
         return None;
     }
-    // Its centre: the weighted middle of the strong part.
+    // Its center: the weighted middle of the strong part.
     let (mut sx, mut sy, mut sw) = (0f64, 0f64, 0f64);
     for y in py.saturating_sub(8)..(py + 9).min(d.h) {
         for x in px.saturating_sub(8)..(px + 9).min(d.w) {
@@ -1055,7 +1291,7 @@ fn make_pair_grid(half: usize) -> PairGrid {
     PairGrid { angles, spacings, radii, sizes, ox, oy, inside, first, second, box_: (lo, lo, hi, hi) }
 }
 
-/// ring_score of circles of each radius centred on every pixel of the box (nearest-pixel samples).
+/// ring_score of circles of each radius centered on every pixel of the box (nearest-pixel samples).
 fn ring_maps(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, radii: &[f64], samples: usize, b: (usize, usize, usize, usize)) -> Vec<f32> {
     let (x0, y0, x1, y1) = b;
     let (bw, bh) = (x1 - x0, y1 - y0);
@@ -1113,7 +1349,7 @@ fn ring_maps(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, radii: &[f64], sample
 }
 
 /// Step 1 of find_rods: the best different rod pairs (and the best about the
-/// centre), and the quality (the best pair's score over a typical pair's).
+/// center), and the quality (the best pair's score over a typical pair's).
 fn coarse_pairs(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, half: usize, n: usize, core: Option<(f64, f64)>, min_r: f64)
                 -> (Vec<Pair>, f64) {
     let size = SYMMETRY_SIZE;
@@ -1126,10 +1362,10 @@ fn coarse_pairs(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, half: usize, n: us
             if g.inside[k] && big_enough { maps[g.first[k]].min(maps[g.second[k]]) } else { 0.0 }
         })
         .collect();
-    let centred = (0..n_off).min_by(|&a, &b| g.ox[a].hypot(g.oy[a]).partial_cmp(&g.ox[b].hypot(g.oy[b])).unwrap()).unwrap();
+    let centered = (0..n_off).min_by(|&a, &b| g.ox[a].hypot(g.oy[a]).partial_cmp(&g.ox[b].hypot(g.oy[b])).unwrap()).unwrap();
     let centred_scores: Vec<f32> = (0..g.angles.len())
-        .filter(|&i| g.inside[i * n_off + centred])
-        .map(|i| score[i * n_off + centred])
+        .filter(|&i| g.inside[i * n_off + centered])
+        .map(|i| score[i * n_off + centered])
         .collect();
     let best = score.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let quality = best as f64 / (ip::median(&centred_scores) as f64).max(1e-6);
@@ -1154,8 +1390,8 @@ fn coarse_pairs(gx: &ImgF, gy: &ImgF, valid: &ImgF, cap: f32, half: usize, n: us
             }
         }
     }
-    // The best pair about the centre too, and about the core if it shows.
-    let mut anchors = vec![centred];
+    // The best pair about the center too, and about the core if it shows.
+    let mut anchors = vec![centered];
     if let Some((x, y)) = core {
         let (dx, dy) = (x - half as f64, y - half as f64);
         let o = (0..n_off).min_by(|&a, &b| (g.ox[a] - dx).hypot(g.oy[a] - dy).partial_cmp(&(g.ox[b] - dx).hypot(g.oy[b] - dy)).unwrap()).unwrap();
@@ -1252,12 +1488,12 @@ fn find_rods_in(g: &Grads, cx: f64, cy: f64, min_rod: f64) -> (Vec<(f64, f64, f6
         let e = (pair_score((&g.gx, &g.gy), &g.valid, cap, p, 256, true, false)
             + pair_score((&clean_gx, &clean_gy), &g.valid, cap, p, 256, true, false)) / 2.0;
         let (dx, dy) = (p[3] * p[2].cos(), -p[3] * p[2].sin());
-        let centres = [(p[0] + dx, p[1] + dy), (p[0] - dx, p[1] - dy)];
-        let cov = centres.iter().map(|&(x, y)| edge_coverage(&g.gx, &g.gy, &g.valid, x, y, p[4], g.typical)).fold(f64::INFINITY, f64::min);
-        ranked.push((e * cov as f32, quality, *p, centres));
+        let centers = [(p[0] + dx, p[1] + dy), (p[0] - dx, p[1] - dy)];
+        let cov = centers.iter().map(|&(x, y)| edge_coverage(&g.gx, &g.gy, &g.valid, x, y, p[4], g.typical)).fold(f64::INFINITY, f64::min);
+        ranked.push((e * cov as f32, quality, *p, centers));
     }
     // A visible core breaks near-ties: of the pairs within CORE_TIE of the best, the
-    // rods sit either side of the core, so pairs centred away from it count less.
+    // rods sit either side of the core, so pairs centered away from it count less.
     // (Only near-ties: a speck of dirt taken for the core can't overrule a clear winner.)
     let top = ranked.iter().map(|r| r.0).fold(f32::NEG_INFINITY, f32::max);
     let weight = |r: &(f32, f64, Pair, [(f64, f64); 2])| -> f32 {
@@ -1278,12 +1514,12 @@ fn find_rods_in(g: &Grads, cx: f64, cy: f64, min_rod: f64) -> (Vec<(f64, f64, f6
             (best, best_w) = (r.clone(), w);
         }
     }
-    let (_, quality, [mx, my, _, _, r], centres) = best;
+    let (_, quality, [mx, my, _, _, r], centers) = best;
 
-    // 3. Each centre to a fraction of a pixel.
+    // 3. Each center to a fraction of a pixel.
     let mut fitted = Vec::new();
     let mut sizes = Vec::new();
-    for (x0, y0) in centres {
+    for (x0, y0) in centers {
         let (mut x, mut y, mut rr) = (x0, y0, r);
         for _ in 0..3 {
             match fit_rod_edge(&g.gx, &g.gy, x, y, rr, 0.12, 180) {
@@ -1320,11 +1556,11 @@ fn find_rods_in(g: &Grads, cx: f64, cy: f64, min_rod: f64) -> (Vec<(f64, f64, f6
 
 /// Rod 0 to rod 1 as (dx, dy) at the search scale, by sliding rod 0's outline over rod 1;
 /// and how much better it matches turned 180 degrees ("turned gain").
-fn match_rods(gx: &ImgF, gy: &ImgF, typical: f32, centres: &[(f64, f64)], r: f64, dirt: Option<&Mask>, search: isize)
+fn match_rods(gx: &ImgF, gy: &ImgF, typical: f32, centers: &[(f64, f64)], r: f64, dirt: Option<&Mask>, search: isize)
               -> (Option<(f64, f64)>, Option<f64>) {
     let strength = gx.zip(gy, |a, b| a.hypot(b).min(EDGE_CAP * typical));
-    let ((ax, ay), (bx, by)) = (centres[0], centres[1]);
-    if !(r > 0.0) || !centres.iter().all(|c| c.0.is_finite() && c.1.is_finite()) {
+    let ((ax, ay), (bx, by)) = (centers[0], centers[1]);
+    if !(r > 0.0) || !centers.iter().all(|c| c.0.is_finite() && c.1.is_finite()) {
         return (None, None);
     }
     let size = (1.25 * r).ceil() as isize + 1;
@@ -1669,7 +1905,7 @@ pub fn apple_core(image: &RgbImage, cx: f64, cy: f64, radius: f64, rods_deg: Opt
     let coarse = best(arange(0.0, 90.0, 1.0));
     let theta = best(arange(coarse - 1.0, coarse + 1.001, 0.1)).rem_euclid(90.0);
     // Which axis goes through the pinches: trace the outline (the strongest edge along rays
-    // from the centre) and see how far it reaches along each axis. A pinched side's corners
+    // from the center) and see how far it reaches along each axis. A pinched side's corners
     // reach further than its middle; a straight or bulging side's middle reaches furthest.
     let ray_edge = |deg: f64| -> f64 {
         let t = deg.to_radians();
@@ -1815,7 +2051,7 @@ pub fn measure_axis(image: &RgbImage, cx: f64, cy: f64, radius: f64, method: &st
     });
     let mask = Mask::from_fn(diff.w, diff.h, |x, y| ring.at(x, y) && diff.at(x, y) as f64 > threshold);
 
-    // Principal axis of the stress parts about the fiber centre.
+    // Principal axis of the stress parts about the fiber center.
     let (mut wx, mut wy) = (Vec::new(), Vec::new());
     for y in 0..mask.h {
         for x in 0..mask.w {
@@ -1921,7 +2157,7 @@ fn symmetry_angle(diff: &ImgF, cx: f64, cy: f64, radius: f64, start_deg: f64) ->
         })
         .collect();
     let error = |deg: f64| -> f64 {
-        // getRotationMatrix2D((cx, cy), -deg, scale), then moved so the centre is the middle pixel.
+        // getRotationMatrix2D((cx, cy), -deg, scale), then moved so the center is the middle pixel.
         let a = (-deg).to_radians();
         let (al, be) = (scale * a.cos(), scale * a.sin());
         let m: ip::Affine = [
@@ -1965,7 +2201,7 @@ pub fn analyse(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, method: &s
     analyse_tracking(image, circles, None, method, parts_centre, detection, centre_only)
 }
 
-/// How far a followed fiber may move (centre, radius) between updates, fractions of its radius.
+/// How far a followed fiber may move (center, radius) between updates, fractions of its radius.
 const TRACK_MOVE: f64 = 0.1;
 const TRACK_SIZE: f64 = 0.05;
 
@@ -2003,15 +2239,78 @@ pub fn track_fibers(image: &RgbImage, previous: &[(f64, f64, f64)]) -> Option<Ve
 /// are followed instead of searched for, which is much faster, if they still fit.
 pub fn analyse_tracking(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, previous: Option<&[(f64, f64, f64)]>,
                         method: &str, parts_centre: bool, detection: &Detection, centre_only: bool) -> Vec<FiberAxis> {
+    analyse_in(image, circles, previous, method, parts_centre, detection, centre_only, None)
+}
+
+/// Where fibers are looked for (a region of interest), in image pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "shape", rename_all = "lowercase")]
+pub enum Region {
+    Rect { x0: f64, y0: f64, x1: f64, y1: f64 },
+    Circle { cx: f64, cy: f64, r: f64 },
+}
+
+impl Region {
+    /// The rectangle with these two corners.
+    pub fn rect(a: (f64, f64), b: (f64, f64)) -> Self {
+        Region::Rect { x0: a.0.min(b.0), y0: a.1.min(b.1), x1: a.0.max(b.0), y1: a.1.max(b.1) }
+    }
+
+    pub fn contains(&self, x: f64, y: f64) -> bool {
+        match *self {
+            Region::Rect { x0, y0, x1, y1 } => x >= x0 && x <= x1 && y >= y0 && y <= y1,
+            Region::Circle { cx, cy, r } => (x - cx).hypot(y - cy) <= r,
+        }
+    }
+
+    /// (x0, y0, x1, y1)
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        match *self {
+            Region::Rect { x0, y0, x1, y1 } => (x0, y0, x1, y1),
+            Region::Circle { cx, cy, r } => (cx - r, cy - r, cx + r, cy + r),
+        }
+    }
+}
+
+/// Fibers whose centers are in the region: searched for in just that part of the image.
+pub fn find_in_region(image: &RgbImage, region: &Region) -> Vec<(f64, f64, f64)> {
+    let (bx0, by0, bx1, by1) = region.bounds();
+    let x0 = bx0.max(0.0).floor() as u32;
+    let y0 = by0.max(0.0).floor() as u32;
+    let x1 = (bx1.ceil().max(0.0) as u32).min(image.width());
+    let y1 = (by1.ceil().max(0.0) as u32).min(image.height());
+    if x1 < x0 + 16 || y1 < y0 + 16 {
+        return Vec::new();
+    }
+    let crop = image::imageops::crop_imm(image, x0, y0, x1 - x0, y1 - y0).to_image();
+    find_fibers(&crop, 10).into_iter().map(|(x, y, r)| (x + x0 as f64, y + y0 as f64, r)).filter(|c| region.contains(c.0, c.1)).collect()
+}
+
+/// As analyse_tracking; with a region, fibers are only looked for (and kept) inside it.
+#[allow(clippy::too_many_arguments)]
+pub fn analyse_in(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, previous: Option<&[(f64, f64, f64)]>,
+                  method: &str, parts_centre: bool, detection: &Detection, centre_only: bool, region: Option<&Region>) -> Vec<FiberAxis> {
+    let inside = |c: &(f64, f64, f64)| region.is_none_or(|r| r.contains(c.0, c.1));
     let circles: Vec<(f64, f64, f64)> = match (circles, previous) {
         (Some(c), _) if !c.is_empty() => c.to_vec(),
         (_, Some(prev)) if !prev.is_empty() => match track_fibers(image, prev) {
-            Some(c) => c,
-            None => return analyse_tracking(image, None, None, method, parts_centre, detection, centre_only),
+            Some(c) => c.into_iter().filter(inside).collect(),
+            None => return analyse_in(image, None, None, method, parts_centre, detection, centre_only, region),
         },
         _ => {
-            let found = find_fibers(image, 10);
-            if centre_only { nearest_centre(&found, image.width(), image.height()) } else { found }
+            let found = match region {
+                Some(r) => find_in_region(image, r),
+                None => find_fibers(image, 10),
+            };
+            match (centre_only, region) {
+                (false, _) => found,
+                (true, None) => nearest_centre(&found, image.width(), image.height()),
+                (true, Some(r)) => {
+                    let (x0, y0, x1, y1) = r.bounds();
+                    let moved: Vec<_> = found.iter().map(|c| (c.0 - x0, c.1 - y0, c.2)).collect();
+                    nearest_centre(&moved, (x1 - x0) as u32, (y1 - y0) as u32).into_iter().map(|c| (c.0 + x0, c.1 + y0, c.2)).collect()
+                }
+            }
         }
     };
     // Each fiber on its own thread (V-groove images hold several).
@@ -2034,7 +2333,7 @@ pub fn analyse_tracking(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, p
 }
 
 /// Brightness (luma, 0-255) of the brightest spot within CORE_SEARCH of the
-/// fiber centre: the peak of a small box average (2% of the radius, at least
+/// fiber center: the peak of a small box average (2% of the radius, at least
 /// 3x3 px), so one hot pixel doesn't count. Light sent into a fiber shows here.
 pub fn centre_brightness(image: &RgbImage, cx: f64, cy: f64, radius: f64) -> f64 {
     let (w, h) = (image.width() as i64, image.height() as i64);
@@ -2072,7 +2371,7 @@ pub fn centre_brightness(image: &RgbImage, cx: f64, cy: f64, radius: f64) -> f64
     if best.is_finite() { best } else { 0.0 }
 }
 
-/// Of two or more fibers, the one with the brightest centre: (its index, its
+/// Of two or more fibers, the one with the brightest center: (its index, its
 /// position counted from the right, 1 = rightmost). None for fewer than two.
 pub fn brightest_centre(axes: &[FiberAxis]) -> Option<(usize, usize)> {
     if axes.len() < 2 {
@@ -2153,6 +2452,40 @@ mod tests {
             assert!(angle_error(f.slow_deg, truth) < 1.0, "{truth}: {}", f.slow_deg);
             let right = f.part_centres.iter().map(|c| c.0).fold(f64::NEG_INFINITY, f64::max);
             assert!((right - (690.0 + 95.0 * a.cos().abs())).abs() < 4.0, "{truth}: right rod at {right}");
+        }
+    }
+
+    /// No fiber in view, only the curved edge of a bright area on a grey field (the
+    /// user's 2026-10-27 video): nothing found.
+    #[test]
+    fn no_fiber_on_a_lit_edge() {
+        let img = RgbImage::from_fn(960, 540, |x, y| {
+            let lit = (x as f64 - 1500.0).hypot(y as f64 - 270.0) < 880.0;
+            let v = if lit { 255.0 } else { 140.0 + 30.0 * x as f64 / 960.0 };
+            image::Rgb([v as u8; 3])
+        });
+        let img = crate::imgproc::gaussian_blur_rgb(&img, 5.0);
+        assert!(find_fibers(&img, 10).is_empty(), "{:?}", find_fibers(&img, 10));
+    }
+
+    /// Fibers in a column, a little brighter than a background lit brighter on one side
+    /// than the other (the user's 2026-10-27 video): all of them found.
+    #[test]
+    fn fibers_on_a_slope_of_light() {
+        let mut img = RgbImage::from_fn(960, 560, |x, _| image::Rgb([(210.0 - 100.0 * x as f64 / 960.0) as u8; 3]));
+        let ys = [70i64, 210, 350, 490];
+        for &y in &ys {
+            draw::fill_circle_px(&mut img, 480, y, 66, [178, 178, 178]);
+            for s in [-1, 1] {
+                draw::fill_circle_px(&mut img, 480, y + s * 33, 18, [120, 120, 120]);
+            }
+        }
+        let img = crate::imgproc::gaussian_blur_rgb(&img, 1.5);
+        let mut found = find_fibers(&img, 10);
+        found.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        assert_eq!(found.len(), 4, "{found:?}");
+        for (f, &y) in found.iter().zip(&ys) {
+            assert!((f.0 - 480.0).abs() < 3.0 && (f.1 - y as f64).abs() < 3.0 && (f.2 - 66.0).abs() < 4.0, "{found:?}");
         }
     }
 

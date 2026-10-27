@@ -151,7 +151,7 @@ pub fn column_name(label: &str, power: u8, unit: &str) -> String {
 pub fn measurement_sheet(measurements: &[Measurement], cal: &Calibration, source: &str) -> Sheet {
     let mut headers = vec!["#".to_string(), "Type".to_string()];
     headers.extend(FIELDS.iter().map(|(_, l, p)| column_name(l, *p, &cal.unit)));
-    headers.extend(["Centre x (px)", "Centre y (px)", "Points (px)", "Image", "Calibration"].map(String::from));
+    headers.extend(["Center x (px)", "Center y (px)", "Points (px)", "Image", "Calibration"].map(String::from));
     let rows = measurements
         .iter()
         .filter_map(|m| {

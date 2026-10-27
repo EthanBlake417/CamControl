@@ -21,7 +21,7 @@ pub const KINDS: [Kind; 7] = [
     Kind { name: "line", label: "Line", n_points: Some(2), min_points: 2 },
     Kind { name: "polyline", label: "Polyline", n_points: None, min_points: 2 },
     Kind { name: "circle", label: "Circle (3 pt)", n_points: Some(3), min_points: 3 },
-    Kind { name: "circle_centre", label: "Circle (centre)", n_points: Some(2), min_points: 2 },
+    Kind { name: "circle_centre", label: "Circle (center)", n_points: Some(2), min_points: 2 },
     Kind { name: "angle", label: "Angle", n_points: Some(3), min_points: 3 },
     Kind { name: "rectangle", label: "Rectangle", n_points: Some(2), min_points: 2 },
     Kind { name: "polygon", label: "Polygon", n_points: None, min_points: 3 },
@@ -52,7 +52,7 @@ pub struct Results {
     pub width: Option<f64>,
     pub height: Option<f64>,
     pub angle_deg: Option<f64>,
-    /// Circle centre in image pixels, for drawing.
+    /// Circle center in image pixels, for drawing.
     pub center_px: Option<Point>,
 }
 
@@ -89,7 +89,7 @@ pub fn polygon_area(p: &[Point]) -> f64 {
     (0..n).map(|i| p[i].0 * p[(i + 1) % n].1 - p[(i + 1) % n].0 * p[i].1).sum::<f64>().abs() / 2.0
 }
 
-/// Centre and radius of the circle through three points.
+/// Center and radius of the circle through three points.
 pub fn circle_through(a: Point, b: Point, c: Point) -> Result<(f64, f64, f64), String> {
     let ((ax, ay), (bx, by), (cx, cy)) = (a, b, c);
     let d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by));

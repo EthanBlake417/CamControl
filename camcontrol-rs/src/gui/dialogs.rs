@@ -305,25 +305,25 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
                 ui.checkbox(outside, "Outside the fiber").on_hover_text(
                     "Draw each fiber's axis lines only outside the fibers, from the fiber's edge to the edges of the view\n\
                      (as the crosshair), so they can be compared with the crosshair, the grid or lines in the image\n\
-                     without covering the fiber. With the crosshair centred on the fiber, its lines also stop at the\n\
+                     without covering the fiber. With the crosshair centered on the fiber, its lines also stop at the\n\
                      fibers' edges. Also used for exported drawings (to the picture's edges) and videos.");
                 ui.end_row();
                 let f = &mut *fiber;
                 axis_color_rows(ui, "Slow", &mut f.slow_color, &mut f.slow_opacity, &mut f.slow_by_angle);
                 axis_color_rows(ui, "Fast", &mut f.fast_color, &mut f.fast_opacity, &mut f.fast_by_angle);
             } else if tab == "crosshair" {
-                ui.label("Centred on:");
+                ui.label("Centered on:");
                 let label = CROSSHAIR_ANCHORS.iter().find(|a| a.0 == crosshair.anchor).map(|a| a.1).unwrap_or("");
                 egui::ComboBox::from_id_salt("anchor").selected_text(label).show_ui(ui, |ui| {
                     for (name, label) in CROSSHAIR_ANCHORS {
                         ui.selectable_value(&mut crosshair.anchor, name.to_string(), label);
                     }
-                }).response.on_hover_text("Image centre: the middle of the picture (the optical axis), e.g. to centre a fiber.\n\
-                    Window centre: the middle of what you're looking at, wherever you've zoomed or panned to.");
+                }).response.on_hover_text("Image center: the middle of the picture (the optical axis), e.g. to center a fiber.\n\
+                    Window center: the middle of what you're looking at, wherever you've zoomed or panned to.");
                 ui.end_row();
                 ui.label("Ring:");
                 ui.add(egui::DragValue::new(&mut crosshair.circle).range(0..=500).suffix(" px"))
-                    .on_hover_text("Radius of the ring round the centre, on screen (0: no ring)");
+                    .on_hover_text("Radius of the ring round the center, on screen (0: no ring)");
                 ui.end_row();
                 ui.label("Line width:");
                 ui.add(egui::DragValue::new(&mut crosshair.width).range(0.5..=10.0).speed(0.1).suffix(" px"));

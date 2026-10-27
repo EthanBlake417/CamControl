@@ -10,7 +10,7 @@ use super::style::AngleBands;
 use crate::draw::{label, Canvas, Color, Dash, SkiaCanvas, P};
 use crate::measure::{compute, is_circle, summary, Measurement};
 use crate::processing::count::{Counter, CLASS_COLORS};
-use crate::processing::fiber_axis::{brightest_centre, FiberAxis};
+use crate::processing::fiber_axis::{brightest_centre, FiberAxis, Region};
 
 pub const MEASURE_COLOR: Color = [0, 255, 0, 255];
 pub const SELECTED_COLOR: Color = [255, 140, 0, 255];
@@ -18,7 +18,10 @@ pub const PREVIEW_COLOR: Color = [0, 200, 255, 255];
 pub const SLOW_COLOR: Color = [255, 0, 200, 255]; // magenta: shows on blue, white and black
 pub const FAST_COLOR: Color = [255, 200, 0, 255];
 pub const READOUT_COLOR: Color = [0, 255, 0, 255];
-const LINE_LENGTH: f64 = 1.25; // axis lines reach this many radii from the centre
+pub const REGION_COLOR: Color = [255, 220, 0, 255];
+pub const REFERENCE_COLOR: Color = [0, 220, 255, 255];
+pub const NUMBER_COLOR: Color = [255, 255, 255, 255];
+const LINE_LENGTH: f64 = 1.25; // axis lines reach this many radii from the center
 /// Readout text height on screen (px); exports scale it with the image.
 pub const READOUT_PX: f32 = 26.0;
 
@@ -38,15 +41,31 @@ pub struct FiberDrawing {
     /// Colors by angle (see style::AngleColors): aim, then (limit in degrees, color), smallest first.
     pub slow_bands: Option<AngleBands>,
     pub fast_bands: Option<AngleBands>,
+    /// Numbering: the first fiber (top, or left in a row) gets this number, the next ones count up or down.
+    pub first_number: i64,
+    pub ascending: bool,
+    /// A reference line's angle: every angle shown is then measured from it.
+    pub reference: Option<f64>,
 }
 
 impl Default for FiberDrawing {
     fn default() -> Self {
-        Self { show_parts: false, long_lines: false, slow: SLOW_COLOR, fast: FAST_COLOR, show_slow: true, show_fast: true, slow_bands: None, fast_bands: None }
+        Self { show_parts: false, long_lines: false, slow: SLOW_COLOR, fast: FAST_COLOR, show_slow: true, show_fast: true, slow_bands: None,
+               fast_bands: None, first_number: 1, ascending: true, reference: None }
     }
 }
 
 impl FiberDrawing {
+    /// An axis angle as shown: from the reference line if there is one, else from horizontal (-90 to +90).
+    pub fn shown(&self, deg: f64) -> f64 {
+        signed_angle(deg - self.reference.unwrap_or(0.0))
+    }
+
+    /// The number of the i-th fiber (in the order they're kept: top to bottom, then left to right).
+    pub fn number(&self, i: usize) -> i64 {
+        if self.ascending { self.first_number + i as i64 } else { self.first_number - i as i64 }
+    }
+
     fn by_angle(base: Color, bands: &Option<AngleBands>, deg: f64) -> Color {
         let Some((aim, bands)) = bands else { return base };
         let off = (signed_angle(deg).abs() - aim).abs(); // from the aim, either way
@@ -55,15 +74,15 @@ impl FiberDrawing {
 
     /// This fiber's slow axis color (its own, or by its angle).
     pub fn slow_color(&self, f: &FiberAxis) -> Color {
-        Self::by_angle(self.slow, &self.slow_bands, f.slow_deg)
+        Self::by_angle(self.slow, &self.slow_bands, self.shown(f.slow_deg))
     }
 
     pub fn fast_color(&self, f: &FiberAxis) -> Color {
-        Self::by_angle(self.fast, &self.fast_bands, f.fast_deg())
+        Self::by_angle(self.fast, &self.fast_bands, self.shown(f.fast_deg()))
     }
 }
 
-/// The parts of the line a..b outside every circle (centre, radius).
+/// The parts of the line a..b outside every circle (center, radius).
 pub fn outside_circles(a: P, b: P, circles: &[(P, f32)]) -> Vec<(P, P)> {
     let d = (b.0 - a.0, b.1 - a.1);
     let len2 = d.0 * d.0 + d.1 * d.1;
@@ -187,14 +206,14 @@ pub fn draw_measurement(c: &mut dyn Canvas, m: &Measurement, cal: &Calibration, 
             }
             if let Some(r) = &results {
                 let (cx, cy) = r.center_px.unwrap();
-                let centre = to_out(cx, cy);
+                let center = to_out(cx, cy);
                 // With non-square pixels the circle is an ellipse in pixels.
                 let rad = r.radius.unwrap();
-                c.ellipse(centre, (rad / cal.x * zoom) as f32, (rad / cal.y * zoom) as f32, Some(color), w, Dash::Solid, None);
+                c.ellipse(center, (rad / cal.x * zoom) as f32, (rad / cal.y * zoom) as f32, Some(color), w, Dash::Solid, None);
                 let k = style.marker * 2.0;
-                c.line((centre.0 - k, centre.1), (centre.0 + k, centre.1), color, w, Dash::Solid);
-                c.line((centre.0, centre.1 - k), (centre.0, centre.1 + k), color, w, Dash::Solid);
-                anchor = centre;
+                c.line((center.0 - k, center.1), (center.0 + k, center.1), color, w, Dash::Solid);
+                c.line((center.0, center.1 - k), (center.0, center.1 + k), color, w, Dash::Solid);
+                anchor = center;
             } else if pts.len() >= 2 {
                 c.polyline(&pts, false, color, w, Dash::Solid, None);
             }
@@ -247,7 +266,7 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
     let brightest = brightest_centre(axes).map(|b| b.0);
     let circles: Vec<(P, f32)> = axes.iter().map(|f| (to_out(f.cx, f.cy), (f.radius * zoom) as f32)).collect();
     for (i, f) in axes.iter().enumerate() {
-        let centre = to_out(f.cx, f.cy);
+        let center = to_out(f.cx, f.cy);
         let (ax, ay) = f.axis_point();
         let pivot = to_out(ax, ay);
         let r = (f.radius * zoom) as f32;
@@ -266,10 +285,10 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
                 c.line((p.0 - k, p.1 + k), (p.0 + k, p.1 - k), drawing.slow, width, Dash::Solid);
             }
         }
-        c.ellipse(centre, r, r, Some([255, 255, 255, 160]), (width / 2.0).max(1.0), Dash::Dot, None);
+        c.ellipse(center, r, r, Some([255, 255, 255, 160]), (width / 2.0).max(1.0), Dash::Dot, None);
         if brightest == Some(i) {
             let k = (r * 0.25).max(style.marker * 3.0);
-            c.ellipse(centre, k, k, Some(READOUT_COLOR), width, Dash::Solid, None);
+            c.ellipse(center, k, k, Some(READOUT_COLOR), width, Dash::Solid, None);
         }
         let shown = [(drawing.show_fast, f.fast_deg(), drawing.fast_color(f), Dash::Dash), (drawing.show_slow, f.slow_deg, drawing.slow_color(f), Dash::Solid)];
         for (deg, color, dash) in shown.into_iter().filter(|a| a.0).map(|a| (a.1, a.2, a.3)) {
@@ -298,7 +317,7 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
 
 /// The readout's lines as colored pieces: per fiber (numbered left to right) the slow and fast
 /// axis angles in their line colors (opaque, to stay readable), "(unclear)" when unsure;
-/// with several fibers, a last line saying which has the brightest centre.
+/// with several fibers, a last line saying which has the brightest center.
 pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<Vec<(String, Color)>> {
     let opaque = |c: Color| [c[0], c[1], c[2], 255];
     let mut lines: Vec<Vec<(String, Color)>> = axes
@@ -306,8 +325,8 @@ pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<V
         .enumerate()
         .map(|(i, f)| {
             let mut line = vec![
-                (format!("slow {}°", fmt_angle(f.slow_deg)), opaque(drawing.slow_color(f))),
-                (format!("fast {}°", fmt_angle(f.fast_deg())), opaque(drawing.fast_color(f))),
+                (format!("slow {}°", fmt_angle(drawing.shown(f.slow_deg))), opaque(drawing.slow_color(f))),
+                (format!("fast {}°", fmt_angle(drawing.shown(f.fast_deg()))), opaque(drawing.fast_color(f))),
             ];
             // Only the axes shown, the number in the first one's color.
             line.retain(|p| if p.0.starts_with("slow") { drawing.show_slow } else { drawing.show_fast });
@@ -315,22 +334,29 @@ pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<V
                 line[1].0.insert_str(0, "  ");
             }
             let first = line.first().map(|p| p.1).unwrap_or(READOUT_COLOR);
-            line.insert(0, (format!("{}: ", i + 1), first));
+            line.insert(0, (format!("{}: ", drawing.number(i)), first));
             if !f.clear() {
                 line.push((" (unclear)".into(), [230, 230, 230, 255]));
             }
             line
         })
         .collect();
-    if let Some((i, position)) = brightest_centre(axes) {
-        lines.push(vec![(format!("Brightest centre: position {position} from right (fiber {})", i + 1), READOUT_COLOR)]);
+    if let Some((i, _)) = brightest_centre(axes) {
+        lines.push(vec![(format!("Fiber {} is on (brightest center)", drawing.number(i)), READOUT_COLOR)]);
+    }
+    if drawing.reference.is_some() && !axes.is_empty() {
+        lines.push(vec![("Angles from the reference line".into(), REFERENCE_COLOR)]);
     }
     lines
 }
 
 /// The readout's lines as plain text.
 pub fn fiber_readout_lines(axes: &[FiberAxis]) -> Vec<String> {
-    fiber_readout_pieces(axes, &FiberDrawing::default()).into_iter().map(|l| l.into_iter().map(|p| p.0).collect()).collect()
+    fiber_readout_lines_with(axes, &FiberDrawing::default())
+}
+
+pub fn fiber_readout_lines_with(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<String> {
+    fiber_readout_pieces(axes, drawing).into_iter().map(|l| l.into_iter().map(|p| p.0).collect()).collect()
 }
 
 /// The angles in a dark box with its top-left corner at `corner`.
@@ -352,6 +378,122 @@ pub fn draw_fiber_readout(c: &mut dyn Canvas, axes: &[FiberAxis], drawing: &Fibe
             x += w;
         }
     }
+}
+
+/// What's drawn besides measurements and fiber axes: the region fibers are looked for in,
+/// a reference line, the fibers' numbers, and notes (on saved copies, bottom left).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Extras {
+    pub region: Option<Region>,
+    pub reference: Option<((f64, f64), (f64, f64))>,
+    pub numbers: bool,
+    pub notes: Vec<String>,
+}
+
+pub fn draw_extras(c: &mut dyn Canvas, extras: &Extras, axes: &[FiberAxis], drawing: &FiberDrawing, to_out: &dyn Fn(f64, f64) -> P,
+                   zoom: f64, style: &Style, area: (P, P)) {
+    let w = style.line_width;
+    match extras.region {
+        Some(Region::Rect { x0, y0, x1, y1 }) => {
+            let pts = [to_out(x0, y0), to_out(x1, y0), to_out(x1, y1), to_out(x0, y1)];
+            c.polyline(&pts, true, REGION_COLOR, w, Dash::Dash, None);
+        }
+        Some(Region::Circle { cx, cy, r }) => {
+            let r = (r * zoom) as f32;
+            c.ellipse(to_out(cx, cy), r, r, Some(REGION_COLOR), w, Dash::Dash, None);
+        }
+        None => {}
+    }
+    if let Some((a, b)) = extras.reference {
+        // Dashed across the whole picture, solid where it was drawn.
+        let (p, q) = (to_out(a.0, a.1), to_out(b.0, b.1));
+        let len = (q.0 - p.0).hypot(q.1 - p.1).max(1e-3);
+        let far = (area.1 .0 - area.0 .0).abs() + (area.1 .1 - area.0 .1).abs() + (p.0 - area.0 .0).abs() + (p.1 - area.0 .1).abs();
+        let u = ((q.0 - p.0) / len * far, (q.1 - p.1) / len * far);
+        if let Some((s, e)) = clip_to_rect((p.0 - u.0, p.1 - u.1), (p.0 + u.0, p.1 + u.1), area.0, area.1) {
+            c.line(s, e, REFERENCE_COLOR, w, Dash::Dash);
+        }
+        c.line(p, q, REFERENCE_COLOR, w * 1.5, Dash::Solid);
+    }
+    if extras.numbers {
+        let on = brightest_centre(axes).map(|b| b.0);
+        for (i, f) in axes.iter().enumerate() {
+            let k = std::f64::consts::FRAC_1_SQRT_2 * f.radius;
+            let (text, color) = if on == Some(i) { (format!("{} on", drawing.number(i)), READOUT_COLOR) } else { (drawing.number(i).to_string(), NUMBER_COLOR) };
+            label(c, to_out(f.cx + k, f.cy - k), &text, color, style.font_px * 1.4);
+        }
+    }
+}
+
+/// Notes in a dark box with its bottom-left corner at `corner`; tab-separated parts of a
+/// line line up in columns (a table).
+pub fn draw_notes(c: &mut dyn Canvas, notes: &[String], corner: P, font_px: f32) {
+    if notes.is_empty() {
+        return;
+    }
+    let pad = font_px * 0.4;
+    let step = font_px * 1.3;
+    let gap = font_px * 1.2;
+    let rows: Vec<Vec<&str>> = notes.iter().map(|l| l.split('\t').collect()).collect();
+    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(1);
+    let mut widths = vec![0f32; cols];
+    for r in rows.iter().filter(|r| r.len() > 1) {
+        for (k, cell) in r.iter().enumerate() {
+            widths[k] = widths[k].max(c.text_width(cell, font_px));
+        }
+    }
+    let table: f32 = widths.iter().sum::<f32>() + gap * (cols as f32 - 1.0);
+    let single = rows.iter().filter(|r| r.len() == 1).map(|r| c.text_width(r[0], font_px)).fold(0.0, f32::max);
+    let w = table.max(single) + 2.0 * pad;
+    let h = step * rows.len() as f32 + 2.0 * pad - (step - font_px * 1.15);
+    let top = corner.1 - h;
+    c.fill_rect((corner.0, top), (corner.0 + w, corner.1), [0, 0, 0, 190]);
+    for (k, r) in rows.iter().enumerate() {
+        let y = top + pad + k as f32 * step;
+        let mut x = corner.0 + pad;
+        for (j, cell) in r.iter().enumerate() {
+            c.text((x, y), cell, font_px, [255, 255, 255, 255]);
+            x += widths[j].max(if r.len() == 1 { 0.0 } else { widths[j] }) + gap;
+        }
+    }
+}
+
+/// Everything drawn on a view, to burn into a saved copy or a recording.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Markup {
+    pub axes: Vec<FiberAxis>,
+    pub drawing: FiberDrawing,
+    pub measurements: Vec<Measurement>,
+    pub calibration: Option<Calibration>,
+    pub extras: Extras,
+}
+
+impl Markup {
+    pub fn is_empty(&self) -> bool {
+        self.axes.is_empty() && self.measurements.is_empty() && self.extras.region.is_none() && self.extras.reference.is_none()
+            && self.extras.notes.is_empty()
+    }
+}
+
+/// A full-resolution copy of the image with the markup drawn on it.
+pub fn render_markup(img: &RgbImage, m: &Markup) -> RgbImage {
+    let (w, h) = (img.width() as f32, img.height() as f32);
+    let style = Style { line_width: (w / 600.0).max(2.0), font_px: (w / 60.0).round().max(14.0), marker: 3.0 };
+    let mut c = SkiaCanvas::from_image(img);
+    let cal = m.calibration.clone().unwrap_or_else(Calibration::pixels);
+    for meas in &m.measurements {
+        draw_measurement(&mut c, meas, &cal, &identity, 1.0, MEASURE_COLOR, &style);
+    }
+    let area = ((0.0, 0.0), (w, h));
+    if !m.axes.is_empty() {
+        draw_fiber_axes(&mut c, &m.axes, &identity, 1.0, &style, None, m.drawing, area);
+    }
+    draw_extras(&mut c, &m.extras, &m.axes, &m.drawing, &identity, 1.0, &style, area);
+    let font = (w / 1000.0 * READOUT_PX).round().max(18.0);
+    let margin = font * 0.4;
+    draw_fiber_readout(&mut c, &m.axes, &m.drawing, (margin, margin), font);
+    draw_notes(&mut c, &m.extras.notes, (margin, h - margin), font * 0.8);
+    c.to_image()
 }
 
 fn identity(x: f64, y: f64) -> P {
@@ -403,7 +545,7 @@ mod tests {
     fn axis_lines_outside_the_fiber() {
         let img = RgbImage::new(600, 400);
         let mut f = FiberAxis::new(300.0, 200.0, 100.0, 0.0, 2.0, "Panda", 2);
-        f.axis_x = Some(310.0); // pivot a little off the circle's centre
+        f.axis_x = Some(310.0); // pivot a little off the circle's center
         let blue = [0, 0, 255, 255];
         let drawing = FiberDrawing { long_lines: true, slow: blue, ..Default::default() };
         let mut neighbour = FiberAxis::new(520.0, 200.0, 50.0, 45.0, 2.0, "Panda", 2);

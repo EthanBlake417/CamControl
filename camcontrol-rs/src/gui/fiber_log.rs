@@ -119,11 +119,13 @@ impl FiberLog {
                                                     "Mean contrast (%)"];
 
     /// Add one update's fibers (numbered from 1, left to right); returns how many entries were added.
-    pub fn add(&mut self, fibers: &[FiberAxis]) -> usize {
+    /// `reference`: the reference line's angle, the axes logged from it (else from horizontal).
+    pub fn add(&mut self, fibers: &[FiberAxis], reference: Option<f64>) -> usize {
         self.updates += 1;
         let time = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
         for (i, f) in fibers.iter().enumerate() {
-            let (slow, fast) = (signed_angle(f.slow_deg), signed_angle(f.fast_deg()));
+            let r = reference.unwrap_or(0.0);
+            let (slow, fast) = (signed_angle(f.slow_deg - r), signed_angle(f.fast_deg() - r));
             self.entries.push(Entry { time: time.clone(), update: self.updates, fiber: i + 1, slow, fast, quality: f.image_quality });
         }
         fibers.len()
@@ -170,7 +172,8 @@ impl App {
     pub(crate) fn record_fibers(&mut self, id: u64) {
         if self.fiber_log.record {
             let fibers = self.pane(id).fibers.clone();
-            self.fiber_log.add(&fibers);
+            let reference = self.alignment.reference_deg();
+            self.fiber_log.add(&fibers, reference);
         }
     }
 
