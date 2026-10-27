@@ -21,6 +21,9 @@ fn main() {
     for f in &found {
         println!("  ({:.1}, {:.1}) r {:.1}: {} slow {:.2} clear {} quality {:?} coverage {:?} turned {:?} centre brightness {:?}",
                  f.cx, f.cy, f.radius, f.fiber_type, f.slow_deg, f.clear(), f.quality, f.coverage, f.turned_gain, f.centre_brightness);
+        if let Some(q) = &f.image_quality {
+            println!("    image quality: {}", q.details().replace('\n', "; "));
+        }
     }
     // A live update: following the fibers just found (as Update live does).
     let previous: Vec<(f64, f64, f64)> = found.iter().map(|f| (f.cx, f.cy, f.radius)).collect();

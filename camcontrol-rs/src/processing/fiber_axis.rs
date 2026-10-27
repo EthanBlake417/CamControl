@@ -18,6 +18,7 @@ use image::RgbImage;
 use serde::{Deserialize, Serialize};
 
 use crate::imgproc::{self as ip, ImgF, Mask};
+use super::fiber_quality::{fiber_quality, FiberQuality};
 
 pub const CORE_FRACTION: f64 = 0.12;
 pub const EDGE_FRACTION: f64 = 0.92;
@@ -142,6 +143,8 @@ pub struct FiberAxis {
     pub centre_brightness: Option<f64>,
     /// Measured from the apple core (see apple_core): whether it was clear.
     pub core_clear: Option<bool>,
+    /// Contrast, focus, noise and clipping round the fiber, see fiber_quality.
+    pub image_quality: Option<FiberQuality>,
 }
 
 impl FiberAxis {
@@ -166,6 +169,7 @@ impl FiberAxis {
             turned_gain: None,
             centre_brightness: None,
             core_clear: None,
+            image_quality: None,
         }
     }
 
@@ -1999,10 +2003,13 @@ pub fn analyse_tracking(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, p
     std::thread::scope(|s| {
         let jobs: Vec<_> = circles
             .iter()
-            .map(|&(x, y, r)| {
+            .enumerate()
+            .map(|(i, &(x, y, r))| {
+                let others: Vec<(f64, f64, f64)> = circles.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, &c)| c).collect();
                 s.spawn(move || {
                     let mut f = measure_axis(image, x, y, r, method, parts_centre, detection);
                     f.centre_brightness = Some(centre_brightness(image, x, y, r));
+                    f.image_quality = fiber_quality(image, f.cx, f.cy, f.radius, &others);
                     f
                 })
             })

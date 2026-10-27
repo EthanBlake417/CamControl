@@ -47,13 +47,15 @@ pub(crate) fn with_ext(path: PathBuf, allowed: &[&str], default_ext: &str) -> Pa
 
 const FIBER_HEADERS: &[&str] = &["#", "Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity", "Method", "Clear",
                                  "Threshold (noise x)", "Rod outline found", "Centre x (px)", "Centre y (px)", "Axis x (px)",
-                                 "Axis y (px)", "Diameter (px)", "Centre brightness (0-255)", "Image"];
+                                 "Axis y (px)", "Diameter (px)", "Centre brightness (0-255)", "Fiber level (0-255)",
+                                 "Background level (0-255)", "Contrast (%)", "Edge width (px)", "Noise", "SNR", "Clipped (%)",
+                                 "Bright parts (0-255)", "Quality", "Image"];
 
 fn fiber_row(i: usize, f: &FiberAxis, source: &str) -> Vec<Cell> {
     let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
     let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
     let (ax, ay) = f.axis_point();
-    vec![
+    let mut row = vec![
         Cell::Num((i + 1) as f64),
         Cell::Text(f.fiber_type.clone()),
         r2(super::annotate::signed_angle(f.slow_deg)),
@@ -65,8 +67,10 @@ fn fiber_row(i: usize, f: &FiberAxis, source: &str) -> Vec<Cell> {
         f.coverage.map(|c| Cell::Num((c * 1000.0).round() / 1000.0)).unwrap_or(Cell::Empty),
         r1(f.cx), r1(f.cy), r1(ax), r1(ay), r1(2.0 * f.radius),
         f.centre_brightness.map(r1).unwrap_or(Cell::Empty),
-        Cell::Text(source.into()),
-    ]
+    ];
+    row.extend(super::fiber_log::quality_cells(f.image_quality.as_ref(), true));
+    row.push(Cell::Text(source.into()));
+    row
 }
 
 impl App {

@@ -710,11 +710,13 @@ impl App {
                 let a = self.active;
                 let mut select = None;
                 egui::ScrollArea::both().max_height((ui.available_height() - 50.0).max(60.0)).auto_shrink([false, true]).show(ui, |ui| {
-                    egui::Grid::new("fibers").striped(true).num_columns(10).show(ui, |ui| {
-                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "Clarity", "Method", "Centre (px)", "Axis through (px)", "Diameter (px)",
-                                  "Centre brightness"] {
+                    egui::Grid::new("fibers").striped(true).num_columns(12).show(ui, |ui| {
+                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "Clarity", "Contrast", "Quality", "Method", "Centre (px)",
+                                  "Axis through (px)", "Diameter (px)", "Centre brightness"] {
                             let r = ui.strong(h);
-                            if h == "Centre brightness" {
+                            if h == "Contrast" || h == "Quality" {
+                                r.on_hover_text(super::fiber_log::QUALITY_HELP);
+                            } else if h == "Centre brightness" {
                                 r.on_hover_text("Brightness (0-255) of the brightest spot near the fiber's centre, e.g. light in the core.\n\
                                                  With several fibers, the brightest is ringed in green and named in the readout\n\
                                                  by its position counted from the right.");
@@ -732,11 +734,23 @@ impl App {
                                 None => format!("{:.2}", f.elongation),
                             } + if f.clear() { "" } else { " (unclear)" };
                             let (ax, ay) = f.axis_point();
-                            for t in [(i + 1).to_string(), f.fiber_type.clone(), fmt_angle(f.slow_deg), fmt_angle(f.fast_deg()), clarity,
-                                      method_label(&f.method).to_string(), format!("{:.1}, {:.1}", f.cx, f.cy), format!("{ax:.1}, {ay:.1}"),
-                                      format!("{:.1}", 2.0 * f.radius),
-                                      f.centre_brightness.map(|b| format!("{b:.0}{}", if brightest == Some(i) { "  (brightest)" } else { "" })).unwrap_or_default()] {
-                                if ui.selectable_label(sel, t).clicked() {
+                            // Quality cells (with the numbers on hover) right after Clarity, so they show without scrolling.
+                            let q = f.image_quality.as_ref();
+                            let quality = [egui::RichText::new(super::fiber_log::fmt_contrast(q)), super::fiber_log::grade_text(q)];
+                            let plain = |t: String| (egui::RichText::new(t), false);
+                            let cells = [plain((i + 1).to_string()), plain(f.fiber_type.clone()), plain(fmt_angle(f.slow_deg)),
+                                         plain(fmt_angle(f.fast_deg())), plain(clarity)].into_iter()
+                                .chain(quality.map(|t| (t, true)))
+                                .chain([method_label(&f.method).to_string(), format!("{:.1}, {:.1}", f.cx, f.cy), format!("{ax:.1}, {ay:.1}"),
+                                        format!("{:.1}", 2.0 * f.radius),
+                                        f.centre_brightness.map(|b| format!("{b:.0}{}", if brightest == Some(i) { "  (brightest)" } else { "" }))
+                                            .unwrap_or_default()].map(plain));
+                            for (t, hover) in cells {
+                                let mut r = ui.selectable_label(sel, t);
+                                if hover {
+                                    r = r.on_hover_text(super::fiber_log::quality_hover(q));
+                                }
+                                if r.clicked() {
                                     select = Some(i);
                                 }
                             }

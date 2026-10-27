@@ -4,6 +4,7 @@
 pub mod common;
 pub mod count;
 pub mod fiber_axis;
+pub mod fiber_quality;
 pub mod flatfield;
 pub mod fluorescence;
 pub mod focus_stack;

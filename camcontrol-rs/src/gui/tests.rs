@@ -401,7 +401,7 @@ fn records_the_fiber_axes_on_the_video() {
     let axis = crate::processing::fiber_axis::FiberAxis {
         cx: 320.0, cy: 240.0, radius: 120.0, slow_deg: 5.0, elongation: 0.5, fiber_type: "Panda".into(), n_parts: 2,
         method: "rods".into(), axis_x: None, axis_y: None, parts: Vec::new(), part_centres: Vec::new(), threshold: 0.0,
-        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None, centre_brightness: None, core_clear: None,
+        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None, centre_brightness: None, core_clear: None, image_quality: None,
     };
     t.state_mut().active_pane_mut().fibers = vec![axis];
     t.state_mut().request_recording(true);
