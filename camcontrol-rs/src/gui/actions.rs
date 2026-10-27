@@ -686,6 +686,8 @@ impl App {
             p.title.clear();
             p.result = None;
             p.fiber_last = None;
+            p.fibers.clear(); // the last image's fibers: not to be followed into the camera's frames
+            p.fiber_locked = false;
             if let Some(f) = p.camera.as_ref().and_then(|c| c.last_frame()) {
                 p.view.set_image(&ctx, f);
             }
@@ -1323,7 +1325,7 @@ impl App {
             from_camera: self.pane(id).live,
             generation: self.fiber_generation,
             circles,
-            previous: (kind == FiberKind::Live && !self.pane(id).fibers.is_empty())
+            previous: (kind == FiberKind::Live && self.pane(id).fiber_locked && !self.pane(id).fibers.is_empty())
                 .then(|| self.pane(id).fibers.iter().map(|f| (f.cx, f.cy, f.radius)).collect()),
             method: self.fiber.method.clone(),
             parts_centre: self.fiber.parts_centre,
@@ -1394,6 +1396,9 @@ impl App {
         }
         let n = axes.len();
         let unclear = axes.iter().filter(|f| !f.clear()).count();
+        let circles = |a: &[FiberAxis]| a.iter().map(|f| (f.cx, f.cy, f.radius)).collect::<Vec<_>>();
+        let locked = req.kind == FiberKind::Live && fiber_axis::same_fibers(&circles(&self.pane(req.pane).fibers), &circles(&axes));
+        self.pane_mut(req.pane).fiber_locked = locked;
         self.pane_mut(req.pane).fibers = axes;
         self.record_fibers(req.pane);
         if req.kind == FiberKind::Find {

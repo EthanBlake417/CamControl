@@ -1965,6 +1965,21 @@ pub fn analyse(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, method: &s
     analyse_tracking(image, circles, None, method, parts_centre, detection, centre_only)
 }
 
+/// How far a followed fiber may move (centre, radius) between updates, fractions of its radius.
+const TRACK_MOVE: f64 = 0.1;
+const TRACK_SIZE: f64 = 0.05;
+
+/// Whether two sets of circles are the same fibers (each one within the
+/// distance a followed fiber may move). Live updates only start following
+/// fibers once two searches in a row agree, so one wrong search isn't followed.
+pub fn same_fibers(a: &[(f64, f64, f64)], b: &[(f64, f64, f64)]) -> bool {
+    !a.is_empty()
+        && a.len() == b.len()
+        && b.iter().all(|&(x, y, r)| {
+            a.iter().any(|&(ax, ay, ar)| (x - ax).hypot(y - ay) < TRACK_MOVE * ar && (r - ar).abs() < TRACK_SIZE * ar)
+        })
+}
+
 /// The fibers found last time, followed into this image: each circle re-fitted to
 /// its cladding edge. None if any has moved much or can't be fitted (search again).
 pub fn track_fibers(image: &RgbImage, previous: &[(f64, f64, f64)]) -> Option<Vec<(f64, f64, f64)>> {
@@ -1976,7 +1991,7 @@ pub fn track_fibers(image: &RgbImage, previous: &[(f64, f64, f64)]) -> Option<Ve
                 let gray = &gray;
                 s.spawn(move || {
                     let f = fit_cladding_edge(gray, c.0, c.1, c.2, 360)?;
-                    ((f.0 - c.0).hypot(f.1 - c.1) < 0.1 * c.2 && (f.2 - c.2).abs() < 0.05 * c.2).then_some(f)
+                    ((f.0 - c.0).hypot(f.1 - c.1) < TRACK_MOVE * c.2 && (f.2 - c.2).abs() < TRACK_SIZE * c.2).then_some(f)
                 })
             })
             .collect();
@@ -2251,6 +2266,16 @@ mod tests {
         let f = measure_axis(&img, 200.0, 200.0, 150.0, "rods", false, &picky);
         assert!(angle_error(f.slow_deg, 30.0) < 1.0, "{}", f.slow_deg);
         assert!(f.rod_radii.iter().all(|&r| r >= 0.3 * 150.0 - 0.5), "{:?}", f.rod_radii);
+    }
+
+    #[test]
+    fn same_fibers_within_a_small_move() {
+        let a = [(100.0, 100.0, 50.0), (220.0, 100.0, 50.0)];
+        assert!(same_fibers(&a, &[(222.0, 101.0, 51.0), (103.0, 99.0, 49.0)]), "order doesn't matter");
+        assert!(!same_fibers(&a, &[(100.0, 100.0, 50.0)]), "a fiber lost");
+        assert!(!same_fibers(&a, &[(100.0, 100.0, 50.0), (240.0, 100.0, 50.0)]), "one moved a lot");
+        assert!(!same_fibers(&a, &[(100.0, 100.0, 50.0), (220.0, 100.0, 60.0)]), "one a different size");
+        assert!(!same_fibers(&[], &[]), "nothing found isn't a lock");
     }
 
     #[test]

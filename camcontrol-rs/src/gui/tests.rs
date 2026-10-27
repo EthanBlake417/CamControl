@@ -462,6 +462,14 @@ fn live_fiber_axes_and_moving_the_camera() {
     t.state_mut().fiber.live = true;
     wait(&mut t, "live fiber axes", |a| !a.active_pane().fibers.is_empty());
     assert_eq!(t.state().active_pane().fibers[0].fiber_type, "Panda");
+    // Followed only once a second search agrees.
+    wait(&mut t, "the fiber locked on", |a| a.active_pane().fiber_locked);
+    // Fibers from another image aren't followed into the camera's frames.
+    let id = t.state().active;
+    t.state_mut().set_live(id, false);
+    t.state_mut().active_pane_mut().fibers[0].cx += 100.0;
+    t.state_mut().set_live(id, true);
+    assert!(t.state().active_pane().fibers.is_empty() && !t.state().active_pane().fiber_locked);
     // A second view takes the camera; the first keeps its last frame, frozen.
     let first = t.state().active;
     let key = t.state().active_pane().camera.as_ref().unwrap().key.clone();

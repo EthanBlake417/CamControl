@@ -89,6 +89,9 @@ pub struct Pane {
     pub title: String,
     pub result: Option<ResultInfo>,
     pub fiber_last: Option<Instant>,
+    /// Live updates follow the fibers (instead of searching the whole frame)
+    /// only once two searches in a row found the same ones.
+    pub fiber_locked: bool,
     /// The details saved with the open file (exposure, gain, ...): one line, and all of them.
     pub details: Option<(String, String)>,
 }
@@ -110,6 +113,7 @@ impl Pane {
             title: String::new(),
             result: None,
             fiber_last: None,
+            fiber_locked: false,
             details: None,
         }
     }

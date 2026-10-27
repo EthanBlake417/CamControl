@@ -31,6 +31,11 @@ fn main() {
     let followed = camcontrol::processing::fiber_axis::analyse_tracking(&img, None, Some(&previous), method, false, &Detection::default(), centre);
     println!("live update (following): {:.0} ms, angles {:?}", t.elapsed().as_secs_f64() * 1000.0,
              followed.iter().map(|f| format!("{:.2}", f.slow_deg)).collect::<Vec<_>>());
+    let t = Instant::now();
+    for &(x, y, r) in &previous {
+        camcontrol::processing::fiber_quality::fiber_quality(&img, x, y, r, &[]);
+    }
+    println!("image quality alone (one after another): {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
     if let Some(out) = std::env::var_os("FIBER_OUT") {
         camcontrol::gui::annotate::render_fiber_axes(&img, &found, camcontrol::gui::annotate::FiberDrawing { show_parts: true, ..Default::default() }).save(out).unwrap();
     }
