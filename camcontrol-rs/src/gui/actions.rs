@@ -1303,7 +1303,7 @@ impl App {
         self.pane_mut(req.pane).fiber_locked = locked;
         self.pane_mut(req.pane).fibers = axes;
         self.record_fibers(req.pane);
-        self.alignment_reading(req.pane);
+        self.alignment_reading(req.pane, Some(&req.image));
         self.alignment_trend(req.pane);
         if req.kind == FiberKind::Find {
             if n > 0 {

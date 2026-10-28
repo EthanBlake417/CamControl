@@ -99,6 +99,14 @@ pub struct Saved {
     /// The next fiber's number in the Alignment table, and counting up (else down).
     pub align_next: i64,
     pub align_ascending: bool,
+    /// Alignment: take a photo with each take; where the table (and photos) are saved (empty: the output folder) and as what.
+    pub align_photos: bool,
+    pub align_folder: String,
+    pub align_name: String,
+    /// Fiber count: where its image and table are saved (empty: the output folder), as what, and the image format (0 PNG, 1 TIFF).
+    pub count_folder: String,
+    pub count_name: String,
+    pub count_format: usize,
     /// Fiber count panel: the top fiber's number, and counting up from it.
     pub count_first: i64,
     pub count_ascending: bool,
@@ -157,6 +165,12 @@ impl Default for Saved {
             align_reference: None,
             align_next: 1,
             align_ascending: true,
+            align_photos: false,
+            align_folder: String::new(),
+            align_name: String::new(),
+            count_folder: String::new(),
+            count_name: String::new(),
+            count_format: 0,
             count_first: 1,
             count_ascending: true,
             count_show_axes: false,

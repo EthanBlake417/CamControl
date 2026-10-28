@@ -868,7 +868,8 @@ impl App {
             let crosshair = self.saved.crosshair.then_some(&self.saved.crosshair_style);
             let active = self.active;
             let (cal, fiber_drawing) = (&self.calibration, self.fiber_drawing());
-            let idx = self.panes.iter().position(|p| p.id == *id).unwrap();
+            // Its header's × may just have removed this view.
+            let Some(idx) = self.panes.iter().position(|p| p.id == *id) else { continue };
             let pane = &mut self.panes[idx];
             let overlays = Overlays {
                 grid,

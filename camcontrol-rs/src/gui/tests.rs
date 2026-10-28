@@ -236,10 +236,15 @@ fn alignment_readings_reference_and_region() {
     h.state_mut().view_event(id, super::view::ViewEvent::Drawn("rectangle".into(), vec![(0.0, 0.0), (640.0, 340.0)]));
     wait(&mut h, "fibers in the region", |a| a.active_pane().fibers.len() == 2);
     assert!(h.state().active_pane().fibers.iter().all(|f| f.cx < 640.0));
+    // A photo with each take, labelled with the fiber's number; saved with the table.
+    h.state_mut().saved.align_photos = true;
+    h.state_mut().saved.align_name = "run".into();
+    h.state_mut().take_readings();
+    let last = h.state().alignment.rows.last().unwrap().clone();
+    assert!(last.photo.is_some(), "{last:?}");
     h.state_mut().save_alignment(true);
-    let saved: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| n.starts_with("alignment_")).collect();
-    assert!(saved.iter().any(|n| n.ends_with(".png")) && saved.iter().any(|n| n.ends_with(".csv")), "{saved:?}");
+    assert!(dir.join("run-001.csv").is_file());
+    assert!(dir.join(format!("run-001_fiber{}.png", last.fiber)).is_file());
 }
 
 /// Space takes n readings of the live view's fibers (the next n updates).
@@ -283,13 +288,28 @@ fn fiber_count_numbers_and_saves() {
     assert!(lines[0].starts_with("17: ") && lines[2].starts_with("15: "), "{lines:?}");
     assert_eq!(lines.len(), 3, "no 'is on' line in the readout: {lines:?}");
     assert_eq!(crate::processing::fiber_axis::brightest_centre(&h.state().active_pane().fibers).map(|b| b.0), Some(1));
+    h.state_mut().saved.count_name = "groove".into();
+    h.state_mut().saved.count_format = 1; // TIFF
     h.state_mut().save_fiber_count();
-    let json = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path())
-        .find(|p| p.extension().is_some_and(|e| e == "json") && p.file_name().unwrap().to_string_lossy().starts_with("fibers_"))
-        .expect("details saved");
-    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&json).unwrap()).unwrap();
-    assert_eq!((v["count"].as_u64(), v["on"].as_i64()), (Some(3), Some(16)));
-    assert!(json.with_extension("png").is_file());
+    let csv = std::fs::read_to_string(dir.join("groove-001.csv")).expect("the table");
+    assert_eq!(csv.lines().count(), 4, "{csv}");
+    assert!(csv.lines().any(|l| l.starts_with("16,") && l.contains(",on,")), "{csv}");
+    let meta = crate::capture::read_image_details(&dir.join("groove-001.tif")).expect("the image, details inside");
+    assert_eq!((meta["fiber_count"]["count"].as_u64(), meta["fiber_count"]["on"].as_i64()), (Some(3), Some(16)));
+}
+
+/// Closing one of several views with its × closes just that view (it used to crash the app).
+#[test]
+fn closing_a_view_with_its_x() {
+    let (mut h, _dir) = harness("closeview");
+    h.state_mut().add_view().unwrap();
+    h.state_mut().set_layout("grid", true);
+    h.run_ok();
+    assert_eq!(h.state().panes.len(), 2);
+    h.query_all_by_label("×").next().expect("a view's ×").click();
+    h.run_ok();
+    h.run_ok();
+    assert_eq!(h.state().panes.len(), 1);
 }
 
 #[test]

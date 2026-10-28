@@ -415,6 +415,8 @@ pub struct Extras {
     pub reference: Option<((f64, f64), (f64, f64))>,
     pub numbers: bool,
     pub notes: Vec<String>,
+    /// Text beside particular fibers (center x, y, radius), as the fiber numbers are.
+    pub labels: Vec<((f64, f64, f64), String)>,
     /// How the region and the reference line are drawn: (color, width on screen, line style); None: the standard look.
     pub region_look: Option<(Color, f32, Dash)>,
     pub reference_look: Option<(Color, f32, Dash)>,
@@ -459,20 +461,26 @@ pub fn draw_extras(c: &mut dyn Canvas, extras: &Extras, axes: &[FiberAxis], draw
         let (color, width, dash) = extras.reference_look();
         c.line(p, q, color, width * w / 2.0, dash);
     }
+    let font = style.font_px * 1.4;
     if extras.numbers {
         let on = brightest_centre(axes).map(|b| b.0);
-        let font = style.font_px * 1.4;
         for (i, f) in axes.iter().enumerate() {
             let (text, color) = if on == Some(i) { (format!("{} on", drawing.number(i)), READOUT_COLOR) } else { (drawing.number(i).to_string(), NUMBER_COLOR) };
-            // Starting at the middle of the fiber's right edge, centered on it.
-            let edge = to_out(f.cx + f.radius, f.cy);
-            let pad = font * 0.25;
-            let (w, h) = (c.text_width(&text, font) + 2.0 * pad, font * 1.2 + 2.0 * pad);
-            let min = (edge.0 + font * 0.15, edge.1 - h / 2.0);
-            c.fill_rect(min, (min.0 + w, min.1 + h), [0, 0, 0, 170]);
-            c.text((min.0 + pad, min.1 + pad + font * 0.1), &text, font, color);
+            edge_label(c, to_out(f.cx + f.radius, f.cy), &text, color, font);
         }
     }
+    for ((x, y, r), text) in &extras.labels {
+        edge_label(c, to_out(x + r, *y), text, NUMBER_COLOR, font);
+    }
+}
+
+/// Text in a dark box starting at `edge` (the middle of a fiber's right edge), centered on it.
+fn edge_label(c: &mut dyn Canvas, edge: P, text: &str, color: Color, font: f32) {
+    let pad = font * 0.25;
+    let (w, h) = (c.text_width(text, font) + 2.0 * pad, font * 1.2 + 2.0 * pad);
+    let min = (edge.0 + font * 0.15, edge.1 - h / 2.0);
+    c.fill_rect(min, (min.0 + w, min.1 + h), [0, 0, 0, 170]);
+    c.text((min.0 + pad, min.1 + pad + font * 0.1), text, font, color);
 }
 
 /// Notes in a dark box with its bottom-left corner at `corner`; tab-separated parts of a
