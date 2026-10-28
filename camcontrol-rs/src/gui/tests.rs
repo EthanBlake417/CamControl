@@ -215,28 +215,28 @@ fn alignment_readings_reference_and_region() {
     h.state_mut().view_event(id, super::view::ViewEvent::Drawn("line".into(), vec![(0.0, 300.0), (dx, 300.0 + dy)]));
     assert!((h.state().alignment.reference_deg().unwrap() - 30.0).abs() < 1e-9);
     // Axes at 0° and 90°, the line at 30°: perpendicular is 120°, the 90° axis is 30° clockwise of it.
-    // Aligning (the Alignment panel open): just the fiber measured, by its Fiber # (the middle one).
+    // Aligning (the Alignment panel open): each fiber, numbered on from the Fiber #.
     h.state_mut().panels.set_open(PanelId::Alignment, true);
     let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
-    assert_eq!(lines, vec!["1: fast -30.00°"]);
+    assert_eq!(lines, vec!["1: fast -30.00°", "2: fast -30.00°", "3: fast -30.00°"]);
     h.state_mut().alignment.next_number = 5;
     let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
-    assert_eq!(lines, vec!["5: fast -30.00°"]);
+    assert_eq!(lines, vec!["5: fast -30.00°", "6: fast -30.00°", "7: fast -30.00°"]);
     h.state_mut().alignment.next_number = 1;
     // Its ends dragged: the line moves.
     h.state_mut().view_event(id, super::view::ViewEvent::ReferenceMoved((0.0, 300.0), (100.0, 300.0)));
     assert!(h.state().alignment.reference_deg().unwrap().abs() < 1e-9);
     h.state_mut().alignment.reference = Some(super::alignment::rotate_line((0.0, 300.0), (100.0, 300.0), 30.0));
-    // One fiber per take (the middle one), numbered from the chosen number up.
+    // Every fiber in view, numbered on from the chosen number; the next take carries on.
     h.state_mut().alignment.next_number = 7;
     h.state_mut().take_readings();
     h.state_mut().take_readings();
     let rows = h.state().alignment.rows.clone();
-    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows.len(), 6, "{rows:?}");
     for r in &rows {
         assert!(r.n == 1 && r.std == 0.0 && (r.mean + 30.0).abs() < 0.5 && r.reference.is_some() && r.axis == "fast", "off perpendicular: {r:?}");
     }
-    assert_eq!(rows.iter().map(|r| r.fiber).collect::<Vec<_>>(), vec![7, 8]);
+    assert_eq!(rows.iter().map(|r| r.fiber).collect::<Vec<_>>(), vec![7, 8, 9, 10, 11, 12]);
     // Only the two fibers whose centers are in the left 640 px.
     h.state_mut().alignment.drawing = Some(DrawTarget::RegionRect);
     h.state_mut().view_event(id, super::view::ViewEvent::Drawn("rectangle".into(), vec![(0.0, 0.0), (640.0, 340.0)]));
@@ -246,11 +246,12 @@ fn alignment_readings_reference_and_region() {
     h.state_mut().saved.align_photos = true;
     h.state_mut().saved.align_name = "run".into();
     h.state_mut().take_readings();
-    let last = h.state().alignment.rows.last().unwrap().clone();
-    assert!(last.photo.is_some(), "{last:?}");
+    let rows = h.state().alignment.rows.clone();
+    let (a, b) = (&rows[rows.len() - 2], &rows[rows.len() - 1]);
+    assert!(a.photo.is_some() && a.photo == b.photo, "one photo for the take: {a:?} {b:?}");
     h.state_mut().save_alignment(true);
     assert!(dir.join("run-001.csv").is_file());
-    assert!(dir.join(format!("run-001_fiber{}.png", last.fiber)).is_file());
+    assert!(dir.join(format!("run-001_fiber{}-{}.png", a.fiber, b.fiber)).is_file());
 }
 
 /// Space takes n readings of the live view's fibers (the next n updates).

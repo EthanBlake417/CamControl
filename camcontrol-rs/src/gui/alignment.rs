@@ -31,18 +31,19 @@ pub enum DrawTarget {
     Reference,
 }
 
-/// Readings being taken of one fiber (the one nearest the middle), one per update.
+/// Readings being taken of every fiber in view, one set per update.
 #[derive(Clone, Debug)]
 pub struct Collecting {
     pub pane: u64,
     pub wanted: usize,
-    pub readings: Vec<f64>,
-    /// Which axis the readings are of ("fast" / "slow"), as last measured.
-    pub axis: &'static str,
-    /// With a photo: the measured frames added up (width, height, sum), and the fiber last measured.
+    /// Per update: each fiber's angle (fibers in their order: top to bottom, then left to right).
+    pub readings: Vec<Vec<f64>>,
+    /// Which axis each fiber's readings are of ("fast" / "slow"), as last measured.
+    pub axes: Vec<&'static str>,
+    /// With a photo: the measured frames added up (width, height, sum), and the fibers last measured.
     pub sum: Option<(u32, u32, Vec<f32>)>,
     pub frames: usize,
-    pub fiber: Option<FiberAxis>,
+    pub fibers: Vec<FiberAxis>,
 }
 
 /// A take's photo (not compared or printed whole).
@@ -184,14 +185,25 @@ impl Alignment {
         self.reference.map(|(a, b)| line_angle(a, b))
     }
 
-    /// A row for the fiber from the readings taken, numbered next_number (which then counts
-    /// on, up or down, for the next fiber).
-    pub fn finish(&mut self, readings: &[f64], axis: &'static str, reference: Option<f64>) -> &Row {
+    /// The number the i-th fiber of a take gets (counting on from next_number, up or down).
+    pub fn number(&self, i: usize) -> i64 {
+        if self.ascending { self.next_number + i as i64 } else { self.next_number - i as i64 }
+    }
+
+    /// A row for each fiber from the readings taken (per update, each fiber's angle), numbered
+    /// on from next_number; next_number then carries on past them. Returns the numbers given.
+    pub fn finish(&mut self, readings: &[Vec<f64>], axes: &[&'static str], reference: Option<f64>) -> Vec<i64> {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
-        let (mean, std) = axial_stats(readings);
-        self.rows.push(Row { time, fiber: self.next_number, n: readings.len(), mean: signed_angle(mean), std, reference, axis, photo: None });
-        self.next_number += if self.ascending { 1 } else { -1 };
-        self.rows.last().unwrap()
+        let fibers = readings.iter().map(|r| r.len()).max().unwrap_or(0);
+        let numbers: Vec<i64> = (0..fibers).map(|i| self.number(i)).collect();
+        for (i, &fiber) in numbers.iter().enumerate() {
+            let angles: Vec<f64> = readings.iter().filter_map(|r| r.get(i).copied()).collect();
+            let (mean, std) = axial_stats(&angles);
+            let axis = axes.get(i).copied().unwrap_or("fast");
+            self.rows.push(Row { time: time.clone(), fiber, n: angles.len(), mean: signed_angle(mean), std, reference, axis, photo: None });
+        }
+        self.next_number = self.number(fibers);
+        numbers
     }
 
     pub fn sheet(&self) -> Sheet {
@@ -231,8 +243,8 @@ impl App {
             return;
         }
         let live = p.live;
-        self.alignment.collecting = Some(Collecting { pane: id, wanted: if live { self.alignment.n } else { 1 }, readings: Vec::new(), axis: "fast",
-                                                      sum: None, frames: 0, fiber: None });
+        self.alignment.collecting = Some(Collecting { pane: id, wanted: if live { self.alignment.n } else { 1 }, readings: Vec::new(), axes: Vec::new(),
+                                                      sum: None, frames: 0, fibers: Vec::new() });
         self.alignment.status = "Taking readings...".into();
         if !live {
             if self.pane(id).fibers.is_empty() {
@@ -244,25 +256,26 @@ impl App {
         }
     }
 
-    /// A new measurement of a view's fibers (in `image`): one reading, if readings are being taken there.
+    /// A new measurement of a view's fibers (in `image`): one reading of each, if readings are being taken there.
     pub(crate) fn alignment_reading(&mut self, pane: u64, image: Option<&Arc<RgbImage>>) {
         if !self.collecting_on(pane) {
             return;
         }
         let drawing = self.fiber_drawing();
-        let Some(f) = self.measured_fiber(pane) else {
+        let fibers = self.pane(pane).fibers.clone();
+        if fibers.is_empty() {
             if !self.pane(pane).live {
                 self.alignment.collecting = None;
                 self.alignment.status = "No fiber found.".into();
             }
             return;
-        };
-        let angle = drawing.off_perpendicular(&f).unwrap_or_else(|| drawing.shown(f.fast_deg()));
-        let axis = drawing.perpendicular_axis(&f).unwrap_or("fast");
+        }
+        let angles: Vec<f64> = fibers.iter().map(|f| drawing.off_perpendicular(f).unwrap_or_else(|| drawing.shown(f.fast_deg()))).collect();
+        let axes: Vec<&'static str> = fibers.iter().map(|f| drawing.perpendicular_axis(f).unwrap_or("fast")).collect();
         let photos = self.saved.align_photos;
         let c = self.alignment.collecting.as_mut().unwrap();
-        c.readings.push(angle);
-        c.axis = axis;
+        c.readings.push(angles);
+        c.axes = axes;
         if let (true, Some(img)) = (photos, image) {
             let (w, h) = img.dimensions();
             let sum = c.sum.get_or_insert_with(|| (w, h, vec![0.0; (w * h * 3) as usize]));
@@ -273,30 +286,35 @@ impl App {
                 c.frames += 1;
             }
         }
-        c.fiber = Some(f);
+        c.fibers = fibers;
         let (got, wanted) = (c.readings.len(), c.wanted);
         if got < wanted {
             self.alignment.status = format!("Taking readings: {got} of {wanted}");
             return;
         }
         let done = self.alignment.collecting.take().unwrap();
-        let number = self.alignment.next_number;
         let photo = done.sum.filter(|_| done.frames > 0).map(|(w, h, sum)| {
             let k = 1.0 / done.frames as f32;
             let avg = RgbImage::from_raw(w, h, sum.iter().map(|v| (v * k).round().clamp(0.0, 255.0) as u8).collect()).unwrap();
             let mut markup = self.markup_of(pane, Vec::new());
-            if let Some(f) = &done.fiber {
-                markup.extras.labels.push(((f.cx, f.cy, f.radius), number.to_string()));
-            }
+            markup.extras.labels = done.fibers.iter().enumerate()
+                .map(|(i, f)| ((f.cx, f.cy, f.radius), self.alignment.number(i).to_string())).collect();
             Photo(Arc::new(render_markup(&avg, &markup)))
         });
-        let row_photo = photo.is_some();
-        let fiber = self.alignment.finish(&done.readings, done.axis, drawing.reference).fiber;
-        if let Some(p) = photo {
-            self.alignment.rows.last_mut().unwrap().photo = Some(p);
+        let numbers = self.alignment.finish(&done.readings, &done.axes, drawing.reference);
+        if let Some(p) = &photo {
+            let n = self.alignment.rows.len();
+            for r in &mut self.alignment.rows[n - numbers.len()..] {
+                r.photo = Some(p.clone());
+            }
         }
-        self.alignment.status = format!("Added fiber {fiber} ({got} reading{}{}).", if got == 1 { "" } else { "s" },
-                                        if row_photo { ", with a photo" } else { "" });
+        let which = match (numbers.first(), numbers.last()) {
+            (Some(a), Some(b)) if a != b => format!("fibers {a} to {b}"),
+            (Some(a), _) => format!("fiber {a}"),
+            _ => "nothing".into(),
+        };
+        self.alignment.status = format!("Added {which} ({got} reading{}{}).", if got == 1 { "" } else { "s" },
+                                        if photo.is_some() { ", with a photo" } else { "" });
         if !self.panels.is_open(PanelId::Alignment) {
             self.panels.set_open(PanelId::Alignment, true);
         }
@@ -438,14 +456,24 @@ impl App {
         }
         let stem = csv.file_stem().unwrap_or_default().to_string_lossy().to_string();
         let mut saved = 0;
-        for r in self.alignment.rows.iter().filter(|r| r.photo.is_some()) {
-            let mut path = folder.join(format!("{stem}_fiber{}.png", r.fiber));
+        // One photo per take (its rows share it), named after the fibers in it.
+        let mut takes: Vec<(Photo, i64, i64)> = Vec::new();
+        for r in &self.alignment.rows {
+            let Some(p) = &r.photo else { continue };
+            match takes.last_mut() {
+                Some(t) if t.0 == *p => t.2 = r.fiber,
+                _ => takes.push((p.clone(), r.fiber, r.fiber)),
+            }
+        }
+        for (photo, first, last) in takes {
+            let which = if first == last { format!("{first}") } else { format!("{first}-{last}") };
+            let mut path = folder.join(format!("{stem}_fiber{which}.png"));
             let mut k = 2;
             while path.exists() {
-                path = folder.join(format!("{stem}_fiber{}_{k}.png", r.fiber));
+                path = folder.join(format!("{stem}_fiber{which}_{k}.png"));
                 k += 1;
             }
-            if let Err(e) = r.photo.as_ref().unwrap().0.save(&path) {
+            if let Err(e) = photo.0.save(&path) {
                 self.warn("Save with photos", format!("Save failed: {e}"));
                 return;
             }
@@ -503,7 +531,7 @@ impl App {
                 ui.label("Fiber #");
                 ui.horizontal(|ui| {
                     ui.add_enabled(!busy, egui::DragValue::new(&mut self.alignment.next_number).range(-99999..=99999))
-                        .on_hover_text("The number the next fiber measured gets; it then counts up or down by one for each take.");
+                        .on_hover_text("The number the first fiber (top, or left) measured gets; the others, and the next take, count on up or down.");
                     ui.radio_value(&mut self.alignment.ascending, true, "Up");
                     ui.radio_value(&mut self.alignment.ascending, false, "Down");
                 });
@@ -621,23 +649,30 @@ impl App {
                 ui.label(RichText::new("No readings yet: press Take readings (Space).").weak());
                 return;
             }
-            egui::ScrollArea::both().id_salt("align_rows").max_height(ui.available_height().max(120.0) - 30.0)
+            // The headings stay put above the rows, which scroll (column widths shared).
+            const WIDTHS: [f32; 6] = [46.0, 32.0, 56.0, 50.0, 22.0, 54.0];
+            let cell = |ui: &mut egui::Ui, w: f32, text: RichText| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.add_sized([w, 18.0], egui::Label::new(text).truncate());
+            };
+            ui.horizontal(|ui| {
+                for (h, w) in ["Fiber #", "Axis", "Mean", "Std dev", "n", "Time"].into_iter().zip(WIDTHS) {
+                    cell(ui, w, RichText::new(h).strong());
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical().id_salt("align_rows").max_height(ui.available_height().max(100.0) - 30.0)
                 .stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
-                egui::Grid::new("align_grid").striped(true).num_columns(6).spacing(egui::vec2(12.0, 4.0)).show(ui, |ui| {
-                    for h in ["Fiber #", "Axis", "Mean", "Std dev", "n", "Time"] {
-                        ui.strong(h);
-                    }
-                    ui.end_row();
-                    for r in &self.alignment.rows {
-                        ui.label(RichText::new(r.fiber.to_string()).strong());
-                        ui.label(r.axis);
-                        ui.label(RichText::new(format!("{:+.2}°", r.mean)).strong());
-                        ui.label(format!("{:.2}°", r.std));
-                        ui.label(r.n.to_string());
-                        ui.label(RichText::new(&r.time).weak());
-                        ui.end_row();
-                    }
-                });
+                for r in &self.alignment.rows {
+                    ui.horizontal(|ui| {
+                        let texts = [RichText::new(r.fiber.to_string()).strong(), RichText::new(r.axis),
+                                     RichText::new(format!("{:+.2}°", r.mean)).strong(), RichText::new(format!("{:.2}°", r.std)),
+                                     RichText::new(r.n.to_string()), RichText::new(&r.time).weak()];
+                        for (t, w) in texts.into_iter().zip(WIDTHS) {
+                            cell(ui, w, t);
+                        }
+                    });
+                }
             });
             ui.add_space(4.0);
             output_rows(ui, "align_output", &mut self.saved.align_folder, &mut self.saved.align_name, &self.saved.folder);
@@ -992,9 +1027,8 @@ mod tests {
     #[test]
     fn rows_from_readings() {
         let mut a = Alignment::new(3, None, None, 17, false);
-        a.finish(&[44.0, 46.0, 45.0], "slow", Some(30.0));
-        a.finish(&[89.0, -89.0, 90.0], "fast", Some(30.0));
-        assert_eq!((a.rows[0].fiber, a.rows[1].fiber, a.next_number), (17, 16, 15), "counting down from 17");
+        let numbers = a.finish(&[vec![44.0, 89.0], vec![46.0, -89.0], vec![45.0, 90.0]], &["slow", "fast"], Some(30.0));
+        assert_eq!((numbers, a.next_number), (vec![17, 16], 15), "two fibers, counting down from 17; the next take goes on from 15");
         assert!((a.rows[0].mean - 45.0).abs() < 1e-9 && (a.rows[0].std - 1.0).abs() < 1e-9);
         assert!((a.rows[1].mean.abs() - 90.0).abs() < 1e-6, "wraps at 90: {}", a.rows[1].mean);
         assert_eq!(a.rows[0].reference, Some(30.0));

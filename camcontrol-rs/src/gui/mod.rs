@@ -273,8 +273,9 @@ impl App {
             fast: self.saved.fiber_lines.fast(),
             slow_bands: self.saved.fiber_lines.slow_by_angle.bands(self.saved.fiber_lines.slow_opacity),
             fast_bands: self.saved.fiber_lines.fast_by_angle.bands(self.saved.fiber_lines.fast_opacity),
-            first_number: self.saved.count_first,
-            ascending: self.saved.count_ascending,
+            // Aligning: numbered from the Alignment panel's Fiber #, else the Fiber Count panel's.
+            first_number: if self.panels.is_open(PanelId::Alignment) { self.alignment.next_number } else { self.saved.count_first },
+            ascending: if self.panels.is_open(PanelId::Alignment) { self.alignment.ascending } else { self.saved.count_ascending },
             reference: self.alignment.reference_deg(),
             readout_px: self.saved.fiber_lines.readout_size as f32,
             readout_mono: self.saved.fiber_lines.readout_font == "mono",
@@ -282,9 +283,7 @@ impl App {
             parts_fill: self.saved.fiber_lines.parts_fill(),
             parts_outline: self.saved.fiber_lines.parts_outline(),
             numbers_only: self.counting_clean(),
-            // Aligning: just the fiber being measured, with the number its readings will get.
-            only: self.panels.is_open(PanelId::Alignment)
-                .then(|| self.measured_index(self.active).map(|i| (i, self.alignment.next_number))).flatten(),
+            only: None,
         }
     }
 
