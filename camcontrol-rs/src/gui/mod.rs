@@ -280,6 +280,7 @@ impl App {
             readout_px: self.saved.fiber_lines.readout_size as f32,
             readout_mono: self.saved.fiber_lines.readout_font == "mono",
             readout_bold: self.saved.fiber_lines.readout_bold,
+            readout_edge: self.saved.fiber_lines.readout_edge,
             parts_fill: self.saved.fiber_lines.parts_fill(),
             parts_outline: self.saved.fiber_lines.parts_outline(),
             numbers_only: self.counting_clean(),

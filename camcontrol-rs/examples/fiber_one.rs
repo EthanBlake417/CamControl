@@ -21,6 +21,7 @@ fn main() {
     for f in &found {
         println!("  ({:.1}, {:.1}) r {:.1}: {} slow {:.2} clear {} quality {:?} coverage {:?} turned {:?} center brightness {:?}",
                  f.cx, f.cy, f.radius, f.fiber_type, f.slow_deg, f.clear(), f.quality, f.coverage, f.turned_gain, f.centre_brightness);
+        println!("    rod edge {:?}", f.rod_edge);
         if let Some(q) = &f.image_quality {
             println!("    image quality: {}", q.details().replace('\n', "; "));
         }

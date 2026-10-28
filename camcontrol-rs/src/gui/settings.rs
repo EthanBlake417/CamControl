@@ -101,6 +101,8 @@ pub struct Saved {
     pub align_ascending: bool,
     /// Alignment: take a photo with each take; where the table (and photos) are saved (empty: the output folder) and as what.
     pub align_photos: bool,
+    /// Alignment: save each fiber's Fiber Axis details with the table.
+    pub align_details: bool,
     pub align_folder: String,
     pub align_name: String,
     /// Fiber count: where its image and table are saved (empty: the output folder), as what, and the image format (0 PNG, 1 TIFF).
@@ -112,6 +114,8 @@ pub struct Saved {
     pub count_ascending: bool,
     /// Fiber count panel open: still show the axis lines, angles, region and reference line.
     pub count_show_axes: bool,
+    /// Fiber count panel: say which fiber is on (the brightest center).
+    pub count_find_on: bool,
     /// The layout "Several views" goes back to.
     pub multi_layout: String,
     /// The tab last shown in the grid, crosshair and fiber axes window.
@@ -166,6 +170,7 @@ impl Default for Saved {
             align_next: 1,
             align_ascending: true,
             align_photos: false,
+            align_details: false,
             align_folder: String::new(),
             align_name: String::new(),
             count_folder: String::new(),
@@ -174,6 +179,7 @@ impl Default for Saved {
             count_first: 1,
             count_ascending: true,
             count_show_axes: false,
+            count_find_on: true,
             multi_layout: "grid".into(),
             overlay_tab: "grid".into(),
             histogram_log: false,

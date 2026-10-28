@@ -965,6 +965,8 @@ impl App {
             ViewEvent::Activated => self.set_active(id),
             ViewEvent::Drawn(k, points) if self.alignment.drawing.is_some() => self.alignment_drawn(&k, &points),
             ViewEvent::ReferenceMoved(a, b) => self.alignment.reference = Some((a, b)),
+            ViewEvent::RegionEdited(r) => self.alignment.region = Some(r),
+            ViewEvent::RegionDone => self.region_changed(),
             ViewEvent::Drawn(k, points) if self.picking_rod => {
                 self.picking_rod = false;
                 self.tool = None;

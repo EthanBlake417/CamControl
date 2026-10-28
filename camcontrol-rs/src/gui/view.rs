@@ -22,7 +22,7 @@ use super::style::{CrosshairStyle, GridStyle};
 use crate::calibration::Calibration;
 use crate::draw::{self, Canvas, Color, Dash, P};
 use crate::measure::{kind, Measurement, Point};
-use crate::processing::fiber_axis::FiberAxis;
+use crate::processing::fiber_axis::{FiberAxis, Region};
 
 const TILE: usize = 2048; // every GPU egui runs on takes 2048-pixel textures
 const ZOOM_STEP: f32 = 1.25;
@@ -175,7 +175,27 @@ struct Tile {
     options: TextureOptions,
 }
 
-/// How close (screen px) to a reference line's end a press grabs it.
+/// What a drag on the image holds (with no tool in use).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Grab {
+    /// A reference line's end (0 or 1).
+    RefEnd(usize),
+    /// A region rectangle's corner (top-left, top-right, bottom-right, bottom-left).
+    Corner(usize),
+    /// A region circle's outline.
+    Radius,
+    /// The whole region: where the drag started (image px) and the region then.
+    Move(Point, Region),
+}
+
+/// Distance from p to the segment a-b.
+fn segment_distance(p: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let ab = b - a;
+    let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0.0, 1.0);
+    (p - (a + ab * t)).length()
+}
+
+/// How close (screen px) to a reference line's end (or a region's corner or edge) a press grabs it.
 const GRAB_PX: f32 = 9.0;
 
 /// What the view should draw on top of the image.
@@ -198,6 +218,9 @@ pub enum ViewEvent {
     Drawn(String, Vec<Point>),
     /// The reference line's ends after one was dragged.
     ReferenceMoved(Point, Point),
+    /// The region of interest while a corner, its outline or itself is dragged; then done (let go).
+    RegionEdited(Region),
+    RegionDone,
     ToolExit,
 }
 
@@ -221,8 +244,8 @@ pub struct ImageView {
     points: Vec<Point>,
     mouse: Option<Point>,
     press_pos: Option<Pos2>,
-    /// Which end of the reference line is being dragged.
-    grab: Option<usize>,
+    /// What's being dragged: a reference line end, or the region of interest.
+    grab: Option<Grab>,
     /// Image pixel under the mouse and its RGB.
     pub hover: Option<(u32, u32, [u8; 3])>,
     /// Zoom or position changed by the user this frame (for Link views).
@@ -464,29 +487,86 @@ impl ImageView {
             }
         }
         let clicking = self.tool.is_some();
-        // The reference line's ends can be dragged (when no tool is in use).
-        if let Some((a, b)) = overlays.extras.reference.filter(|_| !clicking) {
-            let to_scr = |p: Point| rect.center() + (Pos2::new(p.0 as f32, p.1 as f32) - self.center) * self.zoom;
-            if let Some(cursor) = over {
-                let near = [a, b].iter().position(|&p| (to_scr(p) - cursor).length() <= GRAB_PX);
-                if near.is_some() || self.grab.is_some() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        // When no tool is in use: the reference line's ends, and the region of interest's corners
+        // (resize), its edge (move), or a circle's outline (resize) and middle (move) can be dragged.
+        if !clicking {
+            let (c0, z) = (self.center, self.zoom);
+            let to_scr = move |p: Point| rect.center() + (Pos2::new(p.0 as f32, p.1 as f32) - c0) * z;
+            let (reference, region) = (overlays.extras.reference, overlays.extras.region);
+            if let Some(cursor) = over.filter(|_| self.grab.is_none()) {
+                let mut hit: Option<(Grab, egui::CursorIcon)> = None;
+                if let Some((a, b)) = reference {
+                    if let Some(k) = [a, b].iter().position(|&p| (to_scr(p) - cursor).length() <= GRAB_PX) {
+                        hit = Some((Grab::RefEnd(k), egui::CursorIcon::Grab));
+                    }
+                }
+                match region.filter(|_| hit.is_none()) {
+                    Some(r @ Region::Rect { x0, y0, x1, y1 }) => {
+                        let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(to_scr);
+                        if let Some(k) = corners.iter().position(|c| (*c - cursor).length() <= GRAB_PX) {
+                            let icon = if k % 2 == 0 { egui::CursorIcon::ResizeNwSe } else { egui::CursorIcon::ResizeNeSw };
+                            hit = Some((Grab::Corner(k), icon));
+                        } else if (0..4).any(|k| segment_distance(cursor, corners[k], corners[(k + 1) % 4]) <= GRAB_PX) {
+                            hit = Some((Grab::Move(self.to_image(cursor), r), egui::CursorIcon::Move));
+                        }
+                    }
+                    Some(r @ Region::Circle { cx, cy, r: radius }) => {
+                        let d = (cursor - to_scr((cx, cy))).length();
+                        if (d - radius as f32 * z).abs() <= GRAB_PX {
+                            hit = Some((Grab::Radius, egui::CursorIcon::ResizeHorizontal));
+                        } else if d <= 2.0 * GRAB_PX {
+                            hit = Some((Grab::Move(self.to_image(cursor), r), egui::CursorIcon::Move));
+                        }
+                    }
+                    None => {}
+                }
+                if let Some((_, icon)) = hit {
+                    ui.ctx().set_cursor_icon(icon);
                 }
                 if pressed[0] {
-                    self.grab = near;
+                    self.grab = hit.map(|h| h.0);
                 }
             }
-            if let (Some(k), Some(pos)) = (self.grab, hover_pos) {
+            if let (Some(g), Some(pos)) = (self.grab, hover_pos) {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
                 if response.dragged_by(PointerButton::Primary) {
-                    let mut ends = [a, b];
-                    ends[k] = self.to_image(pos);
-                    if ends[k] != [a, b][k] {
-                        events.push(ViewEvent::ReferenceMoved(ends[0], ends[1]));
+                    let p = self.to_image(pos);
+                    match (g, region) {
+                        (Grab::RefEnd(k), _) => {
+                            if let Some((a, b)) = reference {
+                                let mut ends = [a, b];
+                                ends[k] = p;
+                                if ends[k] != [a, b][k] {
+                                    events.push(ViewEvent::ReferenceMoved(ends[0], ends[1]));
+                                }
+                            }
+                        }
+                        (Grab::Corner(k), Some(Region::Rect { x0, y0, x1, y1 })) => {
+                            let corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+                            let r = Region::rect(corners[(k + 2) % 4], p);
+                            // Dragged past the opposite side: now a different corner.
+                            if let Region::Rect { x0, y0, x1, y1 } = r {
+                                let now = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)];
+                                let k = (0..4).min_by(|&i, &j| ((now[i].0 - p.0).hypot(now[i].1 - p.1)).total_cmp(&(now[j].0 - p.0).hypot(now[j].1 - p.1))).unwrap();
+                                self.grab = Some(Grab::Corner(k));
+                            }
+                            events.push(ViewEvent::RegionEdited(r));
+                        }
+                        (Grab::Radius, Some(Region::Circle { cx, cy, .. })) => {
+                            events.push(ViewEvent::RegionEdited(Region::Circle { cx, cy, r: (p.0 - cx).hypot(p.1 - cy).max(5.0) }));
+                        }
+                        (Grab::Move(start, r0), _) => {
+                            events.push(ViewEvent::RegionEdited(r0.moved(p.0 - start.0, p.1 - start.1)));
+                        }
+                        _ => {}
                     }
                 }
             }
         }
         if released[0] {
+            if matches!(self.grab, Some(Grab::Corner(_) | Grab::Radius | Grab::Move(..))) {
+                events.push(ViewEvent::RegionDone);
+            }
             self.grab = None;
         }
         let pan = response.dragged_by(PointerButton::Middle) || (!clicking && self.grab.is_none() && response.dragged_by(PointerButton::Primary));

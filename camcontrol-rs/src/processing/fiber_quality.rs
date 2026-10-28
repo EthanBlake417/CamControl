@@ -191,8 +191,13 @@ pub fn fiber_quality(image: &RgbImage, cx: f64, cy: f64, radius: f64, others: &[
 /// step of width w rises by step/w per pixel at its middle). The median sector.
 /// Rays off the image or into another fiber are left out.
 fn edge_width(lum: &ip::ImgF, cx: f64, cy: f64, radius: f64, blocked: impl Fn(f64, f64) -> bool) -> Option<f64> {
-    let step = (0.25f64).max((EDGE.1 - EDGE.0) * radius / 400.0);
-    let n = (((EDGE.1 - EDGE.0) * radius) / step) as usize + 1;
+    edge_width_across(lum, cx, cy, radius, EDGE.0 * radius, EDGE.1 * radius, blocked)
+}
+
+/// As edge_width, the profiles from `from` to `to` px from the center.
+fn edge_width_across(lum: &ip::ImgF, cx: f64, cy: f64, radius: f64, from: f64, to: f64, blocked: impl Fn(f64, f64) -> bool) -> Option<f64> {
+    let step = (0.25f64).max((to - from) / 400.0);
+    let n = ((to - from) / step) as usize + 1;
     let end = (n / 10).max(2); // samples averaged at each end for the step
     let mut widths = Vec::new();
     for s in 0..SECTORS {
@@ -203,7 +208,7 @@ fn edge_width(lum: &ip::ImgF, cx: f64, cy: f64, radius: f64, blocked: impl Fn(f6
             let (dx, dy) = (a.cos(), a.sin());
             let mut ray = Vec::with_capacity(n);
             for i in 0..n {
-                let t = EDGE.0 * radius + i as f64 * step;
+                let t = from + i as f64 * step;
                 let (x, y) = (cx + t * dx, cy + t * dy);
                 if x < 0.0 || y < 0.0 || x > (lum.w - 1) as f64 || y > (lum.h - 1) as f64 || (t >= radius && blocked(x, y)) {
                     continue 'ray;
@@ -239,9 +244,43 @@ fn edge_width(lum: &ip::ImgF, cx: f64, cy: f64, radius: f64, blocked: impl Fn(f6
     (widths.len() >= SECTORS / 4).then(|| ip::median_f64(&widths))
 }
 
+/// Focus on the stress rods: how many pixels their edges take to go from rod to cladding
+/// (as edge_width, across each rod's outline), the rods averaged. Smaller is sharper. None if
+/// no rod edge could be measured. `rods`: (center x, center y, radius).
+pub fn rod_edge_width(image: &RgbImage, rods: &[(f64, f64, f64)]) -> Option<f64> {
+    let widths: Vec<f64> = rods.iter().filter(|r| r.2 >= 3.0).filter_map(|&(cx, cy, r)| {
+        let half = (0.3 * r).max(6.0);
+        let reach = r + half + 2.0;
+        let (w, h) = (image.width() as i64, image.height() as i64);
+        let (x0, y0) = (((cx - reach).floor() as i64).max(0), ((cy - reach).floor() as i64).max(0));
+        let (x1, y1) = (((cx + reach).ceil() as i64 + 1).min(w), ((cy + reach).ceil() as i64 + 1).min(h));
+        if x1 - x0 < 4 || y1 - y0 < 4 {
+            return None;
+        }
+        let lum = ip::ImgF::from_fn((x1 - x0) as usize, (y1 - y0) as usize, |x, y| luma(image.get_pixel((x0 + x as i64) as u32, (y0 + y as i64) as u32).0));
+        edge_width_across(&lum, cx - x0 as f64, cy - y0 as f64, r, (r - half).max(1.0), r + half, |_, _| false)
+    }).collect();
+    (!widths.is_empty()).then(|| widths.iter().sum::<f64>() / widths.len() as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rod_edges_sharp_and_blurred() {
+        let mut img = RgbImage::from_pixel(400, 400, image::Rgb([30; 3]));
+        draw::fill_circle_px(&mut img, 200, 200, 150, [200; 3]);
+        for x in [125, 275] {
+            draw::fill_circle_px(&mut img, x, 200, 35, [60; 3]);
+        }
+        let rods = [(125.0, 200.0, 35.0), (275.0, 200.0, 35.0)];
+        let sharp = rod_edge_width(&img, &rods).unwrap();
+        let soft = rod_edge_width(&ip::gaussian_blur_rgb(&img, 3.0), &rods).unwrap();
+        assert!(sharp < 2.0, "{sharp}");
+        assert!((soft - 3.0 * std::f64::consts::TAU.sqrt()).abs() < 2.0, "sigma 3 -> about 7.5 px, got {soft}");
+        assert_eq!(rod_edge_width(&img, &[]), None);
+    }
     use crate::draw;
 
     fn disc(fiber: u8, background: u8) -> RgbImage {

@@ -361,6 +361,7 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
                         ui.selectable_value(&mut fiber.readout_font, "mono".to_string(), "Monospace");
                     });
                     ui.checkbox(&mut fiber.readout_bold, "Bold");
+                    ui.checkbox(&mut fiber.readout_edge, "Rod edge").on_hover_text("Also read out each fiber's rod edge width (focus: smaller is sharper).");
                 }).response.on_hover_text("The angles box in the view's top-left corner: size on screen, font, bold.\n\
                                             Exports and videos scale it to the picture.");
                 ui.end_row();

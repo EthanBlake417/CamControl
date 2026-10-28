@@ -223,6 +223,13 @@ fn alignment_readings_reference_and_region() {
     let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
     assert_eq!(lines, vec!["5: fast -30.00°", "6: fast -30.00°", "7: fast -30.00°"]);
     h.state_mut().alignment.next_number = 1;
+    // The region dragged by a corner, then moved (on the image, no tool in use).
+    h.state_mut().view_event(id, super::view::ViewEvent::RegionEdited(crate::processing::fiber_axis::Region::rect((0.0, 0.0), (500.0, 340.0))));
+    h.state_mut().view_event(id, super::view::ViewEvent::RegionDone);
+    assert_eq!(h.state().alignment.region, Some(crate::processing::fiber_axis::Region::rect((0.0, 0.0), (500.0, 340.0))));
+    h.state_mut().alignment.region = None;
+    h.state_mut().region_changed();
+    wait(&mut h, "all three again", |a| a.active_pane().fibers.len() == 3);
     // Its ends dragged: the line moves.
     h.state_mut().view_event(id, super::view::ViewEvent::ReferenceMoved((0.0, 300.0), (100.0, 300.0)));
     assert!(h.state().alignment.reference_deg().unwrap().abs() < 1e-9);
@@ -249,8 +256,12 @@ fn alignment_readings_reference_and_region() {
     let rows = h.state().alignment.rows.clone();
     let (a, b) = (&rows[rows.len() - 2], &rows[rows.len() - 1]);
     assert!(a.photo.is_some() && a.photo == b.photo, "one photo for the take: {a:?} {b:?}");
+    h.state_mut().saved.align_details = true;
     h.state_mut().save_alignment(true);
     assert!(dir.join("run-001.csv").is_file());
+    let csv = std::fs::read_to_string(dir.join("run-001.csv")).unwrap();
+    let header = csv.lines().next().unwrap();
+    assert!(header.contains("Rod edge (px, mean)") && header.contains("Quality") && csv.contains("Panda"), "{csv}");
     assert!(dir.join(format!("run-001_fiber{}-{}.png", a.fiber, b.fiber)).is_file());
 }
 
@@ -303,9 +314,52 @@ fn fiber_count_numbers_and_saves() {
     assert!(csv.lines().any(|l| l.starts_with("16,") && l.contains(",on,")), "{csv}");
     let meta = crate::capture::read_image_details(&dir.join("groove-001.tif")).expect("the image, details inside");
     assert_eq!((meta["fiber_count"]["count"].as_u64(), meta["fiber_count"]["on"].as_i64()), (Some(3), Some(16)));
+    // Not looking for the fiber that's on: none named.
+    h.state_mut().saved.count_find_on = false;
+    h.state_mut().save_fiber_count();
+    let csv = std::fs::read_to_string(dir.join("groove-002.csv")).expect("the table");
+    assert!(!csv.contains(",on,"), "{csv}");
+    assert!(!h.state().view_extras().show_on);
 }
 
 /// Closing one of several views with its × closes just that view (it used to crash the app).
+fn drag(h: &mut Test, from: Pos2, to: Pos2) {
+    h.input_mut().events.push(egui::Event::PointerMoved(from));
+    h.step();
+    h.input_mut().events.push(egui::Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    h.step();
+    for k in 1..=5 {
+        let p = from + (to - from) * (k as f32 / 5.0);
+        h.input_mut().events.push(egui::Event::PointerMoved(p));
+        h.step();
+    }
+    h.input_mut().events.push(egui::Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    h.step();
+    h.step();
+}
+
+/// The region of interest on the image: a corner dragged resizes it, its edge dragged moves it.
+#[test]
+fn dragging_the_region_of_interest() {
+    use crate::processing::fiber_axis::Region;
+    let (mut h, dir) = harness("roidrag");
+    let path = dir.join("three.png");
+    three_fibers(&path);
+    open(&mut h, &path);
+    h.state_mut().alignment.region = Some(Region::rect((100.0, 50.0), (500.0, 300.0)));
+    h.run_ok();
+    let to = |h: &Test, x: f64, y: f64| h.state().active_pane().view.to_screen(x, y);
+    let (corner, target) = (to(&h, 500.0, 300.0), to(&h, 600.0, 320.0));
+    drag(&mut h, corner, target);
+    let Some(Region::Rect { x0, y0, x1, y1 }) = h.state().alignment.region else { panic!("{:?}", h.state().alignment.region) };
+    assert!((x0 - 100.0).abs() < 2.0 && (y0 - 50.0).abs() < 2.0 && (x1 - 600.0).abs() < 3.0 && (y1 - 320.0).abs() < 3.0, "resized: {x0} {y0} {x1} {y1}");
+    // Its top edge, half way along, dragged down 20 and right 10: the whole box moves.
+    let (edge, target) = (to(&h, 350.0, 50.0), to(&h, 360.0, 70.0));
+    drag(&mut h, edge, target);
+    let Some(Region::Rect { x0, y0, x1, y1 }) = h.state().alignment.region else { panic!() };
+    assert!((x0 - 110.0).abs() < 3.0 && (y0 - 70.0).abs() < 3.0 && (x1 - 610.0).abs() < 3.0 && (y1 - 340.0).abs() < 3.0, "moved: {x0} {y0} {x1} {y1}");
+}
+
 #[test]
 fn closing_a_view_with_its_x() {
     let (mut h, _dir) = harness("closeview");
@@ -522,7 +576,7 @@ fn records_the_fiber_axes_on_the_video() {
     let axis = crate::processing::fiber_axis::FiberAxis {
         cx: 320.0, cy: 240.0, radius: 120.0, slow_deg: 5.0, elongation: 0.5, fiber_type: "Panda".into(), n_parts: 2,
         method: "rods".into(), axis_x: None, axis_y: None, parts: Vec::new(), part_centres: Vec::new(), threshold: 0.0,
-        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None, centre_brightness: None, core_clear: None, image_quality: None,
+        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None, centre_brightness: None, core_clear: None, image_quality: None, rod_edge: None,
     };
     t.state_mut().active_pane_mut().fibers = vec![axis];
     t.state_mut().request_recording(true);

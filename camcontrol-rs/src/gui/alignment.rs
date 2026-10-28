@@ -44,6 +44,8 @@ pub struct Collecting {
     pub sum: Option<(u32, u32, Vec<f32>)>,
     pub frames: usize,
     pub fibers: Vec<FiberAxis>,
+    /// Per update: each fiber's rod edge width (focus).
+    pub edges: Vec<Vec<Option<f64>>>,
 }
 
 /// A take's photo (not compared or printed whole).
@@ -77,6 +79,10 @@ pub struct Row {
     pub axis: &'static str,
     /// The frames measured, averaged, the fiber's number beside it (Take a photo with each reading).
     pub photo: Option<Photo>,
+    /// The fiber as last measured in the take (everything Fiber Axis shows), and its rod edge
+    /// width averaged over the take: saved with the table if asked for.
+    pub details: Option<FiberAxis>,
+    pub rod_edge: Option<f64>,
 }
 
 pub struct Alignment {
@@ -150,6 +156,12 @@ pub fn fit_line(points: &[(f64, f64)], extend: f64) -> Option<((f64, f64), (f64,
     (hi - lo > 1e-6).then(|| ((mx + lo * dx, my + lo * dy), (mx + hi * dx, my + hi * dy)))
 }
 
+/// The Fiber Axis details saved with each fiber (Include Fiber Axis details).
+pub const DETAIL_HEADERS: [&str; 19] = ["Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity (rod outline % or elongation)", "Method",
+    "Center x (px)", "Center y (px)", "Diameter (px)", "Center brightness (0-255)", "Rod edge (px, mean)",
+    "Fiber level (0-255)", "Background level (0-255)", "Contrast (%)", "Edge width (px)", "Noise", "SNR", "Clipped (%)",
+    "Bright parts (0-255)", "Quality"];
+
 pub const HEADERS: [&str; 7] = ["Time", "Fiber", "Readings", "Axis", "Mean (deg)", "Std (deg)", "Reference line (deg)"];
 
 /// The line turned about its middle to `deg` (counter-clockwise from horizontal on screen), its length kept.
@@ -210,19 +222,44 @@ impl Alignment {
             let angles: Vec<f64> = readings.iter().filter_map(|r| r.get(i).copied()).collect();
             let (mean, std) = axial_stats(&angles);
             let axis = axes.get(i).copied().unwrap_or("fast");
-            self.rows.push(Row { time: time.clone(), fiber, n: angles.len(), mean: signed_angle(mean), std, reference, axis, photo: None });
+            self.rows.push(Row { time: time.clone(), fiber, n: angles.len(), mean: signed_angle(mean), std, reference, axis, photo: None,
+                                 details: None, rod_edge: None });
         }
         self.next_number = self.number(fibers);
         numbers
     }
 
-    pub fn sheet(&self) -> Sheet {
+    /// The table; with `details`, each fiber's Fiber Axis details as well.
+    pub fn sheet(&self, details: bool) -> Sheet {
+        let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
         let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
-        let rows = self.rows.iter().map(|r| vec![
-            Cell::Text(r.time.clone()), Cell::Text(r.fiber.to_string()), Cell::Text(r.n.to_string()), Cell::Text(r.axis.into()), r2(r.mean), r2(r.std),
-            r.reference.map(|v| r2(signed_angle(v))).unwrap_or(Cell::Empty),
-        ]).collect();
-        Sheet::new("Alignment", &HEADERS, rows)
+        let rows = self.rows.iter().map(|r| {
+            let mut row = vec![
+                Cell::Text(r.time.clone()), Cell::Text(r.fiber.to_string()), Cell::Text(r.n.to_string()), Cell::Text(r.axis.into()), r2(r.mean), r2(r.std),
+                r.reference.map(|v| r2(signed_angle(v))).unwrap_or(Cell::Empty),
+            ];
+            if details {
+                match &r.details {
+                    Some(f) => {
+                        row.extend([
+                            Cell::Text(f.fiber_type.clone()), r2(signed_angle(f.slow_deg)), r2(signed_angle(f.fast_deg())),
+                            f.coverage.map(|c| r1(100.0 * c)).unwrap_or_else(|| Cell::Num((f.elongation * 100.0).round() / 100.0)),
+                            Cell::Text(crate::processing::fiber_axis::method_label(&f.method).into()),
+                            r1(f.cx), r1(f.cy), r1(2.0 * f.radius), f.centre_brightness.map(r1).unwrap_or(Cell::Empty),
+                            r.rod_edge.map(r2).unwrap_or(Cell::Empty),
+                        ]);
+                        row.extend(super::fiber_log::quality_cells(f.image_quality.as_ref(), true));
+                    }
+                    None => row.extend(vec![Cell::Empty; DETAIL_HEADERS.len()]),
+                }
+            }
+            row
+        }).collect();
+        let mut headers: Vec<String> = HEADERS.iter().map(|h| h.to_string()).collect();
+        if details {
+            headers.extend(DETAIL_HEADERS.iter().map(|h| h.to_string()));
+        }
+        Sheet::from_strings("Alignment", headers, rows)
     }
 
     /// The table as text lines, for drawing on a photo.
@@ -254,7 +291,7 @@ impl App {
         }
         let live = p.live;
         self.alignment.collecting = Some(Collecting { pane: id, wanted: if live { self.alignment.n } else { 1 }, readings: Vec::new(), axes: Vec::new(),
-                                                      sum: None, frames: 0, fibers: Vec::new() });
+                                                      sum: None, frames: 0, fibers: Vec::new(), edges: Vec::new() });
         self.alignment.status = "Taking readings...".into();
         if !live {
             if self.pane(id).fibers.is_empty() {
@@ -285,6 +322,7 @@ impl App {
         let photos = self.saved.align_photos;
         let c = self.alignment.collecting.as_mut().unwrap();
         c.readings.push(angles);
+        c.edges.push(fibers.iter().map(|f| f.rod_edge).collect());
         c.axes = axes;
         if let (true, Some(img)) = (photos, image) {
             let (w, h) = img.dimensions();
@@ -312,6 +350,13 @@ impl App {
             Photo(Arc::new(render_markup(&avg, &markup)))
         });
         let numbers = self.alignment.finish(&done.readings, &done.axes, drawing.reference);
+        // Each fiber's details (as last measured) and rod edge width averaged over the readings.
+        let first = self.alignment.rows.len() - numbers.len();
+        for (i, r) in self.alignment.rows[first..].iter_mut().enumerate() {
+            r.details = done.fibers.get(i).cloned();
+            let edges: Vec<f64> = done.edges.iter().filter_map(|e| e.get(i).copied().flatten()).collect();
+            r.rod_edge = (!edges.is_empty()).then(|| edges.iter().sum::<f64>() / edges.len() as f64);
+        }
         if let Some(p) = &photo {
             let n = self.alignment.rows.len();
             for r in &mut self.alignment.rows[n - numbers.len()..] {
@@ -425,6 +470,7 @@ impl App {
             region: self.alignment.region.filter(|_| !clean),
             reference: self.alignment.reference.filter(|_| !clean),
             numbers: self.panels.is_open(PanelId::FiberCount),
+            show_on: self.saved.count_find_on,
             notes: Vec::new(),
             labels: Vec::new(),
             region_look: Some(self.saved.fiber_lines.region_look()),
@@ -458,7 +504,7 @@ impl App {
         } else {
             next_capture_path(&folder, &self.saved.align_name, "csv", "alignment")
         };
-        if let Err(e) = export::write_tables(&[self.alignment.sheet()], &csv, false) {
+        if let Err(e) = export::write_tables(&[self.alignment.sheet(self.saved.align_details)], &csv, false) {
             self.warn("Save measurement", format!("Save failed: {e}"));
             return;
         }
@@ -698,6 +744,9 @@ impl App {
             });
             ui.add_space(4.0);
             output_rows(ui, "align_output", &mut self.saved.align_folder, &mut self.saved.align_name, &self.saved.folder);
+            ui.checkbox(&mut self.saved.align_details, "Include Fiber Axis details")
+                .on_hover_text("Also save each fiber's Fiber Axis details with the table: type, slow and fast axes, clarity, method,\n\
+                                center, diameter, brightness, rod edge (focus, averaged over the take) and image quality.");
             let with_photos = self.alignment.rows.iter().any(|r| r.photo.is_some());
             ui.horizontal_wrapped(|ui| {
                 if ui.button("Save").on_hover_text("Save the table as CSV.").clicked() {
@@ -725,7 +774,7 @@ impl App {
             notes.push(format!("{} fibers, numbered {} to {} from the top (counting {dir})",
                                fibers.len(), d.number(0), d.number(fibers.len() - 1)));
         }
-        if let Some((i, _)) = brightest_centre(fibers) {
+        if let Some((i, _)) = brightest_centre(fibers).filter(|_| self.saved.count_find_on) {
             notes.push(format!("Fiber {} is on", d.number(i)));
         }
         notes
@@ -754,7 +803,7 @@ impl App {
         let mut markup = self.markup_of(id, Vec::new());
         markup.extras.numbers = true;
         let d = self.fiber_drawing();
-        let on = brightest_centre(&fibers).map(|b| b.0);
+        let on = brightest_centre(&fibers).map(|b| b.0).filter(|_| self.saved.count_find_on);
         let mut extra = Map::new();
         extra.insert("fiber_count".into(), json!({
             "count": fibers.len(), "top_number": d.first_number, "ascending": d.ascending,
@@ -830,6 +879,8 @@ impl App {
             if ui.add(button).on_hover_text("Find and number all the fibers in the view (turns off Only the center fiber).").clicked() {
                 self.find_all_fibers();
             }
+            ui.checkbox(&mut self.saved.count_find_on, "Find the fiber that's on")
+                .on_hover_text("Say which fiber has light in it (the brightest center): on the image, here, and in what's saved.");
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(match fibers.len() {
@@ -837,7 +888,7 @@ impl App {
                     1 => "1 fiber".to_string(),
                     n => format!("{n} fibers"),
                 }).size(18.0).strong());
-                if let Some((i, _)) = brightest_centre(&fibers) {
+                if let Some((i, _)) = brightest_centre(&fibers).filter(|_| self.saved.count_find_on) {
                     ui.add_space(12.0);
                     ui.label(RichText::new(format!("Fiber {} is on", d.number(i))).size(18.0).strong().color(egui::Color32::from_rgb(20, 150, 40)))
                         .on_hover_text("The fiber with the brightest center (light in its core).");
@@ -890,7 +941,7 @@ impl App {
             return;
         }
         let d = self.fiber_drawing();
-        let on = brightest_centre(&fibers).map(|b| b.0);
+        let on = brightest_centre(&fibers).map(|b| b.0).filter(|_| self.saved.count_find_on);
         section(ui, "Each fiber", None, |ui| {
             egui::ScrollArea::vertical().id_salt("count_rows").max_height(ui.available_height().max(120.0)).auto_shrink([false, true]).show(ui, |ui| {
                 egui::Grid::new("count_grid").striped(true).num_columns(4).spacing(egui::vec2(16.0, 4.0)).show(ui, |ui| {

@@ -49,6 +49,8 @@ pub struct FiberDrawing {
     pub readout_px: f32,
     pub readout_mono: bool,
     pub readout_bold: bool,
+    /// Add each fiber's rod edge width (focus) to its readout line.
+    pub readout_edge: bool,
     /// The stress parts' fill and outline (None: not drawn).
     pub parts_fill: Option<Color>,
     pub parts_outline: Option<(Color, Dash)>,
@@ -62,7 +64,7 @@ impl Default for FiberDrawing {
     fn default() -> Self {
         Self { show_parts: false, long_lines: false, slow: SLOW_COLOR, fast: FAST_COLOR, show_slow: true, show_fast: true, slow_bands: None,
                fast_bands: None, first_number: 1, ascending: true, reference: None, readout_px: READOUT_PX,
-               readout_mono: false, readout_bold: false, parts_fill: Some([255, 0, 200, 46]), parts_outline: Some((SLOW_COLOR, Dash::Dot)),
+               readout_mono: false, readout_bold: false, readout_edge: false, parts_fill: Some([255, 0, 200, 46]), parts_outline: Some((SLOW_COLOR, Dash::Dot)),
                numbers_only: false, only: None }
     }
 }
@@ -350,6 +352,9 @@ pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<V
             if let (Some(d), Some(axis)) = (drawing.off_perpendicular(f), drawing.perpendicular_axis(f)) {
                 let color = opaque(if axis == "slow" { drawing.slow_color(f) } else { drawing.fast_color(f) });
                 let mut line = vec![(format!("{number}: {axis} {d:+.2}°"), color)];
+                if let Some(e) = f.rod_edge.filter(|_| drawing.readout_edge) {
+                    line.push((format!("  edge {e:.1} px"), [220, 220, 220, 255]));
+                }
                 if !f.clear() {
                     line.push((" (unclear)".into(), [230, 230, 230, 255]));
                 }
@@ -366,6 +371,9 @@ pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<V
             }
             let first = line.first().map(|p| p.1).unwrap_or(READOUT_COLOR);
             line.insert(0, (format!("{number}: "), first));
+            if let Some(e) = f.rod_edge.filter(|_| drawing.readout_edge) {
+                line.push((format!("  edge {e:.1} px"), [220, 220, 220, 255]));
+            }
             if !f.clear() {
                 line.push((" (unclear)".into(), [230, 230, 230, 255]));
             }
@@ -413,6 +421,8 @@ pub struct Extras {
     pub region: Option<Region>,
     pub reference: Option<((f64, f64), (f64, f64))>,
     pub numbers: bool,
+    /// With the numbers: "on" beside the fiber with the brightest center.
+    pub show_on: bool,
     pub notes: Vec<String>,
     /// Text beside particular fibers (center x, y, radius), as the fiber numbers are.
     pub labels: Vec<((f64, f64, f64), String)>,
@@ -462,7 +472,7 @@ pub fn draw_extras(c: &mut dyn Canvas, extras: &Extras, axes: &[FiberAxis], draw
     }
     let font = style.font_px * 1.4;
     if extras.numbers {
-        let on = brightest_centre(axes).map(|b| b.0);
+        let on = brightest_centre(axes).map(|b| b.0).filter(|_| extras.show_on);
         for (i, f) in axes.iter().enumerate() {
             let (text, color) = if on == Some(i) { (format!("{} on", drawing.number(i)), READOUT_COLOR) } else { (drawing.number(i).to_string(), NUMBER_COLOR) };
             edge_label(c, to_out(f.cx + f.radius, f.cy), &text, color, font);

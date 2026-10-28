@@ -123,6 +123,8 @@ pub struct FiberLineStyle {
     pub readout_size: f64,
     pub readout_font: String,
     pub readout_bold: bool,
+    /// Also read out each fiber's rod edge width (focus).
+    pub readout_edge: bool,
     /// The stress parts (Show stress parts): color, filled (with opacity %), outlined (opacity %, line style).
     pub parts_color: String,
     pub parts_fill: bool,
@@ -154,6 +156,7 @@ impl Default for FiberLineStyle {
             readout_size: 26.0,
             readout_font: "sans".into(),
             readout_bold: false,
+            readout_edge: false,
             parts_color: "#ff00c8".into(),
             parts_fill: true,
             parts_fill_opacity: 18,

@@ -18,7 +18,7 @@ use image::RgbImage;
 use serde::{Deserialize, Serialize};
 
 use crate::imgproc::{self as ip, ImgF, Mask};
-use super::fiber_quality::{fiber_quality, FiberQuality};
+use super::fiber_quality::{fiber_quality, rod_edge_width, FiberQuality};
 
 pub const CORE_FRACTION: f64 = 0.12;
 pub const EDGE_FRACTION: f64 = 0.92;
@@ -145,6 +145,8 @@ pub struct FiberAxis {
     pub core_clear: Option<bool>,
     /// Contrast, focus, noise and clipping round the fiber, see fiber_quality.
     pub image_quality: Option<FiberQuality>,
+    /// Focus on the stress rods: their edges' width in px (smaller is sharper), see fiber_quality::rod_edge_width.
+    pub rod_edge: Option<f64>,
 }
 
 impl FiberAxis {
@@ -170,6 +172,7 @@ impl FiberAxis {
             centre_brightness: None,
             core_clear: None,
             image_quality: None,
+            rod_edge: None,
         }
     }
 
@@ -2286,6 +2289,14 @@ pub enum Region {
 }
 
 impl Region {
+    /// The same region moved by (dx, dy).
+    pub fn moved(&self, dx: f64, dy: f64) -> Self {
+        match *self {
+            Region::Rect { x0, y0, x1, y1 } => Region::Rect { x0: x0 + dx, y0: y0 + dy, x1: x1 + dx, y1: y1 + dy },
+            Region::Circle { cx, cy, r } => Region::Circle { cx: cx + dx, cy: cy + dy, r },
+        }
+    }
+
     /// The rectangle with these two corners.
     pub fn rect(a: (f64, f64), b: (f64, f64)) -> Self {
         Region::Rect { x0: a.0.min(b.0), y0: a.1.min(b.1), x1: a.0.max(b.0), y1: a.1.max(b.1) }
@@ -2359,6 +2370,10 @@ pub fn analyse_in(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, previou
                     let mut f = measure_axis(image, x, y, r, method, parts_centre, detection);
                     f.centre_brightness = Some(centre_brightness(image, x, y, r));
                     f.image_quality = fiber_quality(image, f.cx, f.cy, f.radius, &others);
+                    if f.rod_radii.len() == 2 && f.part_centres.len() == 2 {
+                        let rods: Vec<(f64, f64, f64)> = f.part_centres.iter().zip(&f.rod_radii).map(|(&(x, y), &r)| (x, y, r)).collect();
+                        f.rod_edge = rod_edge_width(image, &rods);
+                    }
                     f
                 })
             })
