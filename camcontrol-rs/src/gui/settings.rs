@@ -13,6 +13,8 @@ use super::style::{CrosshairStyle, FiberLineStyle, GridStyle};
 use crate::processing::fiber_axis::{Detection, Region};
 
 pub const MAX_RECENT: usize = 8;
+/// 2: the bottom panel at least 300 px tall (its tabs fit without scrolling).
+pub const LAYOUT_VERSION: u32 = 2;
 pub const AVERAGE_CHOICES: [usize; 5] = [1, 4, 8, 16, 32];
 pub const FORMATS: [(&str, &str); 2] = [("TIFF", "tif"), ("PNG", "png")];
 pub const UNITS: [(&str, f64); 3] = [("seconds", 1.0), ("minutes", 60.0), ("hours", 3600.0)];
@@ -102,8 +104,6 @@ pub struct Saved {
     pub count_ascending: bool,
     /// Fiber count panel open: still show the axis lines, angles, region and reference line.
     pub count_show_axes: bool,
-    /// Counting class names (empty: Class 1, Class 2, ...).
-    pub count_class_names: Vec<String>,
     /// The layout "Several views" goes back to.
     pub multi_layout: String,
     /// The tab last shown in the grid, crosshair and fiber axes window.
@@ -128,6 +128,8 @@ pub struct Saved {
     pub left_width: f32,
     pub right_width: f32,
     pub bottom_height: f32,
+    /// Bumped when a new default layout should be applied once to saved settings.
+    pub layout_version: u32,
 }
 
 impl Default for Saved {
@@ -158,7 +160,6 @@ impl Default for Saved {
             count_first: 1,
             count_ascending: true,
             count_show_axes: false,
-            count_class_names: Vec::new(),
             multi_layout: "grid".into(),
             overlay_tab: "grid".into(),
             histogram_log: false,
@@ -179,7 +180,8 @@ impl Default for Saved {
             resolutions: BTreeMap::new(),
             left_width: 300.0,
             right_width: 380.0,
-            bottom_height: 220.0,
+            bottom_height: 300.0,
+            layout_version: LAYOUT_VERSION,
         }
     }
 }

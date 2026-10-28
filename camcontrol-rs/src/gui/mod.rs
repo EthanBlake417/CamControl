@@ -10,11 +10,11 @@
 //!     Ctrl+O      open an image or video   Ctrl+S  save the active view's image
 //!     Ctrl+E      export measurements      Ctrl+Shift+S  save settings
 //!     Ctrl+K      one view / several views Ctrl+Shift+K  add a view
-//!     Ctrl+1..7   show / hide Controls / Measurements / Captures / Alignment / Fiber axis / Fiber log / Fiber count
+//!     Ctrl+1..6   show / hide Controls / Captures / Alignment / Fiber axis / Fiber log / Fiber count
 //!     Ctrl+Q      quit
 //!
-//! Each view has its own source, live/frozen state, measurements, counting
-//! marks and fiber axes. The panels work on the active view (clicked last).
+//! Each view has its own source, live/frozen state, measurements and fiber
+//! axes. The panels work on the active view (clicked last).
 //! Controls work on the active view's camera, or, if it has none, on the
 //! camera view used last. With Link views on, Capture, Live/Freeze, Fit,
 //! 100% and Find fiber axes act on every view.
@@ -53,7 +53,6 @@ use crate::calibration::Calibration;
 use crate::camera::worker::CameraLink;
 use crate::camera::DeviceKey;
 use crate::measure::Measurement;
-use crate::processing::count::{default_names, Counter};
 use crate::processing::fiber_axis::{Detection, FiberAxis};
 use crate::processing::flatfield::FlatField;
 
@@ -83,7 +82,6 @@ pub struct Pane {
     pub measurements: Vec<Measurement>,
     pub next_id: usize,
     pub measure_selected: Option<usize>,
-    pub counter: Counter,
     pub fibers: Vec<FiberAxis>,
     pub fiber_selected: Option<usize>,
     /// Kept open while it shows a file, so L returns to it.
@@ -108,7 +106,6 @@ impl Pane {
             measurements: Vec::new(),
             next_id: 1,
             measure_selected: None,
-            counter: Counter::default(),
             fibers: Vec::new(),
             fiber_selected: None,
             camera: None,
@@ -136,7 +133,6 @@ pub enum Action {
     ShowResult { pane: u64, image: Arc<RgbImage>, title: String, info: ResultInfo },
     DeleteFiles(Vec<PathBuf>),
     ClearMeasurements(u64),
-    ClearMarks(u64),
     UseViewAsFlat,
     RemoveView(u64),
     SetPaneCamera(u64, Option<DeviceKey>),
@@ -200,7 +196,7 @@ impl App {
         }
         ui.checkbox(&mut self.saved.grid, "Grid  (G)");
         ui.checkbox(&mut self.saved.crosshair, "Crosshair  (C)");
-        if ui.button("Grid, crosshair and fiber axes settings...").clicked() {
+        if ui.button("Display settings...").clicked() {
             self.overlay_open = true;
             ui.close_menu();
         }
@@ -314,11 +310,8 @@ pub struct App {
     pub(crate) flat: Option<Arc<FlatField>>,
     pub(crate) tool: Option<String>,
     pub(crate) calibration: Calibration,
-    pub(crate) counting: bool,
     /// The next circle drawn on a view sets Smallest rod (Fiber axis panel) instead of becoming a measurement.
     pub(crate) picking_rod: bool,
-    pub(crate) count_class: usize,
-    pub(crate) class_names: Vec<String>,
     pub(crate) fiber: FiberSettings,
     pub(crate) fiber_log: fiber_log::FiberLog,
     pub(crate) histogram: histogram::Histogram,
@@ -397,10 +390,14 @@ impl App {
         };
         let multi_layout = if views::LAYOUTS.iter().any(|l| l.0 == saved.multi_layout && l.0 != "single") { saved.multi_layout.clone() } else { "grid".into() };
         let overlay_tab = if ["grid", "crosshair", "fiber", "parts", "marks"].contains(&saved.overlay_tab.as_str()) { saved.overlay_tab.clone() } else { "grid".into() };
-        let class_names = if saved.count_class_names.len() == default_names().len() { saved.count_class_names.clone() } else { default_names() };
         let mut gallery = Gallery::new(wake.clone());
         gallery.count = saved.gallery_count.clamp(1, 500);
         std::thread::spawn(crate::processing::fiber_axis::warm_up); // the first Find axes needn't wait
+        let mut saved = saved;
+        if saved.layout_version < settings::LAYOUT_VERSION {
+            saved.bottom_height = saved.bottom_height.max(300.0);
+            saved.layout_version = settings::LAYOUT_VERSION;
+        }
         let mut app = Self {
             fiber_log: fiber_log::FiberLog { record: saved.fiber_log_record, ..Default::default() },
             histogram: histogram::Histogram::new(saved.histogram_log, saved.histogram_colors),
@@ -424,10 +421,7 @@ impl App {
             flat: None,
             tool: None,
             calibration: Calibration::pixels(),
-            counting: false,
             picking_rod: false,
-            count_class: 0,
-            class_names,
             fiber,
             fiber_job: None,
             fiber_waiting: Vec::new(),
@@ -854,14 +848,11 @@ impl App {
         let ch = (area.height() - gap * (rows as f32 - 1.0)) / rows as f32;
         let mut events: Vec<(u64, ViewEvent)> = Vec::new();
         let keys_ok = !ctx.wants_keyboard_input() && self.modal.is_none();
-        let (tool, count) = (self.tool.clone(), self.counting.then_some(self.count_class));
+        let tool = self.tool.clone();
         let extras = self.view_extras();
         for p in &mut self.panes {
             if p.view.tool != tool {
                 p.view.set_tool(tool.clone());
-            }
-            if p.view.count_class != count {
-                p.view.set_count_class(count);
             }
         }
         let mut moved: Option<u64> = None;
@@ -885,7 +876,6 @@ impl App {
                 measurements: &pane.measurements,
                 calibration: cal,
                 selected: if pane.id == active { pane.measure_selected } else { None },
-                counter: Some(&pane.counter),
                 fibers: &pane.fibers,
                 fiber_selected: pane.fiber_selected,
                 fiber_drawing,
@@ -1069,7 +1059,6 @@ impl App {
         self.saved.align_reference = self.alignment.reference.map(|(a, b)| [a.0, a.1, b.0, b.1]);
         self.saved.align_next = self.alignment.next_number;
         self.saved.align_ascending = self.alignment.ascending;
-        self.saved.count_class_names = self.class_names.clone();
         self.saved.multi_layout = self.multi_layout.clone();
         self.saved.overlay_tab = self.overlay_tab.clone();
     }

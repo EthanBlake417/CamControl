@@ -411,9 +411,6 @@ impl Gallery {
                 actions.push(GalleryAction::Delete(self.selected_paths()));
             }
         }
-        ui.add(egui::Label::new(egui::RichText::new(
-            "Double-click to open (outlined), then the arrow keys step through. Ctrl/Shift-click to select several, \
-             right-click for tools. Delete moves to the Recycle Bin.").weak().small()).wrap());
         actions
     }
 

@@ -484,7 +484,6 @@ impl App {
                 for k in KINDS {
                     if tool_button(ui, self.tool.as_deref() == Some(k.name), k.label).clicked() {
                         self.tool = Some(k.name.into());
-                        self.counting = false; // one clicking mode at a time
                     }
                 }
             });
@@ -622,7 +621,6 @@ and ring the point the axis turns about. Also on saved images and videos.");
                                     "Draw it on the view: click the center of the smallest rod (or anything that size),\nthen its edge. Esc cancels.").clicked() {
                                     self.picking_rod = !picking;
                                     self.tool = (!picking).then(|| "circle_centre".to_string());
-                                    self.counting = false;
                                     if !picking {
                                         self.message("Smallest rod: click the center of a rod, then its edge (Esc cancels).", Some(8.0));
                                     }

@@ -8,8 +8,6 @@
 //!   center; double-click, right-click or Enter finish a polyline/polygon;
 //!   Backspace removes the last point; Esc cancels (again: leaves the tool);
 //!   middle drag pans.
-//! While counting:            left click adds a mark, right click removes the
-//!   nearest, Backspace undoes, Esc stops counting, middle drag pans.
 
 use std::sync::Arc;
 
@@ -24,7 +22,6 @@ use super::style::{CrosshairStyle, GridStyle};
 use crate::calibration::Calibration;
 use crate::draw::{self, Canvas, Color, Dash, P};
 use crate::measure::{kind, Measurement, Point};
-use crate::processing::count::Counter;
 use crate::processing::fiber_axis::FiberAxis;
 
 const TILE: usize = 2048; // every GPU egui runs on takes 2048-pixel textures
@@ -32,8 +29,6 @@ const ZOOM_STEP: f32 = 1.25;
 pub const MIN_ZOOM: f32 = 0.05;
 pub const MAX_ZOOM: f32 = 32.0;
 const PIXELATED_ZOOM: f32 = 4.0; // at or above this, pixels show as sharp blocks
-const MARK_RADIUS_PX: f32 = 6.0;
-const REMOVE_RADIUS_PX: f64 = 15.0;
 const DRAG_MIN_PX: f32 = 6.0;
 const BACKGROUND: Color32 = Color32::from_rgb(30, 30, 30);
 
@@ -190,7 +185,6 @@ pub struct Overlays<'a> {
     pub measurements: &'a [Measurement],
     pub calibration: &'a Calibration,
     pub selected: Option<usize>,
-    pub counter: Option<&'a Counter>,
     pub fibers: &'a [FiberAxis],
     pub fiber_selected: Option<usize>,
     pub fiber_drawing: annotate::FiberDrawing,
@@ -205,9 +199,6 @@ pub enum ViewEvent {
     /// The reference line's ends after one was dragged.
     ReferenceMoved(Point, Point),
     ToolExit,
-    CountAdd(f64, f64),
-    CountRemove(f64, f64, f64),
-    CountUndo,
 }
 
 /// Zoom and position, for Link views: (fitting, zoom, center as a fraction of the image).
@@ -230,7 +221,6 @@ pub struct ImageView {
     points: Vec<Point>,
     mouse: Option<Point>,
     press_pos: Option<Pos2>,
-    pub count_class: Option<usize>,
     /// Which end of the reference line is being dragged.
     grab: Option<usize>,
     /// Image pixel under the mouse and its RGB.
@@ -256,7 +246,6 @@ impl Default for ImageView {
             points: Vec::new(),
             mouse: None,
             press_pos: None,
-            count_class: None,
             grab: None,
             hover: None,
             moved: false,
@@ -390,17 +379,6 @@ impl ImageView {
     pub fn set_tool(&mut self, tool: Option<String>) {
         self.tool = tool;
         self.points.clear();
-        if self.tool.is_some() {
-            self.count_class = None;
-        }
-    }
-
-    pub fn set_count_class(&mut self, cls: Option<usize>) {
-        self.count_class = cls;
-        if cls.is_some() {
-            self.tool = None;
-            self.points.clear();
-        }
     }
 
     /// Where an image point is on screen (as last drawn).
@@ -485,7 +463,7 @@ impl ImageView {
                 self.moved = true;
             }
         }
-        let clicking = self.tool.is_some() || self.count_class.is_some();
+        let clicking = self.tool.is_some();
         // The reference line's ends can be dragged (when no tool is in use).
         if let Some((a, b)) = overlays.extras.reference.filter(|_| !clicking) {
             let to_scr = |p: Point| rect.center() + (Pos2::new(p.0 as f32, p.1 as f32) - self.center) * self.zoom;
@@ -521,15 +499,7 @@ impl ImageView {
             }
         }
         if let Some(cursor) = over {
-            if let Some(cls) = self.count_class {
-                let (x, y) = self.to_image(cursor);
-                if pressed[0] {
-                    let _ = cls;
-                    events.push(ViewEvent::CountAdd(x, y));
-                } else if pressed[1] {
-                    events.push(ViewEvent::CountRemove(x, y, REMOVE_RADIUS_PX / self.zoom as f64));
-                }
-            } else if let Some(tool) = self.tool.clone() {
+            if let Some(tool) = self.tool.clone() {
                 let k = kind(&tool);
                 if pressed[0] {
                     self.points.push(self.to_image(cursor));
@@ -564,14 +534,7 @@ impl ImageView {
         }
         if keys {
             let (esc, enter, back) = ui.input(|i| (i.key_pressed(Key::Escape), i.key_pressed(Key::Enter), i.key_pressed(Key::Backspace)));
-            if self.count_class.is_some() {
-                if esc {
-                    events.push(ViewEvent::ToolExit);
-                }
-                if back {
-                    events.push(ViewEvent::CountUndo);
-                }
-            } else if self.tool.is_some() {
+            if self.tool.is_some() {
                 if esc {
                     if self.points.is_empty() { events.push(ViewEvent::ToolExit) } else { self.points.clear() }
                 }
@@ -623,9 +586,6 @@ impl ImageView {
         }
         if let Some(p) = self.preview() {
             annotate::draw_measurement(&mut canvas, &p, overlays.calibration, &to_screen, zoom as f64, PREVIEW_COLOR, &style);
-        }
-        if let Some(counter) = overlays.counter {
-            annotate::draw_marks(&mut canvas, counter, &to_screen, MARK_RADIUS_PX);
         }
         if !overlays.fibers.is_empty() {
             let area = ((rect.left(), rect.top()), (rect.right(), rect.bottom())); // long lines to the view's edges, as the crosshair

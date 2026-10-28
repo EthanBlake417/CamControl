@@ -2,7 +2,6 @@
 //! it works the same on live captures and on files.
 
 pub mod common;
-pub mod count;
 pub mod fiber_axis;
 pub mod fiber_quality;
 pub mod flatfield;

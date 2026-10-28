@@ -97,7 +97,7 @@ pub fn write_xlsx(sheets: &[Sheet], path: &Path) -> Result<(), String> {
 }
 
 /// .xlsx: all the sheets. .csv: the first sheet; any others go to files named
-/// <stem>_<sheet name>.csv beside it (as the counting export's _marks.csv).
+/// <stem>_<sheet name>.csv beside it.
 pub fn write_tables(sheets: &[Sheet], path: &Path, csv_extra: bool) -> Result<(), String> {
     let is_xlsx = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("xlsx"));
     if is_xlsx {

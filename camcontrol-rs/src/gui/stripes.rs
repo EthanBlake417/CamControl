@@ -58,16 +58,16 @@ impl PanelId {
         }
     }
 
-    /// Ctrl+1..5 as in the Python app, plus Ctrl+6 and 7.
+    /// Ctrl+1..6 (and 7 for Measurements, with the "extras" feature).
     pub fn shortcut(self) -> usize {
         match self {
             PanelId::Controls => 1,
-            PanelId::Measurements => 2,
-            PanelId::Captures => 3,
-            PanelId::Alignment => 4,
-            PanelId::Fiber => 5,
-            PanelId::FiberLog => 6,
-            PanelId::FiberCount => 7,
+            PanelId::Captures => 2,
+            PanelId::Alignment => 3,
+            PanelId::Fiber => 4,
+            PanelId::FiberLog => 5,
+            PanelId::FiberCount => 6,
+            PanelId::Measurements => 7, // only with the "extras" feature
         }
     }
 }

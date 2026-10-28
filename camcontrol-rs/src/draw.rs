@@ -1,6 +1,6 @@
 //! Drawing shapes and labels: on screen (the GUI implements Canvas with egui)
 //! and onto images for export (SkiaCanvas, anti-aliased with tiny-skia). The
-//! measurement, counting and fiber drawings are written once against Canvas.
+//! measurement and fiber drawings are written once against Canvas.
 
 use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
 use image::{Rgb, RgbImage};

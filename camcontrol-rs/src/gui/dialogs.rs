@@ -285,7 +285,7 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
                       outside: &mut bool, fiber: &mut FiberLineStyle) -> bool {
     let mut open = true;
     let mut close = false;
-    egui::Window::new("Grid, crosshair and fiber axes").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+    egui::Window::new("Display settings").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
         ui.horizontal(|ui| {
             ui.selectable_value(tab, "grid".into(), "Grid");
             ui.selectable_value(tab, "crosshair".into(), "Crosshair");

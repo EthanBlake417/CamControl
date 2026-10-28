@@ -1,6 +1,6 @@
-//! Drawing measurements, counting marks and fiber axes through draw::Canvas,
+//! Drawing measurements and fiber axes through draw::Canvas,
 //! so the same code draws on screen and on exported images
-//! (measure_draw.py, count_panel.draw_marks, fiber_panel.draw_fiber_axes).
+//! (measure_draw.py, fiber_panel.draw_fiber_axes).
 //! `to_out` maps image pixels to wherever we're drawing.
 
 use image::RgbImage;
@@ -9,7 +9,6 @@ use crate::calibration::Calibration;
 use super::style::AngleBands;
 use crate::draw::{label, Canvas, Color, Dash, SkiaCanvas, P};
 use crate::measure::{compute, is_circle, summary, Measurement};
-use crate::processing::count::{Counter, CLASS_COLORS};
 use crate::processing::fiber_axis::{brightest_centre, FiberAxis, Region};
 
 pub const MEASURE_COLOR: Color = [0, 255, 0, 255];
@@ -258,18 +257,7 @@ pub fn draw_measurement(c: &mut dyn Canvas, m: &Measurement, cal: &Calibration, 
     }
 }
 
-pub fn class_color(cls: usize) -> Color {
-    let c = CLASS_COLORS[cls % CLASS_COLORS.len()];
-    [c[0], c[1], c[2], 255]
-}
-
 /// A filled dot per mark, in its class color with a dark outline.
-pub fn draw_marks(c: &mut dyn Canvas, counter: &Counter, to_out: &dyn Fn(f64, f64) -> P, radius: f32) {
-    for m in &counter.marks {
-        c.ellipse(to_out(m.x, m.y), radius, radius, Some([0, 0, 0, 255]), (radius / 4.0).max(1.0), Dash::Solid, Some(class_color(m.cls)));
-    }
-}
-
 pub fn signed_angle(deg: f64) -> f64 {
     let a = (deg + 90.0).rem_euclid(180.0) - 90.0;
     if a == -90.0 { 90.0 } else { a }
@@ -570,12 +558,6 @@ pub fn render_annotated(img: &RgbImage, measurements: &[Measurement], cal: &Cali
     for m in measurements {
         draw_measurement(&mut c, m, cal, &identity, 1.0, MEASURE_COLOR, &style);
     }
-    c.to_image()
-}
-
-pub fn render_marks(img: &RgbImage, counter: &Counter) -> RgbImage {
-    let mut c = SkiaCanvas::from_image(img);
-    draw_marks(&mut c, counter, &identity, (img.width() as f32 / 300.0).max(5.0));
     c.to_image()
 }
 

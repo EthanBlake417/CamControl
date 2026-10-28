@@ -130,11 +130,11 @@ fn right_click_shows_the_view_menu() {
     let path = dir.join("panda.png");
     drawn_panda(&path);
     open(&mut h, &path);
-    assert!(h.query_by_label("Grid, crosshair and fiber axes settings...").is_none());
+    assert!(h.query_by_label("Display settings...").is_none());
     let p = h.state().active_pane().view.to_screen(200.0, 200.0);
     click_at(&mut h, p, PointerButton::Secondary);
     h.run_ok();
-    h.get_by_label("Grid, crosshair and fiber axes settings...").click();
+    h.get_by_label("Display settings...").click();
     h.run_ok();
     assert!(h.state().overlay_open);
 }
@@ -157,7 +157,7 @@ fn find_axes_from_the_panel() {
     let path = dir.join("panda.png");
     drawn_panda(&path);
     open(&mut h, &path);
-    h.press_key_modifiers(Modifiers::COMMAND, Key::Num5); // Fiber axis panel
+    h.press_key_modifiers(Modifiers::COMMAND, Key::Num4); // Fiber axis panel
     h.run_ok();
     assert!(h.state().panels.is_open(PanelId::Fiber));
     h.get_by_label("Find axes").click();
@@ -203,6 +203,11 @@ fn alignment_readings_reference_and_region() {
     open(&mut h, &path);
     h.state_mut().find_fiber_axes(false);
     wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
+    assert_eq!(h.state().alignment.trend.points.len(), 1, "each measurement goes on the live trend");
+    // Fit to fibers: the three in a row, at 170 px.
+    h.state_mut().fit_reference_to_fibers();
+    let (a, b) = h.state().alignment.reference.unwrap();
+    assert!((a.1 - 170.0).abs() < 1.0 && (b.1 - 170.0).abs() < 1.0 && (b.0 - a.0).abs() > 600.0, "{a:?} {b:?}");
     let id = h.state().active;
     h.state_mut().alignment.drawing = Some(DrawTarget::Reference);
     // A line at +30°: every angle shown is measured from it.
@@ -260,7 +265,7 @@ fn fiber_count_numbers_and_saves() {
     open(&mut h, &path);
     h.state_mut().saved.count_first = 17;
     h.state_mut().saved.count_ascending = false;
-    h.press_key_modifiers(Modifiers::COMMAND, Key::Num7);
+    h.press_key_modifiers(Modifiers::COMMAND, Key::Num6); // Fiber count panel
     h.run_ok();
     assert!(h.state().panels.is_open(PanelId::FiberCount));
     h.state_mut().fiber.centre_only = true;
@@ -375,7 +380,6 @@ fn choices_kept_between_sessions() {
     app.fiber.live = true;
     app.fiber.centre_only = true;
     app.fiber_log.record = true;
-    app.class_names[0] = "Cores".into();
     app.multi_layout = "row".into();
     app.overlay_tab = "fiber".into();
     app.alignment.n = 7;
@@ -388,14 +392,14 @@ fn choices_kept_between_sessions() {
     app.save_state_for_test();
     let s = &app.saved;
     assert!(s.fiber_live && s.fiber_centre_only && s.fiber_log_record);
-    assert_eq!((s.count_class_names[0].as_str(), s.multi_layout.as_str(), s.overlay_tab.as_str()), ("Cores", "row", "fiber"));
+    assert_eq!((s.multi_layout.as_str(), s.overlay_tab.as_str()), ("row", "fiber"));
     let back: super::settings::Saved = serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap();
     assert!(back.fiber_live && back.fiber_centre_only && back.fiber_log_record);
     assert_eq!((back.align_n, back.align_reference, back.count_first), (7, Some([1.0, 2.0, 3.0, 4.0]), 17));
     assert_eq!((back.align_next, back.align_ascending), (23, false));
     assert_eq!(back.align_region, Some(crate::processing::fiber_axis::Region::Circle { cx: 5.0, cy: 6.0, r: 7.0 }));
     assert!(back.recording.photo_markup && !back.recording.tl_markup);
-    assert_eq!((back.count_class_names, back.multi_layout, back.overlay_tab), (s.count_class_names.clone(), s.multi_layout.clone(), s.overlay_tab.clone()));
+    assert_eq!((back.multi_layout, back.overlay_tab), (s.multi_layout.clone(), s.overlay_tab.clone()));
 }
 
 #[cfg(feature = "extras")]

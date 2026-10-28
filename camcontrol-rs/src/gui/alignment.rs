@@ -5,6 +5,9 @@
 //! the fibers numbered from the top one's number, up or down, and which one
 //! is on (has the brightest center).
 
+use std::collections::VecDeque;
+use std::time::Instant;
+
 use eframe::egui::{self, RichText};
 use serde_json::json;
 
@@ -60,6 +63,64 @@ pub struct Alignment {
     /// The number the next take's fiber gets, and whether numbers count up (else down).
     pub next_number: i64,
     pub ascending: bool,
+    pub trend: Trend,
+}
+
+/// How many seconds the live trend shows.
+pub const TREND_SECONDS: f64 = 30.0;
+
+/// The measured fiber's angle at each update over the last TREND_SECONDS (active view).
+pub struct Trend {
+    pub start: Instant,
+    pub pane: u64,
+    pub reference: Option<f64>,
+    /// (seconds since start, angle)
+    pub points: VecDeque<(f64, f64)>,
+    pub axis: &'static str,
+}
+
+impl Default for Trend {
+    fn default() -> Self {
+        Self { start: Instant::now(), pane: 0, reference: None, points: VecDeque::new(), axis: "fast" }
+    }
+}
+
+impl Trend {
+    /// Add a value now; forget those older than TREND_SECONDS. A different view or
+    /// reference line starts afresh (the values aren't comparable).
+    pub fn add(&mut self, pane: u64, reference: Option<f64>, angle: f64, axis: &'static str) {
+        if pane != self.pane || reference != self.reference {
+            self.points.clear();
+            (self.pane, self.reference) = (pane, reference);
+        }
+        let now = self.start.elapsed().as_secs_f64();
+        self.points.push_back((now, angle));
+        self.axis = axis;
+        while self.points.front().is_some_and(|p| now - p.0 > TREND_SECONDS) {
+            self.points.pop_front();
+        }
+    }
+}
+
+/// The straight line best through the points (least squares, perpendicular distances):
+/// its ends where the points' span along it ends, plus `extend` either way.
+pub fn fit_line(points: &[(f64, f64)], extend: f64) -> Option<((f64, f64), (f64, f64))> {
+    if points.len() < 2 {
+        return None;
+    }
+    let n = points.len() as f64;
+    let (mx, my) = (points.iter().map(|p| p.0).sum::<f64>() / n, points.iter().map(|p| p.1).sum::<f64>() / n);
+    let (mut sxx, mut syy, mut sxy) = (0.0, 0.0, 0.0);
+    for &(x, y) in points {
+        sxx += (x - mx) * (x - mx);
+        syy += (y - my) * (y - my);
+        sxy += (x - mx) * (y - my);
+    }
+    let theta = 0.5 * (2.0 * sxy).atan2(sxx - syy);
+    let (dx, dy) = (theta.cos(), theta.sin());
+    let ts: Vec<f64> = points.iter().map(|&(x, y)| (x - mx) * dx + (y - my) * dy).collect();
+    let (lo, hi) = (ts.iter().cloned().fold(f64::INFINITY, f64::min) - extend, ts.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + extend);
+    (hi - lo > 1e-6).then(|| ((mx + lo * dx, my + lo * dy), (mx + hi * dx, my + hi * dy)))
 }
 
 pub const HEADERS: [&str; 7] = ["Time", "Fiber", "Readings", "Axis", "Mean (deg)", "Std (deg)", "Reference line (deg)"];
@@ -89,6 +150,7 @@ impl Alignment {
             status: String::new(),
             next_number,
             ascending,
+            trend: Trend::default(),
         }
     }
 
@@ -182,6 +244,32 @@ impl App {
         self.alignment.status = format!("Added fiber {fiber} ({got} reading{}).", if got == 1 { "" } else { "s" });
         if !self.panels.is_open(PanelId::Alignment) {
             self.panels.set_open(PanelId::Alignment, true);
+        }
+    }
+
+    /// Each measurement of the active view: the measured fiber's angle onto the live trend.
+    pub(crate) fn alignment_trend(&mut self, pane: u64) {
+        if pane != self.active {
+            return;
+        }
+        let drawing = self.fiber_drawing();
+        let Some(f) = self.measured_fiber(pane) else { return };
+        let angle = drawing.off_perpendicular(&f).unwrap_or_else(|| drawing.shown(f.fast_deg()));
+        let axis = drawing.perpendicular_axis(&f).unwrap_or("fast");
+        self.alignment.trend.add(pane, drawing.reference, angle, axis);
+    }
+
+    /// A reference line fitted through the centers of the active view's fibers.
+    pub(crate) fn fit_reference_to_fibers(&mut self) {
+        let fibers = &self.active_pane().fibers;
+        let centers: Vec<(f64, f64)> = fibers.iter().map(|f| (f.cx, f.cy)).collect();
+        let extend = fibers.iter().map(|f| f.radius).fold(0.0, f64::max);
+        match fit_line(&centers, extend) {
+            Some(line) => {
+                self.alignment.reference = Some(line);
+                self.message(format!("Reference line through {} fiber centers.", centers.len()), Some(6.0));
+            }
+            None => self.warn("Fit to fibers", "Needs at least two fibers: press Find axes (Fiber axis) first."),
         }
     }
 
@@ -300,18 +388,23 @@ impl App {
         if w > 1000.0 {
             ui.columns(3, |c| {
                 self.align_readings_box(&mut c[0]);
+                c[0].add_space(6.0);
+                self.align_trend_box(&mut c[0]);
                 self.align_setup_box(&mut c[1]);
                 self.align_table(&mut c[2]);
             });
         } else if w > 600.0 {
             ui.columns(2, |c| {
                 self.align_readings_box(&mut c[0]);
+                c[0].add_space(6.0);
+                self.align_trend_box(&mut c[0]);
                 self.align_setup_box(&mut c[1]);
+                c[1].add_space(6.0);
+                self.align_table(&mut c[1]);
             });
-            ui.add_space(6.0);
-            self.align_table(ui);
         } else {
             self.align_readings_box(ui);
+            self.align_trend_box(ui);
             self.align_setup_box(ui);
             self.align_table(ui);
         }
@@ -370,6 +463,24 @@ impl App {
         });
     }
 
+    fn align_trend_box(&mut self, ui: &mut egui::Ui) {
+        let t = &self.alignment.trend;
+        let current = t.points.back().map(|p| p.1);
+        section(ui, "Live trend", None, |ui| {
+            ui.horizontal(|ui| {
+                match current {
+                    Some(v) => ui.label(RichText::new(format!("{} {v:+.2}°", t.axis)).size(20.0).strong()),
+                    None => ui.label(RichText::new("No measurements yet").weak()),
+                };
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new(format!("last {TREND_SECONDS:.0} s")).weak());
+                });
+            }).response.on_hover_text("The measured fiber's angle at each update (turn on Update live in Fiber axis to follow it):
+                                       with a reference line, its axis against perpendicular to the line; else its fast axis.");
+            trend_plot(ui, t, 80.0);
+        });
+    }
+
     fn align_setup_box(&mut self, ui: &mut egui::Ui) {
         let drawing = self.alignment.drawing;
         section(ui, "Reference line", Some(c32(self.saved.fiber_lines.reference_look().0)), |ui| {
@@ -378,6 +489,12 @@ impl App {
                     .on_hover_text("Drag a line on the image along the fibers' edge (e.g. the groove): the readout and\n\
                                     the readings then give each fiber's axis against perpendicular to it.").clicked() {
                     self.start_drawing(DrawTarget::Reference);
+                }
+                let fibers = self.active_pane().fibers.len();
+                if ui.add_enabled(fibers >= 2, egui::Button::new("Fit to fibers").min_size(egui::vec2(0.0, 30.0)))
+                    .on_hover_text("Put the line through the centers of the fibers found (e.g. a groove full of fibers).
+                                    Needs two or more: press Find axes first.").clicked() {
+                    self.fit_reference_to_fibers();
                 }
                 if ui.add_enabled(self.alignment.reference.is_some(), egui::Button::new("Clear").min_size(egui::vec2(0.0, 30.0))).clicked() {
                     self.alignment.reference = None;
@@ -646,6 +763,33 @@ pub(crate) fn section<R>(ui: &mut egui::Ui, title: &str, swatch: Option<egui::Co
     }).inner
 }
 
+/// The trend as a line over the last TREND_SECONDS, zero in the middle (perpendicular to the
+/// reference line, or horizontal), the scale fitting the values (at least ±0.5°).
+fn trend_plot(ui: &mut egui::Ui, t: &Trend, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+    let mid = rect.center().y;
+    painter.line_segment([egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)], egui::Stroke::new(1.0, ui.visuals().weak_text_color()));
+    let Some(&(now, _)) = t.points.back() else { return };
+    let span = t.points.iter().map(|p| p.1.abs()).fold(0.5, f64::max) * 1.2;
+    let font = egui::FontId::proportional(11.0);
+    let weak = ui.visuals().weak_text_color();
+    painter.text(rect.left_top() + egui::vec2(4.0, 2.0), egui::Align2::LEFT_TOP, format!("+{span:.1}°"), font.clone(), weak);
+    painter.text(rect.left_bottom() + egui::vec2(4.0, -2.0), egui::Align2::LEFT_BOTTOM, format!("-{span:.1}°"), font, weak);
+    let to = |p: &(f64, f64)| egui::pos2(
+        rect.right() - ((now - p.0) / TREND_SECONDS) as f32 * rect.width(),
+        mid - (p.1 / span) as f32 * (rect.height() / 2.0 - 4.0),
+    );
+    let pts: Vec<egui::Pos2> = t.points.iter().map(to).collect();
+    if pts.len() >= 2 {
+        painter.add(egui::Shape::line(pts.clone(), egui::Stroke::new(2.0, egui::Color32::from_rgb(0x2f, 0x6f, 0xd0))));
+    }
+    if let Some(last) = pts.last() {
+        painter.circle_filled(*last, 3.5, egui::Color32::from_rgb(0x2f, 0x6f, 0xd0));
+    }
+}
+
 /// A larger on/off button (for drawing on the image).
 fn big_toggle(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
     ui.add(egui::Button::new(RichText::new(text).size(14.0)).selected(on).min_size(egui::vec2(0.0, 30.0)))
@@ -668,6 +812,30 @@ mod tests {
         assert!(near(off(89.0, 0.0), -1.0));
         assert!(near(off(122.0, 30.0), 2.0) && near(off(32.0, 30.0), 2.0));
         assert!(near(off(44.0, 0.0), 44.0) && near(off(46.0, 0.0), -44.0), "nearest axis past 45");
+    }
+
+    #[test]
+    fn line_through_fiber_centers() {
+        // A column, leaning a little: the line along it, reaching past the ends.
+        let pts: Vec<(f64, f64)> = (0..5).map(|k| (100.0 + 2.0 * k as f64, 50.0 + 100.0 * k as f64)).collect();
+        let (a, b) = fit_line(&pts, 30.0).unwrap();
+        let deg = signed_angle(line_angle(a, b));
+        assert!((deg.abs() - (90.0 - (2.0f64 / 100.0).atan().to_degrees())).abs() < 1e-6, "{deg}");
+        assert!(((b.0 - a.0).hypot(b.1 - a.1) - (400.0f64.hypot(8.0) + 60.0)).abs() < 1e-6);
+        assert!(fit_line(&pts[..1], 0.0).is_none());
+    }
+
+    #[test]
+    fn trend_keeps_the_last_seconds() {
+        let mut t = Trend::default();
+        t.add(1, None, 0.5, "fast");
+        t.add(1, None, 0.7, "fast");
+        assert_eq!(t.points.len(), 2);
+        t.add(1, Some(10.0), 0.1, "slow");
+        assert_eq!((t.points.len(), t.axis), (1, "slow"), "a new reference line starts afresh");
+        t.points.push_front((-100.0, 9.0));
+        t.add(1, Some(10.0), 0.2, "slow");
+        assert!(t.points.iter().all(|p| p.0 > -1.0), "older than {TREND_SECONDS} s dropped");
     }
 
     #[test]

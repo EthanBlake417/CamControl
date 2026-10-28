@@ -271,7 +271,7 @@ impl App {
         for id in extra {
             let p = self.pane(id);
             let keep = p.camera.as_ref().is_some_and(|c| !busy_list(c).is_empty())
-                || !p.measurements.is_empty() || !p.counter.marks.is_empty() || !p.fibers.is_empty();
+                || !p.measurements.is_empty() || !p.fibers.is_empty();
             if !keep {
                 self.remove_view(id, true);
             }
@@ -724,7 +724,7 @@ impl App {
     fn ask_clear_annotations(&mut self, ctx: &egui::Context, id: u64, title: &str, then: Action) {
         self.set_active(id);
         let p = self.pane(id);
-        if p.measurements.is_empty() && p.counter.marks.is_empty() {
+        if p.measurements.is_empty() {
             self.perform(ctx, then);
             return;
         }
@@ -852,7 +852,6 @@ impl App {
                 p.measurements.clear();
                 p.next_id = 1;
                 p.measure_selected = None;
-                p.counter.marks.clear();
             }
             Action::OpenImage(id, path) => match capture::load_image(&path) {
                 None => self.warn("CamControl", format!("Could not read {}", path.display())),
@@ -906,7 +905,6 @@ impl App {
                 p.next_id = 1;
                 p.measure_selected = None;
             }
-            Action::ClearMarks(id) => self.pane_mut(id).counter.marks.clear(),
             Action::UseViewAsFlat => {
                 let Some(img) = self.active_pane().image() else { return };
                 let dir = settings::flat_dir();
@@ -997,21 +995,8 @@ impl App {
             }
             ViewEvent::ToolExit => {
                 self.tool = None;
-                self.counting = false;
                 self.picking_rod = false;
                 self.alignment.drawing = None;
-            }
-            ViewEvent::CountAdd(x, y) => {
-                if self.counting {
-                    let cls = self.count_class;
-                    self.pane_mut(id).counter.add(x, y, cls);
-                }
-            }
-            ViewEvent::CountRemove(x, y, d) => {
-                self.pane_mut(id).counter.remove_nearest(x, y, d);
-            }
-            ViewEvent::CountUndo => {
-                self.pane_mut(id).counter.marks.pop();
             }
         }
     }
@@ -1319,6 +1304,7 @@ impl App {
         self.pane_mut(req.pane).fibers = axes;
         self.record_fibers(req.pane);
         self.alignment_reading(req.pane);
+        self.alignment_trend(req.pane);
         if req.kind == FiberKind::Find {
             if n > 0 {
                 let note = if unclear > 0 { format!(" ({unclear} unclear)") } else { String::new() };

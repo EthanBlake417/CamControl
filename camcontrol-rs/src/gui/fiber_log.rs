@@ -207,37 +207,44 @@ impl App {
         }
     }
 
-    /// Everything stacked (controls, summary, log), so it fits a side column as well as the bottom.
+    /// Everything stacked (recording, summary, log), so it fits a side column as well as the bottom.
     pub(crate) fn fiber_log_panel(&mut self, ui: &mut egui::Ui) {
         let has_rows = !self.fiber_log.entries.is_empty();
-        ui.horizontal_wrapped(|ui| {
+        super::alignment::section(ui, "Recording", None, |ui| {
             ui.checkbox(&mut self.fiber_log.record, "Record each update").on_hover_text(
                 "Log the slow and fast axes and image quality of every fiber each time the Fiber axis panel measures\n\
                  (Find axes, or every update with Update live on, live or on a playing video).");
-            if ui.add_enabled(has_rows, egui::Button::new("Save to CSV..."))
-                .on_hover_text("Save the log, with the summary beside it (..._summary.csv).\nPick Excel in the dialog for one .xlsx file instead.")
-                .clicked() {
-                self.save_fiber_log();
-            }
-            if ui.add_enabled(has_rows, egui::Button::new("Clear")).on_hover_text("Forget the recorded rows.").clicked() {
-                self.fiber_log.clear();
-            }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(has_rows, egui::Button::new("Save to CSV..."))
+                    .on_hover_text("Save the log, with the summary beside it (..._summary.csv).\nPick Excel in the dialog for one .xlsx file instead.")
+                    .clicked() {
+                    self.save_fiber_log();
+                }
+                if ui.add_enabled(has_rows, egui::Button::new("Clear")).on_hover_text("Forget the recorded rows.").clicked() {
+                    self.fiber_log.clear();
+                }
+                let log = &self.fiber_log;
+                ui.label(egui::RichText::new(format!("{} rows, {} updates", log.entries.len(), log.updates)).weak());
+            });
         });
         let log = &self.fiber_log;
-        ui.label(egui::RichText::new(format!("{} rows from {} updates", log.entries.len(), log.updates)).weak());
-        ui.add_space(4.0);
-        ui.strong("Summary").on_hover_text("Per fiber over the whole log: number of updates, mean (μ) slow and fast axis, their standard deviation \
-                                            (σ, the same for both), and mean contrast.");
-        let summary = log.summary();
-        if summary.is_empty() {
-            ui.label(egui::RichText::new("Nothing recorded yet.").weak());
-        } else {
-            egui::Grid::new("fiber_log_summary").striped(true).num_columns(6).show(ui, |ui| {
-                for h in ["Fiber", "n", "μ slow °", "μ fast °", "σ °", "μ contrast"] {
-                    ui.strong(h);
+        if !has_rows {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Nothing recorded yet: tick Record each update, then measure.").weak());
+            return;
+        }
+        ui.add_space(6.0);
+        super::alignment::section(ui, "Summary", None, |ui| {
+            egui::Grid::new("fiber_log_summary").striped(true).num_columns(6).spacing(egui::vec2(12.0, 4.0)).show(ui, |ui| {
+                for (h, tip) in [("Fiber", ""), ("n", "Updates logged"), ("μ slow", "Mean slow axis (°)"), ("μ fast", "Mean fast axis (°)"),
+                                 ("σ", "Standard deviation (°), the same for both axes"), ("μ contrast", "Mean contrast")] {
+                    let r = ui.strong(h);
+                    if !tip.is_empty() {
+                        r.on_hover_text(tip);
+                    }
                 }
                 ui.end_row();
-                for s in summary {
+                for s in log.summary() {
                     ui.label(s.fiber.to_string());
                     ui.label(s.count.to_string());
                     ui.label(format!("{:+.2}", s.mean_slow));
@@ -247,37 +254,60 @@ impl App {
                     ui.end_row();
                 }
             });
-        }
-        ui.add_space(4.0);
-        ui.strong("Log").on_hover_text(format!("Each update's angles and image quality, newest at the bottom; # is the update number.\n\n{QUALITY_HELP}"));
-        let row_h = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
-        egui::ScrollArea::both().id_salt("fiber_log_rows").stick_to_bottom(true).auto_shrink([false, false])
-            .show_rows(ui, row_h, log.entries.len() + 1, |ui, range| {
-                egui::Grid::new("fiber_log_rows_grid").striped(true).num_columns(8).start_row(range.start).show(ui, |ui| {
+        });
+        ui.add_space(6.0);
+        // The angle against a reference line only when some update had one.
+        let with_angle = log.entries.iter().any(|e| e.perp.is_some());
+        super::alignment::section(ui, "Log", None, |ui| {
+            // Column widths shared by the headings and the rows.
+            let cols: Vec<(&str, f32, &str)> = [
+                ("Time", 64.0, ""),
+                ("#", 30.0, "Update number"),
+                ("Fiber", 38.0, ""),
+                ("Slow", 54.0, "Axis angle (°): from horizontal, or from the reference line."),
+                ("Fast", 54.0, "Axis angle (°): from horizontal, or from the reference line."),
+                ("Angle", 92.0, "With a reference line: the axis nearest perpendicular to it, and how far off (°)."),
+                ("Quality", 50.0, QUALITY_HELP),
+            ].into_iter().filter(|c| c.0 != "Angle" || with_angle).collect();
+            let cell = |ui: &mut egui::Ui, w: f32, text: egui::RichText| {
+                ui.add_sized([w, 18.0], egui::Label::new(text).truncate())
+            };
+            ui.horizontal(|ui| {
+                for &(h, w, tip) in &cols {
+                    let r = cell(ui, w, egui::RichText::new(h).strong());
+                    if !tip.is_empty() {
+                        r.on_hover_text(tip);
+                    }
+                }
+            });
+            ui.separator();
+            let row_h = 18.0 + ui.spacing().item_spacing.y;
+            egui::ScrollArea::vertical().id_salt("fiber_log_rows").stick_to_bottom(true).auto_shrink([false, false])
+                .show_rows(ui, row_h, log.entries.len(), |ui, range| {
                     for i in range {
-                        if i == 0 {
-                            for h in ["Time", "#", "Fiber", "Slow °", "Fast °", "Angle", "Contrast", "Quality"] {
-                                let r = ui.strong(h);
-                                if h == "Quality" || h == "Contrast" {
-                                    r.on_hover_text(QUALITY_HELP);
+                        let e = &log.entries[i];
+                        let q = e.quality.as_ref();
+                        let texts: Vec<(&str, egui::RichText)> = vec![
+                            ("Time", e.time.get(11..19).unwrap_or(&e.time).into()),
+                            ("#", e.update.to_string().into()),
+                            ("Fiber", e.fiber.to_string().into()),
+                            ("Slow", format!("{:+.2}", e.slow).into()),
+                            ("Fast", format!("{:+.2}", e.fast).into()),
+                            ("Angle", e.perp.zip(e.perp_axis).map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default().into()),
+                            ("Quality", grade_text(q)),
+                        ];
+                        ui.horizontal(|ui| {
+                            for (name, text) in texts {
+                                let Some(&(_, w, _)) = cols.iter().find(|c| c.0 == name) else { continue };
+                                let r = cell(ui, w, text);
+                                if name == "Quality" {
+                                    r.on_hover_text(quality_hover(q));
                                 }
                             }
-                        } else {
-                            let e = &log.entries[i - 1];
-                            ui.label(e.time.get(11..).unwrap_or(&e.time));
-                            ui.label(e.update.to_string());
-                            ui.label(e.fiber.to_string());
-                            ui.label(format!("{:+.2}", e.slow));
-                            ui.label(format!("{:+.2}", e.fast));
-                            ui.label(e.perp.zip(e.perp_axis).map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default());
-                            let q = e.quality.as_ref();
-                            ui.label(fmt_contrast(q)).on_hover_text(quality_hover(q));
-                            ui.label(grade_text(q)).on_hover_text(quality_hover(q));
-                        }
-                        ui.end_row();
+                        });
                     }
                 });
-            });
+        });
     }
 }
 
