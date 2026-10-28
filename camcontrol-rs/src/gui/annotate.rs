@@ -299,7 +299,7 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
             }
         }
         c.ellipse(center, r, r, Some([255, 255, 255, 160]), (width / 2.0).max(1.0), Dash::Dot, None);
-        if brightest == Some(i) {
+        if brightest == Some(i) && !drawing.numbers_only { // counting: the number says "on" instead
             let k = (r * 0.25).max(style.marker * 3.0);
             c.ellipse(center, k, k, Some(READOUT_COLOR), width, Dash::Solid, None);
         }
