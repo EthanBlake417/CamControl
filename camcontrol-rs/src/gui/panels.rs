@@ -2,6 +2,7 @@
 //! view), Measurements, Counting and Fiber axis (main_window._build_controls,
 //! measure_panel.py, count_panel.py, record_panel.py, fiber_panel.py).
 
+use super::alignment::section;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -70,8 +71,7 @@ impl App {
         if let (Some(c), true) = (self.controlled, self.panes.len() > 1) {
             title += &format!(" (view {})", self.number(c));
         }
-        ui.group(|ui| {
-            ui.strong(title);
+        section(ui, &title, None, |ui| {
             ui.horizontal(|ui| {
                 let (text, color, tip) = match self.link() {
                     None => ("No camera in this view".to_string(), Some([128, 128, 128]), "Choose one in Device, or in a view's Source menu.".to_string()),
@@ -88,7 +88,7 @@ impl App {
                     }
                 });
             });
-            egui::Grid::new("device").num_columns(2).show(ui, |ui| {
+            egui::Grid::new("device").num_columns(2).spacing(egui::vec2(10.0, 6.0)).show(ui, |ui| {
                 ui.label("Device");
                 let target = self.controlled.unwrap_or(self.active);
                 let current = self.pane(target).camera.as_ref().map(|c| c.key.clone());
@@ -163,7 +163,8 @@ impl App {
             let open = self.link().is_some_and(|l| l.open);
             let mut changes = Vec::new();
             let mut holding = None;
-            egui::Grid::new("sliders").num_columns(2).show(ui, |ui| {
+            ui.add_space(2.0);
+            egui::Grid::new("sliders").num_columns(2).spacing(egui::vec2(10.0, 6.0)).show(ui, |ui| {
                 for name in ADJUSTABLE {
                     ui.label(capitalize(name));
                     let info = self.link().map(|l| (l.ranges.get(name).copied().flatten(), l.values.get(name).copied(), l.exposure_log2));
@@ -229,9 +230,9 @@ impl App {
         });
 
         // --- Output ---
-        ui.group(|ui| {
-            ui.strong("Output");
-            egui::Grid::new("output").num_columns(2).show(ui, |ui| {
+        ui.add_space(6.0);
+        section(ui, "Output", None, |ui| {
+            egui::Grid::new("output").num_columns(2).spacing(egui::vec2(10.0, 6.0)).show(ui, |ui| {
                 ui.label("Folder");
                 ui.horizontal(|ui| {
                     if ui.button("...").clicked() {
@@ -270,15 +271,17 @@ impl App {
         });
 
         // --- Photo / Video / Time-lapse ---
-        ui.group(|ui| {
-            ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        section(ui, "Capture", None, |ui| {
+            ui.columns(3, |c| {
                 for (i, t) in ["Photo", "Video", "Time-lapse"].iter().enumerate() {
-                    if toggle(ui, self.saved.capture_tab == i, t).clicked() {
+                    let on = self.saved.capture_tab == i;
+                    if c[i].add(egui::Button::new(*t).selected(on).min_size(egui::vec2(c[i].available_width(), 28.0))).clicked() {
                         self.saved.capture_tab = i;
                     }
                 }
             });
-            ui.separator();
+            ui.add_space(4.0);
             let open = self.link().is_some_and(|l| l.open);
             match self.saved.capture_tab {
                 1 => self.video_tab(ui, open),
@@ -288,8 +291,8 @@ impl App {
         });
 
         // --- View ---
-        ui.group(|ui| {
-            ui.strong("View");
+        ui.add_space(6.0);
+        section(ui, "View", None, |ui| {
             let wide = |c: &mut egui::Ui, on: bool, text: &str, enabled: bool| {
                 c.add_enabled(enabled, egui::Button::new(text).selected(on).min_size(egui::vec2(c.available_width(), 0.0)))
             };
@@ -328,11 +331,8 @@ impl App {
                 }
             });
         });
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.strong("Histogram");
-            self.histogram_box(ui, 170.0);
-        });
+        ui.add_space(6.0);
+        section(ui, "Histogram", None, |ui| self.histogram_box(ui, 170.0));
     }
 
     fn photo_tab(&mut self, ui: &mut egui::Ui) {
@@ -560,162 +560,183 @@ impl App {
         let mut changed = false;
         let mut tune = false;
         ui.horizontal_top(|ui| {
+            // Measuring: the button, what's shown, how.
             ui.vertical(|ui| {
-                ui.set_width(210.0);
-                ui.horizontal(|ui| {
-                    if primary(ui, "Find axes", true, egui::vec2(130.0, 30.0)).on_hover_text("Measure the fibers in the image in the view.").clicked() {
-                        self.find_fiber_axes(false);
-                    }
-                    if ui.add(egui::Button::new("Clear").min_size(egui::vec2(62.0, 30.0))).on_hover_text("Remove the axes from the view.").clicked() {
-                        self.active_pane_mut().fibers.clear();
-                    }
-                });
-                if ui.checkbox(&mut self.fiber.live, "Update live").on_hover_text(
-                    "Keep measuring the live view (a few times a second),\ne.g. while rotating a fiber to line up its axis;\nmeasure each saved image as it's opened, and the frames of a video\nas it plays (as often as it keeps up) or as you step through it.").changed() && self.fiber.live
-                {
-                    self.find_fiber_axes(true);
-                }
-                ui.checkbox(&mut self.fiber.show_parts, "Show stress parts").on_hover_text(
-                    "Shade the stress parts the axis was measured from, with a cross at each one's center,\nand ring the point the axis turns about. Also used for the exported drawing.");
-                changed |= ui.checkbox(&mut self.fiber.centre_only, "Only the center fiber").on_hover_text(
-                    "Of the fibers found automatically, measure only the one nearest the middle of the image\n(e.g. the lit fiber in a V-groove, with its neighbours ignored). Faster for Update live.").changed();
-                ui.horizontal(|ui| {
-                    ui.label("Method:");
-                    egui::ComboBox::from_id_salt("method").selected_text(method_label(&self.fiber.method)).show_ui(ui, |ui| {
-                        for (name, label) in METHODS {
-                            changed |= ui.selectable_value(&mut self.fiber.method, name.to_string(), label).on_hover_text(method_tip(name)).changed();
-                        }
-                    }).response.on_hover_text("How the axis angle is worked out. Hover over a choice for details.\nAutomatic picks the method for each fiber.");
-                });
-                ui.checkbox(&mut self.fiber.advanced, "Show advanced settings").on_hover_text(
-                    "Smallest rod, turning about the stress parts, circle measurements and the stress part detection settings.\nNot needed normally.");
-                if self.fiber.advanced {
+                ui.set_width(290.0);
+                section(ui, "Measure", None, |ui| {
+                    let find = egui::Button::new(RichText::new("Find axes").size(18.0).strong().color(Color32::WHITE))
+                        .fill(Color32::from_rgb(0x2f, 0x6f, 0xd0)).min_size(egui::vec2(ui.available_width() - 70.0, 40.0));
                     ui.horizontal(|ui| {
-                        ui.label("Smallest rod:");
-                        let d = &mut self.fiber.detection;
-                        let r = ui.add(egui::DragValue::new(&mut d.min_rod_px).range(0.0..=5000.0).speed(1.0)
-                                .custom_formatter(|v, _| if v <= 0.0 { "any".into() } else { format!("{v:.0} px") }))
-                            .on_hover_text("Panda rod outlines: round things with a smaller radius than this (image pixels) are never\n\
-                                            taken for a stress rod, e.g. dust, bubbles or the core. \"any\" (0) tries every size;\n\
-                                            raise it when a speck is outlined instead of a rod. Each fiber gets it as a share of\n\
-                                            its own radius (18% to 40%).");
-                        tune |= r.changed();
-                        let picking = self.picking_rod;
-                        if ui.add(egui::Button::new("Draw").selected(picking)).on_hover_text(
-                            "Draw it on the view: click the center of the smallest rod (or anything that size),\nthen its edge. Esc cancels.").clicked() {
-                            self.picking_rod = !picking;
-                            self.tool = (!picking).then(|| "circle_centre".to_string());
-                            self.counting = false;
-                            if !picking {
-                                self.message("Smallest rod: click the center of a rod, then its edge (Esc cancels).", Some(8.0));
-                            }
+                        if ui.add(find).on_hover_text("Measure the fibers in the image in the view.").clicked() {
+                            self.find_fiber_axes(false);
+                        }
+                        if ui.add(egui::Button::new("Clear").min_size(egui::vec2(60.0, 40.0))).on_hover_text("Remove the axes from the view.").clicked() {
+                            self.active_pane_mut().fibers.clear();
                         }
                     });
-                }
+                    ui.horizontal(|ui| {
+                        ui.label("Method");
+                        egui::ComboBox::from_id_salt("method").selected_text(method_label(&self.fiber.method)).width(140.0).show_ui(ui, |ui| {
+                            for (name, label) in METHODS {
+                                changed |= ui.selectable_value(&mut self.fiber.method, name.to_string(), label).on_hover_text(method_tip(name)).changed();
+                            }
+                        }).response.on_hover_text("How the axis angle is worked out. Hover over a choice for details.\nAutomatic picks the method for each fiber.");
+                    });
+                    ui.columns(2, |c| {
+                        if c[0].checkbox(&mut self.fiber.live, "Update live").on_hover_text(
+                            "Keep measuring the live view (a few times a second),
+e.g. while rotating a fiber to line up its axis;
+measure each saved image as it's opened, and the frames of a video
+as it plays (as often as it keeps up) or as you step through it.").changed() && self.fiber.live
+                        {
+                            self.find_fiber_axes(true);
+                        }
+                        changed |= c[0].checkbox(&mut self.fiber.centre_only, "Only center fiber").on_hover_text(
+                            "Of the fibers found automatically, measure only the one nearest the middle of the image
+(e.g. the lit fiber in a V-groove, with its neighbours ignored). Faster for Update live.").changed();
+                        c[1].checkbox(&mut self.fiber.show_parts, "Stress parts").on_hover_text(
+                            "Show the stress parts the axis was measured from, with a cross at each one's center,
+and ring the point the axis turns about. Also on saved images and videos.");
+                        c[1].checkbox(&mut self.fiber.advanced, "Advanced").on_hover_text(
+                            "Smallest rod and the stress part detection settings. Not needed normally.");
+                    });
+                });
             });
             if self.fiber.advanced {
-                ui.add_enabled_ui(self.fiber.method != "rods", |ui| {
-                    ui.group(|ui| {
-                        ui.set_width(300.0);
-                        ui.strong("Stress part detection").on_hover_text("Tune these when the shaded stress parts don't match what you see\n(turn on Show stress parts and Update live to watch them change).");
-                        let d = &mut self.fiber.detection;
-                        egui::Grid::new("detection").num_columns(2).show(ui, |ui| {
-                            ui.label("Look at:");
-                            let label = LOOK_AT.iter().find(|l| l.0 == d.look_at).map(|l| l.1).unwrap_or("");
-                            egui::ComboBox::from_id_salt("look").selected_text(label).show_ui(ui, |ui| {
-                                for (name, label, _) in LOOK_AT {
-                                    changed |= ui.selectable_value(&mut d.look_at, name.to_string(), label).on_hover_text(look_tip(name)).changed();
-                                }
-                            });
-                            ui.end_row();
-                            ui.label("Threshold:");
+                ui.vertical(|ui| {
+                    ui.set_width(320.0);
+                    section(ui, "Advanced", None, |ui| {
+                        egui::Grid::new("detection").num_columns(2).spacing(egui::vec2(10.0, 6.0)).show(ui, |ui| {
+                            ui.label("Smallest rod");
                             ui.horizontal(|ui| {
-                                let mut auto = d.threshold.is_none();
-                                if ui.checkbox(&mut auto, "Auto").on_hover_text("Pick the threshold automatically (Otsu's method).\nUntick to set it yourself, starting from the automatic value.").changed() {
-                                    d.threshold = if auto { None } else { Some((self.fiber.shown_threshold * 2.0).round() / 2.0) };
-                                    changed = true;
-                                }
-                                let mut t = d.threshold.unwrap_or(self.fiber.shown_threshold);
-                                let r = ui.add_enabled(!auto, egui::Slider::new(&mut t, 0.5..=40.0).step_by(0.5).fixed_decimals(1))
-                                    .on_hover_text("How different from the cladding a pixel must be to count as stress part,\nin multiples of the cladding's own noise. Lower finds fainter parts, but also noise.");
-                                if r.changed() {
-                                    d.threshold = Some(t);
-                                    tune = true;
+                                let d = &mut self.fiber.detection;
+                                let r = ui.add(egui::DragValue::new(&mut d.min_rod_px).range(0.0..=5000.0).speed(1.0)
+                                        .custom_formatter(|v, _| if v <= 0.0 { "any".into() } else { format!("{v:.0} px") }))
+                                    .on_hover_text("Panda rod outlines: round things with a smaller radius than this (image pixels) are never\n\
+                                                    taken for a stress rod, e.g. dust, bubbles or the core. \"any\" (0) tries every size;\n\
+                                                    raise it when a speck is outlined instead of a rod. Each fiber gets it as a share of\n\
+                                                    its own radius (18% to 40%).");
+                                tune |= r.changed();
+                                let picking = self.picking_rod;
+                                if ui.add(egui::Button::new("Draw").selected(picking)).on_hover_text(
+                                    "Draw it on the view: click the center of the smallest rod (or anything that size),\nthen its edge. Esc cancels.").clicked() {
+                                    self.picking_rod = !picking;
+                                    self.tool = (!picking).then(|| "circle_centre".to_string());
+                                    self.counting = false;
+                                    if !picking {
+                                        self.message("Smallest rod: click the center of a rod, then its edge (Esc cancels).", Some(8.0));
+                                    }
                                 }
                             });
                             ui.end_row();
-                            ui.label("Smoothing:");
-                            tune |= ui.add(egui::Slider::new(&mut d.smoothing, 0.0..=5.0).step_by(0.25).suffix("%"))
+                            let parts = self.fiber.method != "rods";
+                            let d = &mut self.fiber.detection;
+                            ui.add_enabled(parts, egui::Label::new("Look at")).on_hover_text("Stress part detection (not used by Panda rod outlines).");
+                            let label = LOOK_AT.iter().find(|l| l.0 == d.look_at).map(|l| l.1).unwrap_or("");
+                            ui.add_enabled_ui(parts, |ui| {
+                                egui::ComboBox::from_id_salt("look").selected_text(label).show_ui(ui, |ui| {
+                                    for (name, label, _) in LOOK_AT {
+                                        changed |= ui.selectable_value(&mut d.look_at, name.to_string(), label).on_hover_text(look_tip(name)).changed();
+                                    }
+                                });
+                            });
+                            ui.end_row();
+                            ui.add_enabled(parts, egui::Label::new("Threshold"));
+                            ui.add_enabled_ui(parts, |ui| {
+                                ui.horizontal(|ui| {
+                                    let mut auto = d.threshold.is_none();
+                                    if ui.checkbox(&mut auto, "Auto").on_hover_text("Pick the threshold automatically (Otsu's method).\nUntick to set it yourself, starting from the automatic value.").changed() {
+                                        d.threshold = if auto { None } else { Some((self.fiber.shown_threshold * 2.0).round() / 2.0) };
+                                        changed = true;
+                                    }
+                                    let mut t = d.threshold.unwrap_or(self.fiber.shown_threshold);
+                                    let r = ui.add_enabled(!auto, egui::Slider::new(&mut t, 0.5..=40.0).step_by(0.5).fixed_decimals(1))
+                                        .on_hover_text("How different from the cladding a pixel must be to count as stress part,\nin multiples of the cladding's own noise. Lower finds fainter parts, but also noise.");
+                                    if r.changed() {
+                                        d.threshold = Some(t);
+                                        tune = true;
+                                    }
+                                });
+                            });
+                            ui.end_row();
+                            ui.add_enabled(parts, egui::Label::new("Smoothing"));
+                            tune |= ui.add_enabled(parts, egui::Slider::new(&mut d.smoothing, 0.0..=5.0).step_by(0.25).suffix("%"))
                                 .on_hover_text("Blur before comparing, as % of the fiber radius.\nMore smooths out noise and fine texture, but rounds off small parts.").changed();
                             ui.end_row();
-                            ui.label("Ignore specks:");
-                            tune |= ui.add(egui::Slider::new(&mut d.min_size, 1.0..=40.0).step_by(1.0).suffix("%"))
+                            ui.add_enabled(parts, egui::Label::new("Ignore specks"));
+                            tune |= ui.add_enabled(parts, egui::Slider::new(&mut d.min_size, 1.0..=40.0).step_by(1.0).suffix("%"))
                                 .on_hover_text("Leave out regions smaller than a square this wide (% of the fiber radius):\ndust, scratches, noise.").changed();
                             ui.end_row();
                         });
                         if ui.button("Defaults").on_hover_text("Back to the standard detection settings.").clicked() {
-                            *d = Detection::default();
+                            self.fiber.detection = Detection::default();
                             changed = true;
                         }
                     });
                 });
             }
+            // The results.
             ui.vertical(|ui| {
                 let a = self.active;
                 let mut select = None;
-                egui::ScrollArea::both().max_height((ui.available_height() - 50.0).max(60.0)).auto_shrink([false, true]).show(ui, |ui| {
-                    egui::Grid::new("fibers").striped(true).num_columns(13).show(ui, |ui| {
-                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "Angle (°)", "Clarity", "Contrast", "Quality", "Method", "Center (px)",
-                                  "Axis through (px)", "Diameter (px)", "Center brightness"] {
-                            let r = ui.strong(h);
-                            if h == "Angle (°)" {
-                                r.on_hover_text("With a reference line (Alignment panel): how far the fiber's axis nearest\n\
-                                                 perpendicular to the line is from perpendicular (slow or fast, whichever).");
-                            } else if h == "Contrast" || h == "Quality" {
-                                r.on_hover_text(super::fiber_log::QUALITY_HELP);
-                            } else if h == "Center brightness" {
-                                r.on_hover_text("Brightness (0-255) of the brightest spot near the fiber's center, e.g. light in the core.\n\
-                                                 With several fibers, the brightest is ringed in green and named in the readout\n\
-                                                 by its position counted from the right.");
-                            } else if h == "Clarity" {
-                                r.on_hover_text("How much longer the stress parts spread along the slow axis than across it.\nBelow 1.3 the axis isn't clear (e.g. a plain round fiber, or poor contrast).\nPanda rod outlines: how much of the rods' outlines was found;\nbelow 50% (or with faint outlines) the axis isn't clear.");
-                            }
-                        }
-                        ui.end_row();
-                        let p = self.pane(a);
-                        let brightest = brightest_centre(&p.fibers).map(|b| b.0);
-                        let drawing = self.fiber_drawing();
-                        for (i, f) in p.fibers.iter().enumerate() {
-                            let sel = p.fiber_selected == Some(i);
-                            let clarity = match f.coverage {
-                                Some(c) => format!("{:.0}% outline", c * 100.0),
-                                None => format!("{:.2}", f.elongation),
-                            } + if f.clear() { "" } else { " (unclear)" };
-                            let (ax, ay) = f.axis_point();
-                            // Quality cells (with the numbers on hover) right after Clarity, so they show without scrolling.
-                            let q = f.image_quality.as_ref();
-                            let quality = [egui::RichText::new(super::fiber_log::fmt_contrast(q)), super::fiber_log::grade_text(q)];
-                            let plain = |t: String| (egui::RichText::new(t), false);
-                            let cells = [plain((i + 1).to_string()), plain(f.fiber_type.clone()), plain(fmt_angle(drawing.shown(f.slow_deg))),
-                                         plain(fmt_angle(drawing.shown(f.fast_deg()))),
-                                         plain(drawing.off_perpendicular(f).zip(drawing.perpendicular_axis(f))
-                                             .map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default()), plain(clarity)].into_iter()
-                                .chain(quality.map(|t| (t, true)))
-                                .chain([method_label(&f.method).to_string(), format!("{:.1}, {:.1}", f.cx, f.cy), format!("{ax:.1}, {ay:.1}"),
-                                        format!("{:.1}", 2.0 * f.radius),
-                                        f.centre_brightness.map(|b| format!("{b:.0}{}", if brightest == Some(i) { "  (brightest)" } else { "" }))
-                                            .unwrap_or_default()].map(plain));
-                            for (t, hover) in cells {
-                                let mut r = ui.selectable_label(sel, t);
-                                if hover {
-                                    r = r.on_hover_text(super::fiber_log::quality_hover(q));
-                                }
-                                if r.clicked() {
-                                    select = Some(i);
+                section(ui, "Fibers", None, |ui| {
+                    if self.pane(a).fibers.is_empty() {
+                        ui.label(RichText::new("No fibers measured yet: press Find axes.").weak());
+                        return;
+                    }
+                    egui::ScrollArea::both().max_height(ui.available_height().max(80.0)).auto_shrink([false, true]).show(ui, |ui| {
+                        egui::Grid::new("fibers").striped(true).num_columns(12).spacing(egui::vec2(14.0, 4.0)).show(ui, |ui| {
+                            for h in ["#", "Type", "Slow", "Fast", "Angle", "Clarity", "Contrast", "Quality", "Method", "Center (px)", "Ø (px)", "Brightness"] {
+                                let r = ui.strong(h);
+                                match h {
+                                    "Slow" | "Fast" => { r.on_hover_text("Axis angle (°): from horizontal, or from the reference line if there is one."); }
+                                    "Angle" => { r.on_hover_text("With a reference line (Alignment panel): how far the fiber's axis nearest\n\
+                                                                 perpendicular to the line is from perpendicular (slow or fast, whichever)."); }
+                                    "Contrast" | "Quality" => { r.on_hover_text(super::fiber_log::QUALITY_HELP); }
+                                    "Brightness" => { r.on_hover_text("Brightness (0-255) of the brightest spot near the fiber's center, e.g. light in the core;\n\
+                                                                      \"on\": the brightest of several fibers (ringed in green)."); }
+                                    "Clarity" => { r.on_hover_text("How sure the axis is. Panda rods: how much of the rods' outlines was found (below 50%,\n\
+                                                                   or faint, isn't clear). Other methods: how much longer the stress parts spread along\n\
+                                                                   the slow axis than across it (below 1.3 isn't clear)."); }
+                                    "Method" => { r.on_hover_text("Rods: Panda rod outlines. Core: apple core. Mirror: mirror symmetry.\n\
+                                                                  Centers: stress part centers. Moments: second moments."); }
+                                    "Ø (px)" => { r.on_hover_text("Diameter in image pixels."); }
+                                    _ => {}
                                 }
                             }
                             ui.end_row();
-                        }
+                            let p = self.pane(a);
+                            let brightest = brightest_centre(&p.fibers).map(|b| b.0);
+                            let drawing = self.fiber_drawing();
+                            for (i, f) in p.fibers.iter().enumerate() {
+                                let sel = p.fiber_selected == Some(i);
+                                let clarity = match f.coverage {
+                                    Some(c) => format!("{:.0}%", c * 100.0),
+                                    None => format!("{:.2}", f.elongation),
+                                } + if f.clear() { "" } else { " unclear" };
+                                let q = f.image_quality.as_ref();
+                                let quality = [RichText::new(super::fiber_log::fmt_contrast(q)), super::fiber_log::grade_text(q)];
+                                let plain = |t: String| (RichText::new(t), false);
+                                let cells = [plain((i + 1).to_string()), plain(f.fiber_type.clone()), plain(fmt_angle(drawing.shown(f.slow_deg))),
+                                             plain(fmt_angle(drawing.shown(f.fast_deg()))),
+                                             plain(drawing.off_perpendicular(f).zip(drawing.perpendicular_axis(f))
+                                                 .map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default()), plain(clarity)].into_iter()
+                                    .chain(quality.map(|t| (t, true)))
+                                    .chain([short_method(&f.method).to_string(), format!("{:.0}, {:.0}", f.cx, f.cy), format!("{:.0}", 2.0 * f.radius),
+                                            f.centre_brightness.map(|b| format!("{b:.0}{}", if brightest == Some(i) { " on" } else { "" }))
+                                                .unwrap_or_default()].map(plain));
+                                for (t, hover) in cells {
+                                    let mut r = ui.selectable_label(sel, t);
+                                    if hover {
+                                        r = r.on_hover_text(super::fiber_log::quality_hover(q));
+                                    }
+                                    if r.clicked() {
+                                        select = Some(i);
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        });
                     });
                 });
                 if let Some(s) = select {
@@ -734,6 +755,19 @@ impl App {
         if tune {
             self.tune_due = Some(Instant::now() + Duration::from_secs_f64(TUNE_DELAY));
         }
+    }
+}
+
+/// A method's short name, for the fibers table.
+fn short_method(name: &str) -> &'static str {
+    match name {
+        "auto" => "Auto",
+        "rods" => "Rods",
+        "core" => "Core",
+        "symmetry" => "Mirror",
+        "centres" => "Centers",
+        "moments" => "Moments",
+        _ => "?",
     }
 }
 

@@ -631,7 +631,7 @@ impl App {
 }
 
 /// A framed group with a title (and a color swatch: what it looks like on the image).
-fn section<R>(ui: &mut egui::Ui, title: &str, swatch: Option<egui::Color32>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+pub(crate) fn section<R>(ui: &mut egui::Ui, title: &str, swatch: Option<egui::Color32>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
