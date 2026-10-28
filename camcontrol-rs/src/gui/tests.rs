@@ -204,10 +204,10 @@ fn alignment_readings_reference_and_region() {
     h.state_mut().find_fiber_axes(false);
     wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
     assert_eq!(h.state().alignment.trend.points.len(), 1, "each measurement goes on the live trend");
-    // Fit to fibers: the three in a row, at 170 px.
-    h.state_mut().fit_reference_to_fibers();
+    // Auto: the three in a level row (centers at 170 px, radius 140): along their tops, at 30 px.
+    h.state_mut().auto_reference();
     let (a, b) = h.state().alignment.reference.unwrap();
-    assert!((a.1 - 170.0).abs() < 1.0 && (b.1 - 170.0).abs() < 1.0 && (b.0 - a.0).abs() > 600.0, "{a:?} {b:?}");
+    assert!((a.1 - 30.0).abs() < 1.5 && (b.1 - 30.0).abs() < 1.5 && (b.0 - a.0).abs() > 600.0, "{a:?} {b:?}");
     let id = h.state().active;
     h.state_mut().alignment.drawing = Some(DrawTarget::Reference);
     // A line at +30°: every angle shown is measured from it.

@@ -160,6 +160,16 @@ pub fn rotate_line(a: (f64, f64), b: (f64, f64), deg: f64) -> ((f64, f64), (f64,
     ((mx - dx, my - dy), (mx + dx, my + dy))
 }
 
+/// The line moved sideways (square to itself) by `d` px: + to the right (down, for a level line).
+pub fn shift_line(a: (f64, f64), b: (f64, f64), d: f64) -> ((f64, f64), (f64, f64)) {
+    let len = (b.0 - a.0).hypot(b.1 - a.1).max(1e-9);
+    let (mut nx, mut ny) = ((b.1 - a.1) / len, -(b.0 - a.0) / len);
+    if nx < 0.0 || (nx == 0.0 && ny < 0.0) {
+        (nx, ny) = (-nx, -ny);
+    }
+    ((a.0 + d * nx, a.1 + d * ny), (b.0 + d * nx, b.1 + d * ny))
+}
+
 /// A line's angle as the fiber axes' (counter-clockwise from horizontal on screen, 0 to 180).
 pub fn line_angle(a: (f64, f64), b: (f64, f64)) -> f64 {
     (-(b.1 - a.1)).atan2(b.0 - a.0).to_degrees().rem_euclid(180.0)
@@ -332,17 +342,19 @@ impl App {
         self.alignment.trend.add(pane, drawing.reference, angle, axis);
     }
 
-    /// A reference line fitted through the centers of the active view's fibers.
-    pub(crate) fn fit_reference_to_fibers(&mut self) {
+    /// Auto reference line: along the left edge of the active view's fibers (a line through their
+    /// centers, moved out by their radius; a level row of fibers: along their tops).
+    pub(crate) fn auto_reference(&mut self) {
         let fibers = &self.active_pane().fibers;
         let centers: Vec<(f64, f64)> = fibers.iter().map(|f| (f.cx, f.cy)).collect();
+        let radius = fibers.iter().map(|f| f.radius).sum::<f64>() / fibers.len().max(1) as f64;
         let extend = fibers.iter().map(|f| f.radius).fold(0.0, f64::max);
         match fit_line(&centers, extend) {
-            Some(line) => {
-                self.alignment.reference = Some(line);
-                self.message(format!("Reference line through {} fiber centers.", centers.len()), Some(6.0));
+            Some((a, b)) => {
+                self.alignment.reference = Some(shift_line(a, b, -radius));
+                self.message(format!("Reference line along the edge of {} fibers; shift it with < and >.", centers.len()), Some(6.0));
             }
-            None => self.warn("Fit to fibers", "Needs at least two fibers: press Find axes (Fiber axis) first."),
+            None => self.warn("Auto reference line", "Needs at least two fibers: press Find axes (Fiber Axis) first."),
         }
     }
 
@@ -584,10 +596,10 @@ impl App {
                     self.start_drawing(DrawTarget::Reference);
                 }
                 let fibers = self.active_pane().fibers.len();
-                if ui.add_enabled(fibers >= 2, egui::Button::new("Fit to fibers").min_size(egui::vec2(0.0, 30.0)))
-                    .on_hover_text("Put the line through the centers of the fibers found (e.g. a groove full of fibers).
-                                    Needs two or more: press Find axes first.").clicked() {
-                    self.fit_reference_to_fibers();
+                if ui.add_enabled(fibers >= 2, egui::Button::new("Auto").min_size(egui::vec2(0.0, 30.0)))
+                    .on_hover_text("Put the line along the left edge of the fibers found (a level row: along their tops),\n\
+                                    to start from; shift or turn it after. Needs two or more: press Find axes first.").clicked() {
+                    self.auto_reference();
                 }
                 if ui.add_enabled(self.alignment.reference.is_some(), egui::Button::new("Clear").min_size(egui::vec2(0.0, 30.0))).clicked() {
                     self.alignment.reference = None;
@@ -612,7 +624,17 @@ impl App {
                             self.alignment.reference = Some(rotate_line(a, b, deg));
                         }
                     });
-                    ui.label(RichText::new("Drag its ends on the image to move it.").weak());
+                    ui.horizontal(|ui| {
+                        ui.label("Shift");
+                        for (text, d) in [("< 10", -10.0), ("< 1", -1.0), ("1 >", 1.0), ("10 >", 10.0)] {
+                            if ui.button(text).on_hover_text("Move the line sideways (keeping its angle) by this many image pixels.").clicked() {
+                                if let Some((a, b)) = self.alignment.reference {
+                                    self.alignment.reference = Some(shift_line(a, b, d));
+                                }
+                            }
+                        }
+                    });
+                    ui.label(RichText::new("Its ends can also be dragged on the image.").weak());
                 }
                 None => {
                     ui.label(RichText::new("None: angles from horizontal.").weak());
@@ -1004,6 +1026,16 @@ mod tests {
         t.points.push_front((-100.0, 9.0));
         t.add(1, Some(10.0), 0.2, "slow");
         assert!(t.points.iter().all(|p| p.0 > -1.0), "older than {TREND_SECONDS} s dropped");
+    }
+
+    #[test]
+    fn shifting_the_reference_line() {
+        let (a, b) = shift_line((100.0, 0.0), (100.0, 500.0), 3.0);
+        assert_eq!((a, b), ((103.0, 0.0), (103.0, 500.0)), "an upright line: + is right");
+        let (a, b) = shift_line((100.0, 500.0), (100.0, 0.0), 3.0);
+        assert_eq!((a, b), ((103.0, 500.0), (103.0, 0.0)), "whichever way it was drawn");
+        let (a, _) = shift_line((0.0, 50.0), (200.0, 50.0), 2.0);
+        assert_eq!(a, (0.0, 52.0), "a level line: + is down");
     }
 
     #[test]

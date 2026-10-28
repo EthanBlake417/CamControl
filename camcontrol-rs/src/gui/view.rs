@@ -593,11 +593,6 @@ impl ImageView {
         }
         let area = ((rect.left(), rect.top()), (rect.right(), rect.bottom()));
         annotate::draw_extras(&mut canvas, overlays.extras, overlays.fibers, &overlays.fiber_drawing, &to_screen, zoom as f64, &style, area);
-        if let Some((a, b)) = overlays.extras.reference {
-            for p in [a, b] {
-                canvas.ellipse(to_screen(p.0, p.1), GRAB_PX * 0.6, GRAB_PX * 0.6, Some(overlays.extras.reference_look().0), 2.0, Dash::Solid, None);
-            }
-        }
         if let Some(c) = overlays.crosshair {
             // On a fiber: where its axis lines cross, with the lines across the whole view to compare with its axes.
             let fiber = if c.anchor == "fiber" { overlays.fibers.get(overlays.fiber_selected.unwrap_or(0)) } else { None };
