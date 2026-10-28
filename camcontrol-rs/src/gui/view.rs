@@ -159,6 +159,19 @@ impl Canvas for EguiCanvas<'_> {
     fn text_width(&self, text: &str, px: f32) -> f32 {
         self.painter.layout_no_wrap(text.into(), egui::FontId::proportional(px), Color32::WHITE).size().x
     }
+
+    fn styled_text(&mut self, pos: P, text: &str, px: f32, color: Color, mono: bool, bold: bool) {
+        let id = if mono { egui::FontId::monospace(px) } else { egui::FontId::proportional(px) };
+        let offsets: &[f32] = if bold { &[0.0, draw::BOLD_OFFSET] } else { &[0.0] };
+        for dx in offsets {
+            self.painter.text(Pos2::new(pos.0 + dx * px, pos.1 - px * 0.05), egui::Align2::LEFT_TOP, text, id.clone(), c32(color));
+        }
+    }
+
+    fn styled_width(&self, text: &str, px: f32, mono: bool, bold: bool) -> f32 {
+        let id = if mono { egui::FontId::monospace(px) } else { egui::FontId::proportional(px) };
+        self.painter.layout_no_wrap(text.into(), id, Color32::WHITE).size().x + if bold { px * draw::BOLD_OFFSET } else { 0.0 }
+    }
 }
 
 struct Tile {
@@ -166,6 +179,9 @@ struct Tile {
     rect: Rect, // image pixels
     options: TextureOptions,
 }
+
+/// How close (screen px) to a reference line's end a press grabs it.
+const GRAB_PX: f32 = 9.0;
 
 /// What the view should draw on top of the image.
 pub struct Overlays<'a> {
@@ -186,6 +202,8 @@ pub struct Overlays<'a> {
 pub enum ViewEvent {
     Activated,
     Drawn(String, Vec<Point>),
+    /// The reference line's ends after one was dragged.
+    ReferenceMoved(Point, Point),
     ToolExit,
     CountAdd(f64, f64),
     CountRemove(f64, f64, f64),
@@ -213,6 +231,8 @@ pub struct ImageView {
     mouse: Option<Point>,
     press_pos: Option<Pos2>,
     pub count_class: Option<usize>,
+    /// Which end of the reference line is being dragged.
+    grab: Option<usize>,
     /// Image pixel under the mouse and its RGB.
     pub hover: Option<(u32, u32, [u8; 3])>,
     /// Zoom or position changed by the user this frame (for Link views).
@@ -237,6 +257,7 @@ impl Default for ImageView {
             mouse: None,
             press_pos: None,
             count_class: None,
+            grab: None,
             hover: None,
             moved: false,
             rect: Rect::NOTHING,
@@ -465,7 +486,32 @@ impl ImageView {
             }
         }
         let clicking = self.tool.is_some() || self.count_class.is_some();
-        let pan = response.dragged_by(PointerButton::Middle) || (!clicking && response.dragged_by(PointerButton::Primary));
+        // The reference line's ends can be dragged (when no tool is in use).
+        if let Some((a, b)) = overlays.extras.reference.filter(|_| !clicking) {
+            let to_scr = |p: Point| rect.center() + (Pos2::new(p.0 as f32, p.1 as f32) - self.center) * self.zoom;
+            if let Some(cursor) = over {
+                let near = [a, b].iter().position(|&p| (to_scr(p) - cursor).length() <= GRAB_PX);
+                if near.is_some() || self.grab.is_some() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                }
+                if pressed[0] {
+                    self.grab = near;
+                }
+            }
+            if let (Some(k), Some(pos)) = (self.grab, hover_pos) {
+                if response.dragged_by(PointerButton::Primary) {
+                    let mut ends = [a, b];
+                    ends[k] = self.to_image(pos);
+                    if ends[k] != [a, b][k] {
+                        events.push(ViewEvent::ReferenceMoved(ends[0], ends[1]));
+                    }
+                }
+            }
+        }
+        if released[0] {
+            self.grab = None;
+        }
+        let pan = response.dragged_by(PointerButton::Middle) || (!clicking && self.grab.is_none() && response.dragged_by(PointerButton::Primary));
         if pan {
             let d = response.drag_delta();
             if d != Vec2::ZERO {
@@ -587,6 +633,11 @@ impl ImageView {
         }
         let area = ((rect.left(), rect.top()), (rect.right(), rect.bottom()));
         annotate::draw_extras(&mut canvas, overlays.extras, overlays.fibers, &overlays.fiber_drawing, &to_screen, zoom as f64, &style, area);
+        if let Some((a, b)) = overlays.extras.reference {
+            for p in [a, b] {
+                canvas.ellipse(to_screen(p.0, p.1), GRAB_PX * 0.6, GRAB_PX * 0.6, Some(annotate::REFERENCE_COLOR), 2.0, Dash::Solid, None);
+            }
+        }
         if let Some(c) = overlays.crosshair {
             // On a fiber: where its axis lines cross, with the lines across the whole view to compare with its axes.
             let fiber = if c.anchor == "fiber" { overlays.fibers.get(overlays.fiber_selected.unwrap_or(0)) } else { None };
@@ -620,7 +671,8 @@ impl ImageView {
             }
         }
         // The angles stay in the view's top-left corner, whatever the zoom.
-        annotate::draw_fiber_readout(&mut canvas, overlays.fibers, &overlays.fiber_drawing, (rect.left() + 8.0, rect.top() + 8.0), annotate::READOUT_PX);
+        annotate::draw_fiber_readout(&mut canvas, overlays.fibers, &overlays.fiber_drawing, (rect.left() + 8.0, rect.top() + 8.0),
+                                     overlays.fiber_drawing.readout_px);
 
         self.mouse = over.map(|p| self.to_image(p));
         self.hover = over.and_then(|cursor| {

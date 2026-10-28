@@ -665,11 +665,14 @@ impl App {
                 let a = self.active;
                 let mut select = None;
                 egui::ScrollArea::both().max_height((ui.available_height() - 50.0).max(60.0)).auto_shrink([false, true]).show(ui, |ui| {
-                    egui::Grid::new("fibers").striped(true).num_columns(12).show(ui, |ui| {
-                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "Clarity", "Contrast", "Quality", "Method", "Center (px)",
+                    egui::Grid::new("fibers").striped(true).num_columns(13).show(ui, |ui| {
+                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "From perp. (°)", "Clarity", "Contrast", "Quality", "Method", "Center (px)",
                                   "Axis through (px)", "Diameter (px)", "Center brightness"] {
                             let r = ui.strong(h);
-                            if h == "Contrast" || h == "Quality" {
+                            if h == "From perp. (°)" {
+                                r.on_hover_text("With a reference line (Alignment panel): how far the fiber's axis nearest\n\
+                                                 perpendicular to the line is from perpendicular (slow or fast, whichever).");
+                            } else if h == "Contrast" || h == "Quality" {
                                 r.on_hover_text(super::fiber_log::QUALITY_HELP);
                             } else if h == "Center brightness" {
                                 r.on_hover_text("Brightness (0-255) of the brightest spot near the fiber's center, e.g. light in the core.\n\
@@ -695,7 +698,8 @@ impl App {
                             let quality = [egui::RichText::new(super::fiber_log::fmt_contrast(q)), super::fiber_log::grade_text(q)];
                             let plain = |t: String| (egui::RichText::new(t), false);
                             let cells = [plain((i + 1).to_string()), plain(f.fiber_type.clone()), plain(fmt_angle(drawing.shown(f.slow_deg))),
-                                         plain(fmt_angle(drawing.shown(f.fast_deg()))), plain(clarity)].into_iter()
+                                         plain(fmt_angle(drawing.shown(f.fast_deg()))),
+                                         plain(drawing.off_perpendicular(f).map(|d| format!("{d:+.2}")).unwrap_or_default()), plain(clarity)].into_iter()
                                 .chain(quality.map(|t| (t, true)))
                                 .chain([method_label(&f.method).to_string(), format!("{:.1}, {:.1}", f.cx, f.cy), format!("{ax:.1}, {ay:.1}"),
                                         format!("{:.1}", 2.0 * f.radius),

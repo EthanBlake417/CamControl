@@ -38,7 +38,7 @@ pub struct Row {
     pub time: String,
     pub fiber: i64,
     pub n: usize,
-    /// Mean fast axis, from the reference line if there was one (else from horizontal).
+    /// With a reference line: mean offset of the axis from perpendicular to it; else the mean fast axis from horizontal.
     pub mean: f64,
     pub std: f64,
     /// The reference line's angle the readings were measured from.
@@ -55,7 +55,15 @@ pub struct Alignment {
     pub status: String,
 }
 
-pub const HEADERS: [&str; 6] = ["Time", "Fiber", "Readings", "Mean fast axis (deg)", "Std (deg)", "Reference line (deg; mean given from it)"];
+pub const HEADERS: [&str; 7] = ["Time", "Fiber", "Readings", "Mean (deg)", "Std (deg)", "Mean of", "Reference line (deg)"];
+
+/// The line turned about its middle to `deg` (counter-clockwise from horizontal on screen), its length kept.
+pub fn rotate_line(a: (f64, f64), b: (f64, f64), deg: f64) -> ((f64, f64), (f64, f64)) {
+    let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    let half = ((b.0 - a.0).hypot(b.1 - a.1) / 2.0).max(1.0);
+    let (dx, dy) = (deg.to_radians().cos() * half, -deg.to_radians().sin() * half);
+    ((mx - dx, my - dy), (mx + dx, my + dy))
+}
 
 /// A line's angle as the fiber axes' (counter-clockwise from horizontal on screen, 0 to 180).
 pub fn line_angle(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -95,6 +103,7 @@ impl Alignment {
         let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
         let rows = self.rows.iter().map(|r| vec![
             Cell::Text(r.time.clone()), Cell::Num(r.fiber as f64), Cell::Num(r.n as f64), r2(r.mean), r2(r.std),
+            Cell::Text(from_label(r.reference)),
             r.reference.map(|v| r2(signed_angle(v))).unwrap_or(Cell::Empty),
         ]).collect();
         Sheet::new("Alignment", &HEADERS, rows)
@@ -102,7 +111,7 @@ impl Alignment {
 
     /// The table as text lines, for drawing on a photo.
     pub fn table_lines(&self) -> Vec<String> {
-        let mut lines = vec!["Fiber\tMean fast axis\tStd dev\tFrom\tn".to_string()];
+        let mut lines = vec!["Fiber\tMean\tStd dev\tMean of\tn".to_string()];
         for r in &self.rows {
             lines.push(format!("{}\t{:+.2}°\t{:.2}°\t{}\t{}", r.fiber, r.mean, r.std, from_label(r.reference), r.n));
         }
@@ -113,8 +122,8 @@ impl Alignment {
 /// What a row's angle is measured from.
 fn from_label(reference: Option<f64>) -> String {
     match reference {
-        Some(r) => format!("line at {}°", fmt_angle(r)),
-        None => "horizontal".into(),
+        Some(r) => format!("perpendicular to line at {}°", fmt_angle(r)),
+        None => "fast axis from horizontal".into(),
     }
 }
 
@@ -153,7 +162,8 @@ impl App {
             return;
         }
         let drawing = self.fiber_drawing();
-        let angles: Vec<f64> = self.pane(pane).fibers.iter().map(|f| drawing.shown(f.fast_deg())).collect();
+        let angles: Vec<f64> = self.pane(pane).fibers.iter()
+            .map(|f| drawing.off_perpendicular(f).unwrap_or_else(|| drawing.shown(f.fast_deg()))).collect();
         let c = self.alignment.collecting.as_mut().unwrap();
         if angles.is_empty() {
             if !self.pane(pane).live {
@@ -275,8 +285,9 @@ impl App {
             let (fill, color) = if busy { (ui.visuals().widgets.inactive.weak_bg_fill, ui.visuals().weak_text_color()) }
                                 else { (egui::Color32::from_rgb(0x2f, 0x6f, 0xd0), egui::Color32::WHITE) };
             if ui.add_enabled(!busy, egui::Button::new(RichText::new(text).size(20.0).strong().color(color)).fill(fill).min_size(egui::vec2(300.0, 52.0)))
-                .on_hover_text("Measure the fiber's fast axis this many times (live: the next updates)\n\
-                                and add its mean and standard deviation to the table.").clicked() {
+                .on_hover_text("Measure the fiber this many times (live: the next updates) and add the mean and\n\
+                                standard deviation to the table: with a reference line, how far its axis is from\n\
+                                perpendicular to the line; without, its fast axis from horizontal.").clicked() {
                 self.take_readings();
             }
             ui.vertical(|ui| {
@@ -307,7 +318,7 @@ impl App {
         ui.separator();
         egui::ScrollArea::vertical().id_salt("align_rows").max_height(150.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
             egui::Grid::new("align_grid").striped(true).num_columns(6).show(ui, |ui| {
-                for h in ["Fiber #", "Mean fast axis", "Std dev", "From", "n", "Time"] {
+                for h in ["Fiber #", "Mean", "Std dev", "Mean of", "n", "Time"] {
                     ui.strong(h);
                 }
                 ui.end_row();
@@ -348,15 +359,30 @@ impl App {
         ui.horizontal_wrapped(|ui| {
             ui.strong("Reference line:");
             if super::panels::toggle(ui, drawing == Some(DrawTarget::Reference), "Draw line")
-                .on_hover_text("Drag a line on the image (e.g. along the groove or a mark): every slow and fast\n\
-                                axis angle shown (readout, tables, log, exports) is then measured from it.").clicked() {
+                .on_hover_text("Drag a line on the image along the fibers' edge (e.g. the groove): the readout and\n\
+                                the readings then give how far each fiber's axis is from perpendicular to it.").clicked() {
                 self.start_drawing(DrawTarget::Reference);
             }
             if ui.add_enabled(self.alignment.reference.is_some(), egui::Button::new("Clear")).clicked() {
                 self.alignment.reference = None;
             }
-            if let Some(r) = self.alignment.reference_deg() {
-                ui.label(format!("at {}°", fmt_angle(r)));
+            if let Some((a, b)) = self.alignment.reference {
+                let mut deg = signed_angle(line_angle(a, b));
+                ui.label("at");
+                let mut changed = ui.add(egui::DragValue::new(&mut deg).range(-90.0..=90.0).speed(0.01).fixed_decimals(2).suffix("°"))
+                    .on_hover_text("Type or drag the line's angle (counter-clockwise from horizontal): it turns about\n\
+                                    its middle. Its ends can also be dragged on the image.").changed();
+                if ui.small_button("-0.1°").clicked() {
+                    deg -= 0.1;
+                    changed = true;
+                }
+                if ui.small_button("+0.1°").clicked() {
+                    deg += 0.1;
+                    changed = true;
+                }
+                if changed {
+                    self.alignment.reference = Some(rotate_line(a, b, deg));
+                }
             }
         });
 
@@ -376,6 +402,12 @@ impl App {
             notes.push(format!("Fiber {} is on", d.number(i)));
         }
         notes
+    }
+
+    /// Find every fiber (not just the center one).
+    pub(crate) fn find_all_fibers(&mut self) {
+        self.fiber.centre_only = false;
+        self.find_fiber_axes(false);
     }
 
     pub(crate) fn save_fiber_count(&mut self) {
@@ -423,8 +455,9 @@ impl App {
     pub(crate) fn fiber_count_panel(&mut self, ui: &mut egui::Ui) {
         let fibers = self.active_pane().fibers.clone();
         ui.horizontal_wrapped(|ui| {
-            if super::panels::primary(ui, "Find fibers", true, egui::vec2(120.0, 26.0)).on_hover_text("Find and number the fibers in the view.").clicked() {
-                self.find_fiber_axes(false);
+            if super::panels::primary(ui, "Find fibers", true, egui::vec2(120.0, 26.0))
+                .on_hover_text("Find and number all the fibers in the view (turns off Only the center fiber).").clicked() {
+                self.find_all_fibers();
             }
             ui.label(RichText::new(match fibers.len() {
                 0 => "No fibers found yet.".to_string(),
@@ -480,6 +513,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn off_perpendicular_either_axis() {
+        use super::super::annotate::perpendicular_offset as off;
+        let near = |a: Option<f64>, b: f64| (a.unwrap() - b).abs() < 1e-9;
+        assert!(near(off(90.5, 0.0), 0.5), "axis at 90.5 on a level line");
+        assert!(near(off(0.5, 0.0), 0.5), "the other axis: same answer");
+        assert!(near(off(89.0, 0.0), -1.0));
+        assert!(near(off(122.0, 30.0), 2.0) && near(off(32.0, 30.0), 2.0));
+        assert!(near(off(44.0, 0.0), 44.0) && near(off(46.0, 0.0), -44.0), "nearest axis past 45");
+    }
+
+    #[test]
+    fn turning_the_reference_line() {
+        let (a, b) = rotate_line((0.0, 100.0), (200.0, 100.0), 30.0);
+        assert!((line_angle(a, b) - 30.0).abs() < 1e-9);
+        assert!(((a.0 + b.0) / 2.0 - 100.0).abs() < 1e-9 && ((a.1 + b.1) / 2.0 - 100.0).abs() < 1e-9, "about its middle");
+        assert!(((b.0 - a.0).hypot(b.1 - a.1) - 200.0).abs() < 1e-9, "same length");
+        let (a, b) = rotate_line(a, b, -0.5);
+        assert!((signed_angle(line_angle(a, b)) + 0.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn line_angles_like_fiber_axes() {
         assert!((line_angle((0.0, 0.0), (10.0, 0.0)) - 0.0).abs() < 1e-9);
         assert!((line_angle((0.0, 0.0), (10.0, -10.0)) - 45.0).abs() < 1e-9, "up and right on screen = +45");
@@ -497,6 +551,6 @@ mod tests {
         assert!((a.rows[1].mean.abs() - 90.0).abs() < 1e-6, "wraps at 90: {}", a.rows[1].mean);
         assert_eq!(a.rows[0].reference, Some(30.0));
         assert_eq!(a.table_lines().len(), 3);
-        assert!(a.table_lines()[1].contains("line at +30.0°"), "{:?}", a.table_lines());
+        assert!(a.table_lines()[1].contains("perpendicular to line at +30.0°"), "{:?}", a.table_lines());
     }
 }

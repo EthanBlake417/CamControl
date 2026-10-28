@@ -20,6 +20,8 @@ pub struct Entry {
     pub fiber: usize,
     pub slow: f64,
     pub fast: f64,
+    /// Off perpendicular to the reference line (when there is one).
+    pub perp: Option<f64>,
     pub quality: Option<FiberQuality>,
 }
 
@@ -113,7 +115,7 @@ pub struct FiberSummary {
 }
 
 impl FiberLog {
-    pub const HEADERS: [&'static str; 10] = ["Time", "Update", "Fiber", "Slow axis (deg)", "Fast axis (deg)", "Contrast (%)",
+    pub const HEADERS: [&'static str; 11] = ["Time", "Update", "Fiber", "Slow axis (deg)", "Fast axis (deg)", "Off perpendicular (deg)", "Contrast (%)",
                                              "Edge width (px)", "SNR", "Clipped (%)", "Quality"];
     pub const SUMMARY_HEADERS: [&'static str; 6] = ["Fiber", "Count", "Mean slow axis (deg)", "Mean fast axis (deg)", "Std (deg)",
                                                     "Mean contrast (%)"];
@@ -126,7 +128,8 @@ impl FiberLog {
         for (i, f) in fibers.iter().enumerate() {
             let r = reference.unwrap_or(0.0);
             let (slow, fast) = (signed_angle(f.slow_deg - r), signed_angle(f.fast_deg() - r));
-            self.entries.push(Entry { time: time.clone(), update: self.updates, fiber: i + 1, slow, fast, quality: f.image_quality });
+            let perp = reference.and_then(|r| super::annotate::perpendicular_offset(f.slow_deg, r));
+            self.entries.push(Entry { time: time.clone(), update: self.updates, fiber: i + 1, slow, fast, perp, quality: f.image_quality });
         }
         fibers.len()
     }
@@ -151,7 +154,8 @@ impl FiberLog {
 
     pub fn sheet(&self) -> Sheet {
         let rows = self.entries.iter().map(|e| {
-            let mut row = vec![Cell::Text(e.time.clone()), Cell::Num(e.update as f64), Cell::Num(e.fiber as f64), round2(e.slow), round2(e.fast)];
+            let mut row = vec![Cell::Text(e.time.clone()), Cell::Num(e.update as f64), Cell::Num(e.fiber as f64), round2(e.slow), round2(e.fast),
+                               e.perp.map(round2).unwrap_or(Cell::Empty)];
             row.extend(quality_cells(e.quality.as_ref(), false));
             row
         }).collect();
@@ -247,10 +251,10 @@ impl App {
         let row_h = ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().item_spacing.y;
         egui::ScrollArea::both().id_salt("fiber_log_rows").stick_to_bottom(true).auto_shrink([false, false])
             .show_rows(ui, row_h, log.entries.len() + 1, |ui, range| {
-                egui::Grid::new("fiber_log_rows_grid").striped(true).num_columns(7).start_row(range.start).show(ui, |ui| {
+                egui::Grid::new("fiber_log_rows_grid").striped(true).num_columns(8).start_row(range.start).show(ui, |ui| {
                     for i in range {
                         if i == 0 {
-                            for h in ["Time", "#", "Fiber", "Slow °", "Fast °", "Contrast", "Quality"] {
+                            for h in ["Time", "#", "Fiber", "Slow °", "Fast °", "From perp.", "Contrast", "Quality"] {
                                 let r = ui.strong(h);
                                 if h == "Quality" || h == "Contrast" {
                                     r.on_hover_text(QUALITY_HELP);
@@ -263,6 +267,7 @@ impl App {
                             ui.label(e.fiber.to_string());
                             ui.label(format!("{:+.2}", e.slow));
                             ui.label(format!("{:+.2}", e.fast));
+                            ui.label(e.perp.map(|d| format!("{d:+.2}")).unwrap_or_default());
                             let q = e.quality.as_ref();
                             ui.label(fmt_contrast(q)).on_hover_text(quality_hover(q));
                             ui.label(grade_text(q)).on_hover_text(quality_hover(q));

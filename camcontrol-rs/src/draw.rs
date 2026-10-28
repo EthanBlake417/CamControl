@@ -25,6 +25,15 @@ pub trait Canvas {
     fn text(&mut self, pos: P, text: &str, px: f32, color: Color);
     fn text_width(&self, text: &str, px: f32) -> f32;
 
+    /// Text in the sans or monospace font, optionally bold.
+    fn styled_text(&mut self, pos: P, text: &str, px: f32, color: Color, _mono: bool, _bold: bool) {
+        self.text(pos, text, px, color);
+    }
+
+    fn styled_width(&self, text: &str, px: f32, _mono: bool, _bold: bool) -> f32 {
+        self.text_width(text, px)
+    }
+
     fn line(&mut self, a: P, b: P, color: Color, width: f32, dash: Dash) {
         self.polyline(&[a, b], false, color, width, dash, None);
     }
@@ -44,8 +53,19 @@ pub fn font() -> FontRef<'static> {
     FontRef::try_from_slice(epaint_default_fonts::UBUNTU_LIGHT).expect("built-in font")
 }
 
+/// The built-in monospace font.
+pub fn mono_font() -> FontRef<'static> {
+    FontRef::try_from_slice(epaint_default_fonts::HACK_REGULAR).expect("built-in font")
+}
+
+/// Bold text: drawn twice, the second this share of the size to the right.
+pub const BOLD_OFFSET: f32 = 0.045;
+
 pub fn measure_text(text: &str, px: f32) -> f32 {
-    let f = font();
+    measure_text_in(&font(), text, px)
+}
+
+pub fn measure_text_in(f: &FontRef<'static>, text: &str, px: f32) -> f32 {
     let s = f.as_scaled(PxScale::from(px));
     let mut w = 0.0;
     let mut last = None;
@@ -139,7 +159,29 @@ impl Canvas for SkiaCanvas {
     }
 
     fn text(&mut self, pos: P, text: &str, px: f32, color: Color) {
-        let f = font();
+        self.text_in(font(), pos, text, px, color);
+    }
+
+    fn text_width(&self, text: &str, px: f32) -> f32 {
+        measure_text(text, px)
+    }
+
+    fn styled_text(&mut self, pos: P, text: &str, px: f32, color: Color, mono: bool, bold: bool) {
+        let f = if mono { mono_font() } else { font() };
+        self.text_in(f.clone(), pos, text, px, color);
+        if bold {
+            self.text_in(f, (pos.0 + px * BOLD_OFFSET, pos.1), text, px, color);
+        }
+    }
+
+    fn styled_width(&self, text: &str, px: f32, mono: bool, bold: bool) -> f32 {
+        let f = if mono { mono_font() } else { font() };
+        measure_text_in(&f, text, px) + if bold { px * BOLD_OFFSET } else { 0.0 }
+    }
+}
+
+impl SkiaCanvas {
+    fn text_in(&mut self, f: FontRef<'static>, pos: P, text: &str, px: f32, color: Color) {
         let s = f.as_scaled(PxScale::from(px));
         let (w, h) = (self.pixmap.width() as i32, self.pixmap.height() as i32);
         let data = self.pixmap.data_mut();
@@ -171,9 +213,6 @@ impl Canvas for SkiaCanvas {
         }
     }
 
-    fn text_width(&self, text: &str, px: f32) -> f32 {
-        measure_text(text, px)
-    }
 }
 
 // --- plain pixel drawing (no anti-aliasing), as cv2.circle with thickness -1 ----------

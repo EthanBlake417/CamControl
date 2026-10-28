@@ -308,6 +308,18 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
                      without covering the fiber. With the crosshair centered on the fiber, its lines also stop at the\n\
                      fibers' edges. Also used for exported drawings (to the picture's edges) and videos.");
                 ui.end_row();
+                ui.label("Readout text:");
+                ui.horizontal(|ui| {
+                    ui.add(egui::DragValue::new(&mut fiber.readout_size).range(10.0..=80.0).speed(0.5).suffix(" px"));
+                    let name = if fiber.readout_font == "mono" { "Monospace" } else { "Sans" };
+                    egui::ComboBox::from_id_salt("readout_font").selected_text(name).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut fiber.readout_font, "sans".to_string(), "Sans");
+                        ui.selectable_value(&mut fiber.readout_font, "mono".to_string(), "Monospace");
+                    });
+                    ui.checkbox(&mut fiber.readout_bold, "Bold");
+                }).response.on_hover_text("The angles box in the view's top-left corner: size on screen, font, bold.\n\
+                                            Exports and videos scale it to the picture.");
+                ui.end_row();
                 let f = &mut *fiber;
                 axis_color_rows(ui, "Slow", &mut f.slow_color, &mut f.slow_opacity, &mut f.slow_by_angle);
                 axis_color_rows(ui, "Fast", &mut f.fast_color, &mut f.fast_opacity, &mut f.fast_by_angle);

@@ -46,12 +46,17 @@ pub struct FiberDrawing {
     pub ascending: bool,
     /// A reference line's angle: every angle shown is then measured from it.
     pub reference: Option<f64>,
+    /// The readout's text: size on screen (px; exports scale it to the picture), monospace, bold.
+    pub readout_px: f32,
+    pub readout_mono: bool,
+    pub readout_bold: bool,
 }
 
 impl Default for FiberDrawing {
     fn default() -> Self {
         Self { show_parts: false, long_lines: false, slow: SLOW_COLOR, fast: FAST_COLOR, show_slow: true, show_fast: true, slow_bands: None,
-               fast_bands: None, first_number: 1, ascending: true, reference: None }
+               fast_bands: None, first_number: 1, ascending: true, reference: None, readout_px: READOUT_PX,
+               readout_mono: false, readout_bold: false }
     }
 }
 
@@ -59,6 +64,13 @@ impl FiberDrawing {
     /// An axis angle as shown: from the reference line if there is one, else from horizontal (-90 to +90).
     pub fn shown(&self, deg: f64) -> f64 {
         signed_angle(deg - self.reference.unwrap_or(0.0))
+    }
+
+    /// With a reference line: how far the fiber's axis nearest perpendicular to the line is
+    /// from perpendicular (-45 to +45, + = turned counter-clockwise). Slow or fast doesn't
+    /// matter: the other axis is the same amount off parallel.
+    pub fn off_perpendicular(&self, f: &FiberAxis) -> Option<f64> {
+        perpendicular_offset(f.slow_deg, self.reference?)
     }
 
     /// The number of the i-th fiber (in the order they're kept: top to bottom, then left to right).
@@ -315,15 +327,30 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
     }
 }
 
+/// How far the nearer of the axes (`axis_deg` and 90° from it) is from perpendicular to a line at `line_deg`.
+pub fn perpendicular_offset(axis_deg: f64, line_deg: f64) -> Option<f64> {
+    let d = (axis_deg - line_deg - 90.0).rem_euclid(90.0);
+    let d = if d >= 45.0 { d - 90.0 } else { d };
+    d.is_finite().then_some(d)
+}
+
 /// The readout's lines as colored pieces: per fiber (numbered left to right) the slow and fast
-/// axis angles in their line colors (opaque, to stay readable), "(unclear)" when unsure;
-/// with several fibers, a last line saying which has the brightest center.
+/// axis angles in their line colors (opaque, to stay readable), "(unclear)" when unsure.
+/// (Which fiber is on, the brightest center: ringed in green, and in the Fiber count panel.)
 pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<Vec<(String, Color)>> {
     let opaque = |c: Color| [c[0], c[1], c[2], 255];
-    let mut lines: Vec<Vec<(String, Color)>> = axes
+    let lines: Vec<Vec<(String, Color)>> = axes
         .iter()
         .enumerate()
         .map(|(i, f)| {
+            // With a reference line, the one angle that matters: off perpendicular to it.
+            if let Some(d) = drawing.off_perpendicular(f) {
+                let mut line = vec![(format!("{}: {d:+.2}°", drawing.number(i)), READOUT_COLOR)];
+                if !f.clear() {
+                    line.push((" (unclear)".into(), [230, 230, 230, 255]));
+                }
+                return line;
+            }
             let mut line = vec![
                 (format!("slow {}°", fmt_angle(drawing.shown(f.slow_deg))), opaque(drawing.slow_color(f))),
                 (format!("fast {}°", fmt_angle(drawing.shown(f.fast_deg()))), opaque(drawing.fast_color(f))),
@@ -341,12 +368,6 @@ pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<V
             line
         })
         .collect();
-    if let Some((i, _)) = brightest_centre(axes) {
-        lines.push(vec![(format!("Fiber {} is on (brightest center)", drawing.number(i)), READOUT_COLOR)]);
-    }
-    if drawing.reference.is_some() && !axes.is_empty() {
-        lines.push(vec![("Angles from the reference line".into(), REFERENCE_COLOR)]);
-    }
     lines
 }
 
@@ -367,14 +388,15 @@ pub fn draw_fiber_readout(c: &mut dyn Canvas, axes: &[FiberAxis], drawing: &Fibe
     }
     let pad = font_px * 0.4;
     let step = font_px * 1.3;
-    let widths: Vec<Vec<f32>> = lines.iter().map(|l| l.iter().map(|p| c.text_width(&p.0, font_px)).collect()).collect();
+    let (mono, bold) = (drawing.readout_mono, drawing.readout_bold);
+    let widths: Vec<Vec<f32>> = lines.iter().map(|l| l.iter().map(|p| c.styled_width(&p.0, font_px, mono, bold)).collect()).collect();
     let w = widths.iter().map(|l| l.iter().sum::<f32>()).fold(0.0, f32::max) + 2.0 * pad;
     let h = step * lines.len() as f32 + 2.0 * pad - (step - font_px * 1.15);
     c.fill_rect(corner, (corner.0 + w, corner.1 + h), [0, 0, 0, 170]);
     for (k, (line, ws)) in lines.iter().zip(&widths).enumerate() {
         let mut x = corner.0 + pad;
         for ((text, color), w) in line.iter().zip(ws) {
-            c.text((x, corner.1 + pad + k as f32 * step), text, font_px, *color);
+            c.styled_text((x, corner.1 + pad + k as f32 * step), text, font_px, *color, mono, bold);
             x += w;
         }
     }
@@ -417,10 +439,16 @@ pub fn draw_extras(c: &mut dyn Canvas, extras: &Extras, axes: &[FiberAxis], draw
     }
     if extras.numbers {
         let on = brightest_centre(axes).map(|b| b.0);
+        let font = style.font_px * 1.4;
         for (i, f) in axes.iter().enumerate() {
-            let k = std::f64::consts::FRAC_1_SQRT_2 * f.radius;
             let (text, color) = if on == Some(i) { (format!("{} on", drawing.number(i)), READOUT_COLOR) } else { (drawing.number(i).to_string(), NUMBER_COLOR) };
-            label(c, to_out(f.cx + k, f.cy - k), &text, color, style.font_px * 1.4);
+            // Starting at the middle of the fiber's right edge, centered on it.
+            let edge = to_out(f.cx + f.radius, f.cy);
+            let pad = font * 0.25;
+            let (w, h) = (c.text_width(&text, font) + 2.0 * pad, font * 1.2 + 2.0 * pad);
+            let min = (edge.0 + font * 0.15, edge.1 - h / 2.0);
+            c.fill_rect(min, (min.0 + w, min.1 + h), [0, 0, 0, 170]);
+            c.text((min.0 + pad, min.1 + pad + font * 0.1), &text, font, color);
         }
     }
 }
@@ -489,7 +517,7 @@ pub fn render_markup(img: &RgbImage, m: &Markup) -> RgbImage {
         draw_fiber_axes(&mut c, &m.axes, &identity, 1.0, &style, None, m.drawing, area);
     }
     draw_extras(&mut c, &m.extras, &m.axes, &m.drawing, &identity, 1.0, &style, area);
-    let font = (w / 1000.0 * READOUT_PX).round().max(18.0);
+    let font = (w / 1000.0 * m.drawing.readout_px).round().max(12.0);
     let margin = font * 0.4;
     draw_fiber_readout(&mut c, &m.axes, &m.drawing, (margin, margin), font);
     draw_notes(&mut c, &m.extras.notes, (margin, h - margin), font * 0.8);
@@ -523,7 +551,7 @@ pub fn render_fiber_axes(img: &RgbImage, axes: &[FiberAxis], drawing: FiberDrawi
     let mut c = SkiaCanvas::from_image(img);
     draw_fiber_axes(&mut c, axes, &identity, 1.0, &style, None, drawing, ((0.0, 0.0), (w, img.height() as f32)));
     // Big, as on screen: READOUT_PX on a view about 1000 px wide.
-    let font = (w / 1000.0 * READOUT_PX).round().max(18.0);
+    let font = (w / 1000.0 * drawing.readout_px).round().max(12.0);
     let margin = font * 0.4;
     draw_fiber_readout(&mut c, axes, &drawing, (margin, margin), font);
     c.to_image()

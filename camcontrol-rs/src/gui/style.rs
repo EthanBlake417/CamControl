@@ -119,6 +119,10 @@ pub struct FiberLineStyle {
     pub fast_opacity: i64,
     pub slow_by_angle: AngleColors,
     pub fast_by_angle: AngleColors,
+    /// The angles box in the view's top-left corner: text size on screen (px), "sans" or "mono", bold.
+    pub readout_size: f64,
+    pub readout_font: String,
+    pub readout_bold: bool,
 }
 
 impl Default for FiberLineStyle {
@@ -131,6 +135,9 @@ impl Default for FiberLineStyle {
             fast_opacity: 100,
             slow_by_angle: AngleColors::for_axis(true),
             fast_by_angle: AngleColors::for_axis(false),
+            readout_size: 26.0,
+            readout_font: "sans".into(),
+            readout_bold: false,
         }
     }
 }
@@ -151,6 +158,13 @@ impl FiberLineStyle {
         }
         if parse_color(&s.fast_color).is_none() {
             s.fast_color = d.fast_color;
+        }
+        if !s.readout_size.is_finite() {
+            s.readout_size = d.readout_size;
+        }
+        s.readout_size = s.readout_size.clamp(10.0, 80.0);
+        if !["sans", "mono"].contains(&s.readout_font.as_str()) {
+            s.readout_font = d.readout_font.clone();
         }
         s.slow_opacity = s.slow_opacity.clamp(5, 100);
         s.fast_opacity = s.fast_opacity.clamp(5, 100);

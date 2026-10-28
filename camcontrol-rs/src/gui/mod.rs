@@ -281,6 +281,9 @@ impl App {
             first_number: self.saved.count_first,
             ascending: self.saved.count_ascending,
             reference: self.alignment.reference_deg(),
+            readout_px: self.saved.fiber_lines.readout_size as f32,
+            readout_mono: self.saved.fiber_lines.readout_font == "mono",
+            readout_bold: self.saved.fiber_lines.readout_bold,
         }
     }
 }

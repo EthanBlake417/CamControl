@@ -209,13 +209,17 @@ fn alignment_readings_reference_and_region() {
     h.state_mut().view_event(id, super::view::ViewEvent::Drawn("line".into(), vec![(0.0, 300.0), (dx, 300.0 + dy)]));
     assert!((h.state().alignment.reference_deg().unwrap() - 30.0).abs() < 1e-9);
     let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
-    assert!(lines[0].starts_with("1: slow -30.0°  fast +60.0°"), "{lines:?}");
-    assert_eq!(lines.last().unwrap(), "Angles from the reference line");
+    // Axes at 0° and 90°, the line at 30°: perpendicular is 120°, the 90° axis is 30° clockwise of it.
+    assert_eq!(lines, vec!["1: -30.00°", "2: -30.00°", "3: -30.00°"]);
+    // Its ends dragged: the line moves.
+    h.state_mut().view_event(id, super::view::ViewEvent::ReferenceMoved((0.0, 300.0), (100.0, 300.0)));
+    assert!(h.state().alignment.reference_deg().unwrap().abs() < 1e-9);
+    h.state_mut().alignment.reference = Some(super::alignment::rotate_line((0.0, 300.0), (100.0, 300.0), 30.0));
     h.state_mut().take_readings();
     let rows = h.state().alignment.rows.clone();
     assert_eq!(rows.len(), 3, "{rows:?}");
     for r in &rows {
-        assert!(r.n == 1 && r.std == 0.0 && (r.mean - 60.0).abs() < 0.5 && r.reference.is_some(), "fast axis from the line: {r:?}");
+        assert!(r.n == 1 && r.std == 0.0 && (r.mean + 30.0).abs() < 0.5 && r.reference.is_some(), "off perpendicular: {r:?}");
     }
     assert_eq!(rows.iter().map(|r| r.fiber).collect::<Vec<_>>(), vec![1, 2, 3]);
     // Only the two fibers whose centers are in the left 640 px.
@@ -255,11 +259,15 @@ fn fiber_count_numbers_and_saves() {
     h.press_key_modifiers(Modifiers::COMMAND, Key::Num7);
     h.run_ok();
     assert!(h.state().panels.is_open(PanelId::FiberCount));
-    h.state_mut().find_fiber_axes(false);
+    h.state_mut().fiber.centre_only = true;
+    h.state_mut().find_all_fibers();
+    assert!(!h.state().fiber.centre_only, "Find fibers looks for all of them");
     wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
+    assert!(h.state().panels.is_open(PanelId::FiberCount), "Find fibers stays on the Fiber count tab");
     let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
     assert!(lines[0].starts_with("17: ") && lines[2].starts_with("15: "), "{lines:?}");
-    assert_eq!(lines.last().unwrap(), "Fiber 16 is on (brightest center)");
+    assert_eq!(lines.len(), 3, "no 'is on' line in the readout: {lines:?}");
+    assert_eq!(crate::processing::fiber_axis::brightest_centre(&h.state().active_pane().fibers).map(|b| b.0), Some(1));
     h.state_mut().save_fiber_count();
     let json = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path())
         .find(|p| p.extension().is_some_and(|e| e == "json") && p.file_name().unwrap().to_string_lossy().starts_with("fibers_"))
@@ -596,7 +604,8 @@ fn brightest_centre_histogram_and_fiber_crosshair() {
     h.state_mut().find_fiber_axes(false);
     wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
     let lines = super::annotate::fiber_readout_lines(&h.state().active_pane().fibers);
-    assert_eq!(lines.last().unwrap(), "Fiber 2 is on (brightest center)", "{lines:?}");
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    assert_eq!(crate::processing::fiber_axis::brightest_centre(&h.state().active_pane().fibers).map(|b| b.0), Some(1));
     // The histogram is in the Controls panel.
     assert!(h.state().panels.is_open(PanelId::Controls));
     h.run_ok();
