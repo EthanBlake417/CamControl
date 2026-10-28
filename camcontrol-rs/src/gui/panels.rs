@@ -257,7 +257,10 @@ impl App {
                 ui.label(RichText::new(next).weak());
                 ui.end_row();
             });
+            // Flat-field correction goes with the Process menu (the "extras" feature).
+            #[cfg(feature = "extras")]
             let mut on = self.saved.flat_on;
+            #[cfg(feature = "extras")]
             if ui.add_enabled(self.flat.is_some(), egui::Checkbox::new(&mut on, "Correct live view and captures"))
                 .on_hover_text("Correct uneven lighting in the live views, photos, videos and time-lapses.\nSet a flat reference first: Process > Flat-field correction.")
                 .changed()
@@ -723,10 +726,6 @@ impl App {
                         }
                     }
                 }
-                hint(ui, "Clarity: how sure the result is; \"(unclear)\" means check it by eye. Angles: 0° is horizontal, + is turned \
-                          counter-clockwise, - clockwise (-90° to +90°). Solid magenta line: slow axis (through the stress rods / wedges / \
-                          ellipse). Dashed yellow: fast axis. Fibers are found automatically; to keep to some of the image, draw a \
-                          region of interest in the Alignment tab.");
             });
         });
         if changed {

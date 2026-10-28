@@ -22,9 +22,9 @@ use super::{Action, App, FiberKind, FiberRequest, Pane, ProcessJob, ResultInfo, 
 use crate::camera::worker::{CameraLink, CaptureRequest, Cmd, Ev, RecordOverlay, TimeLapse};
 use crate::camera::{camera_list, DeviceKey};
 use crate::capture::{self, clean_name, next_capture_path, HD2_SCALE};
-use crate::export::{self, Cell, Sheet};
+use crate::export;
 use crate::measure::{compute, kind, Measurement};
-use crate::processing::fiber_axis::{self, method_label, FiberAxis};
+use crate::processing::fiber_axis::{self, FiberAxis};
 use crate::processing::flatfield::FlatField;
 use crate::video::is_video;
 
@@ -43,40 +43,6 @@ pub(crate) fn timestamp() -> String {
 pub(crate) fn with_ext(path: PathBuf, allowed: &[&str], default_ext: &str) -> PathBuf {
     let ok = path.extension().is_some_and(|e| allowed.contains(&e.to_string_lossy().to_lowercase().as_str()));
     if ok { path } else { path.with_extension(default_ext) }
-}
-
-const FIBER_HEADERS: &[&str] = &["#", "Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity", "Method", "Clear",
-                                 "Threshold (noise x)", "Rod outline found", "Center x (px)", "Center y (px)", "Axis x (px)",
-                                 "Axis y (px)", "Diameter (px)", "Center brightness (0-255)", "Fiber level (0-255)",
-                                 "Background level (0-255)", "Contrast (%)", "Edge width (px)", "Noise", "SNR", "Clipped (%)",
-                                 "Bright parts (0-255)", "Quality",
-                                 "Reference line (deg; axes given from it)", "Axis", "Angle (deg)", "Image"];
-
-/// `reference`: the reference line's angle, which the axes are given from.
-fn fiber_row(i: usize, f: &FiberAxis, source: &str, reference: Option<f64>) -> Vec<Cell> {
-    let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
-    let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
-    let (ax, ay) = f.axis_point();
-    let mut row = vec![
-        Cell::Num((i + 1) as f64),
-        Cell::Text(f.fiber_type.clone()),
-        r2(super::annotate::signed_angle(f.slow_deg - reference.unwrap_or(0.0))),
-        r2(super::annotate::signed_angle(f.fast_deg() - reference.unwrap_or(0.0))),
-        Cell::Num((f.elongation * 1000.0).round() / 1000.0),
-        Cell::Text(method_label(&f.method).into()),
-        Cell::Bool(f.clear()),
-        if f.method == "rods" { Cell::Empty } else { r2(f.threshold) },
-        f.coverage.map(|c| Cell::Num((c * 1000.0).round() / 1000.0)).unwrap_or(Cell::Empty),
-        r1(f.cx), r1(f.cy), r1(ax), r1(ay), r1(2.0 * f.radius),
-        f.centre_brightness.map(r1).unwrap_or(Cell::Empty),
-    ];
-    row.extend(super::fiber_log::quality_cells(f.image_quality.as_ref(), true));
-    row.push(reference.map(r2).unwrap_or(Cell::Empty));
-    let drawing = super::annotate::FiberDrawing { reference, ..Default::default() };
-    row.push(drawing.perpendicular_axis(f).map(|a| Cell::Text(a.into())).unwrap_or(Cell::Empty));
-    row.push(drawing.off_perpendicular(f).map(r2).unwrap_or(Cell::Empty));
-    row.push(Cell::Text(source.into()));
-    row
 }
 
 impl App {
@@ -1264,52 +1230,6 @@ impl App {
         }
     }
 
-    pub(crate) fn export_counts(&mut self) {
-        let p = self.active_pane();
-        let Some(image) = p.image().filter(|_| !p.counter.marks.is_empty()) else {
-            self.warn("Export counts", "There are no counts to export.");
-            return;
-        };
-        let Some(path) = self.export_path("Export counts", "counts") else { return };
-        let counter = self.active_pane().counter.clone();
-        let source = self.active_source();
-        let sheets = vec![counter.summary_sheet(&self.class_names), counter.marks_sheet(&self.class_names),
-                          export::info_sheet(&[("Image", Cell::Text(source))])];
-        let (ip, mp) = (Self::beside(&path, "image"), Self::beside(&path, "marked"));
-        let r = export::write_tables(&sheets, &path, true)
-            .and_then(|_| image.save(&ip).map_err(|e| e.to_string()))
-            .and_then(|_| super::annotate::render_marks(&image, &counter).save(&mp).map_err(|e| e.to_string()));
-        match r {
-            Ok(()) => self.message(format!("Exported {} marks to {}, {} and {}", counter.marks.len(), file_name(&path), file_name(&ip), file_name(&mp)), Some(8.0)),
-            Err(e) => self.warn("Export counts", format!("Export failed: {e}")),
-        }
-    }
-
-    pub(crate) fn fiber_sheet(&self, source: &str) -> Sheet {
-        let reference = self.alignment.reference_deg();
-        let rows = self.active_pane().fibers.iter().enumerate().map(|(i, f)| fiber_row(i, f, source, reference)).collect();
-        Sheet::new("Fiber axes", FIBER_HEADERS, rows)
-    }
-
-    pub(crate) fn export_fiber_axes(&mut self) {
-        let p = self.active_pane();
-        let Some(image) = p.image().filter(|_| !p.fibers.is_empty()) else {
-            self.warn("Export fiber axes", "There are no fiber axes to export. Click Find axes first.");
-            return;
-        };
-        let Some(path) = self.export_path("Export fiber axes", "fiber_axes") else { return };
-        let sheet = self.fiber_sheet(&self.active_source());
-        let axes = self.active_pane().fibers.clone();
-        let (ip, dp) = (Self::beside(&path, "image"), Self::beside(&path, "axes"));
-        let r = export::write_tables(&[sheet], &path, false)
-            .and_then(|_| image.save(&ip).map_err(|e| e.to_string()))
-            .and_then(|_| super::annotate::render_fiber_axes(&image, &axes, self.fiber_drawing()).save(&dp).map_err(|e| e.to_string()));
-        match r {
-            Ok(()) => self.message(format!("Exported {} fibers to {}, {} and {}", axes.len(), file_name(&path), file_name(&ip), file_name(&dp)), Some(8.0)),
-            Err(e) => self.warn("Export fiber axes", format!("Export failed: {e}")),
-        }
-    }
-
     // --- fiber axes -------------------------------------------------------------------------------
 
     /// Measure a view's image in the background with the panel's settings as they are now.
@@ -1724,6 +1644,7 @@ impl App {
             }
         }
         let flat = &data["flat_field"];
+        #[cfg(feature = "extras")]
         match flat["path"].as_str().map(PathBuf::from) {
             Some(p) if p.is_file() => {
                 if self.saved.flat_path != p.display().to_string() || self.flat.is_none() {

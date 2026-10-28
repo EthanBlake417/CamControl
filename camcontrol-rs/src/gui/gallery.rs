@@ -347,12 +347,15 @@ impl Gallery {
                                 show_in_file_manager(path);
                                 ui.close_menu();
                             }
-                            ui.separator();
-                            for (key, text) in PROCESS_TOOLS {
-                                let need = if key == "composite" { 1 } else { 2 };
-                                if ui.add_enabled(n >= need, egui::Button::new(format!("{text} ({n} image{})...", s(n)))).clicked() {
-                                    actions.push(GalleryAction::Process(key.into(), images.clone()));
-                                    ui.close_menu();
+                            #[cfg(feature = "extras")]
+                            {
+                                ui.separator();
+                                for (key, text) in PROCESS_TOOLS {
+                                    let need = if key == "composite" { 1 } else { 2 };
+                                    if ui.add_enabled(n >= need, egui::Button::new(format!("{text} ({n} image{})...", s(n)))).clicked() {
+                                        actions.push(GalleryAction::Process(key.into(), images.clone()));
+                                        ui.close_menu();
+                                    }
                                 }
                             }
                             ui.separator();

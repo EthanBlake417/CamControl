@@ -25,9 +25,20 @@ pub enum PanelId {
 }
 
 impl PanelId {
+    #[cfg(feature = "extras")]
     pub const ALL: [PanelId; 7] = [
         PanelId::Controls,
         PanelId::Measurements,
+        PanelId::Captures,
+        PanelId::Alignment,
+        PanelId::Fiber,
+        PanelId::FiberLog,
+        PanelId::FiberCount,
+    ];
+    /// Without the "extras" feature there's no Measurements panel.
+    #[cfg(not(feature = "extras"))]
+    pub const ALL: [PanelId; 6] = [
+        PanelId::Controls,
         PanelId::Captures,
         PanelId::Alignment,
         PanelId::Fiber,
@@ -92,8 +103,9 @@ impl Default for PanelLayout {
             slots: vec![
                 s(PanelId::Captures, Edge::Left, true),
                 s(PanelId::Controls, Edge::Right, true),
+                #[cfg(feature = "extras")]
                 s(PanelId::Measurements, Edge::Bottom, true),
-                s(PanelId::Alignment, Edge::Bottom, false),
+                s(PanelId::Alignment, Edge::Bottom, !cfg!(feature = "extras")),
                 s(PanelId::Fiber, Edge::Bottom, false),
                 s(PanelId::FiberLog, Edge::Bottom, false),
                 s(PanelId::FiberCount, Edge::Bottom, false),
@@ -108,6 +120,7 @@ impl PanelLayout {
     /// Every panel exactly once, at most one open per edge (after loading saved settings).
     pub fn repair(&mut self) {
         let mut seen = Vec::new();
+        self.slots.retain(|s| PanelId::ALL.contains(&s.id)); // panels left out of this build
         self.slots.retain(|s| {
             let new = !seen.contains(&s.id);
             seen.push(s.id);
@@ -267,10 +280,10 @@ mod tests {
     #[test]
     fn one_open_per_edge_and_moving() {
         let mut l = PanelLayout::default();
-        l.toggle(PanelId::Alignment);
-        assert!(l.is_open(PanelId::Alignment) && !l.is_open(PanelId::Measurements));
-        l.move_to(PanelId::Alignment, Edge::Left, None);
-        assert!(l.is_open(PanelId::Alignment) && !l.is_open(PanelId::Captures));
+        l.toggle(PanelId::FiberLog);
+        assert!(l.is_open(PanelId::FiberLog) && l.open_on(Edge::Bottom) == Some(PanelId::FiberLog), "one open per edge");
+        l.move_to(PanelId::FiberLog, Edge::Left, None);
+        assert!(l.is_open(PanelId::FiberLog) && !l.is_open(PanelId::Captures));
         assert_eq!(l.open_on(Edge::Bottom), None);
         l.slots.push(Slot { id: PanelId::Fiber, edge: Edge::Right, open: true });
         l.repair();

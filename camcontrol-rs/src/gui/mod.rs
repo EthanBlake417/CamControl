@@ -19,6 +19,9 @@
 //! camera view used last. With Link views on, Capture, Live/Freeze, Fit,
 //! 100% and Find fiber axes act on every view.
 
+// Without the "extras" feature, the Measurements panel and processing are left out (their code stays).
+#![cfg_attr(not(feature = "extras"), allow(dead_code, unused_imports, unused_variables))]
+
 mod actions;
 pub mod annotate;
 mod dialogs;
@@ -466,8 +469,10 @@ impl App {
         } else {
             self.gallery.set_output_folder(&folder);
         }
-        let flat = self.saved.flat_path.clone();
-        if !flat.is_empty() && PathBuf::from(&flat).is_file() {
+        // Flat-field correction only with the "extras" feature (the saved choice is kept for it).
+        let flat = if cfg!(feature = "extras") { self.saved.flat_path.clone() } else { String::new() };
+        if !cfg!(feature = "extras") {
+        } else if !flat.is_empty() && PathBuf::from(&flat).is_file() {
             self.use_flat(&PathBuf::from(&flat), true);
             if self.saved.flat_on {
                 self.set_flat_live(true);
@@ -554,6 +559,7 @@ impl App {
         if consume(&SAVE) {
             self.save_image();
         }
+        #[cfg(feature = "extras")]
         if consume(&EXPORT) {
             self.export_measurements();
         }
@@ -679,31 +685,7 @@ impl App {
             ui.menu_button("View", |ui| {
                 self.view_menu(ui, &ctx);
             });
-            ui.menu_button("Measure", |ui| {
-                if ui.add(egui::Button::new("Export measurements...").shortcut_text(fmt(&EXPORT))).clicked() {
-                    ui.close_menu();
-                    self.export_measurements();
-                }
-                if ui.button("Clear measurements").clicked() {
-                    ui.close_menu();
-                    let a = self.active;
-                    self.clear_measurements(a, true);
-                }
-                ui.separator();
-                if ui.button("Export counts...").clicked() {
-                    ui.close_menu();
-                    self.export_counts();
-                }
-                ui.separator();
-                if ui.button("Find fiber axes").clicked() {
-                    ui.close_menu();
-                    self.find_fiber_axes(false);
-                }
-                if ui.button("Export fiber axes...").clicked() {
-                    ui.close_menu();
-                    self.export_fiber_axes();
-                }
-            });
+            #[cfg(feature = "extras")]
             ui.menu_button("Process", |ui| {
                 ui.menu_button("Flat-field correction", |ui| {
                     let info = self.flat.as_ref().map(|f| format!("Reference: {}", f.name)).unwrap_or("No flat reference (use or load one below)".into());
@@ -797,7 +779,10 @@ impl App {
                 let actions = self.gallery.ui(ui);
                 self.gallery_actions(ctx, actions);
             }
+            #[cfg(feature = "extras")]
             PanelId::Measurements => self.measure_panel(ui),
+            #[cfg(not(feature = "extras"))]
+            PanelId::Measurements => {}
             PanelId::Alignment => {
                 egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.alignment_panel(ui));
             }
@@ -997,20 +982,18 @@ impl App {
                     }
                     ui.vertical(|ui| {
                         ui.heading("CamControl");
-                        ui.label(format!("Version {} (Rust)", env!("CARGO_PKG_VERSION")));
+                        ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     });
                 });
-                ui.label("Live view, capture, measurement and image processing for USB microscope cameras \
-                          (e.g. the O.C. White Ultra-Cam II and the ETN3000 fiber end-face inspector).");
+                ui.label("Camera control, measurement and PM fiber alignment for USB microscope cameras.");
                 for line in [
-                    "One or more views side by side, each showing a camera, an image, a video or a result; several cameras live at once",
-                    "Photo capture with frame averaging, video recording and time-lapse",
-                    "Measurements, counting, and the slow/fast axes of PM fibers (Panda, Bow-tie, Elliptical)",
-                    "Flat-field correction, focus stacking, HDR, stitching and fluorescence composites",
-                    "Grid and crosshair overlays, settings files, Excel/CSV export",
+                    "Live view, photos, video and time-lapse",
+                    "Slow and fast axes of PM fibers, alignment readings and fiber counting",
+                    "Measurements, image processing and Excel/CSV export",
                 ] {
                     ui.label(format!("•  {line}"));
                 }
+                ui.add_space(4.0);
                 ui.label("Made by Ethan Blake at Grid Evolution Technologies.");
             });
             self.about = open;

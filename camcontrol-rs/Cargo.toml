@@ -24,6 +24,11 @@ tiff = "0.11"
 tiny-skia = "0.12.0"
 trash = "5.2.9"
 
+[features]
+# Left out of the app for now (the code stays): the Measurements panel and the Process menu
+# (and the Captures panel's processing tools). Build with them: `cargo build --release --features extras`.
+extras = []
+
 [profile.release]
 lto = true
 codegen-units = 1

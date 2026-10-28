@@ -167,6 +167,7 @@ fn find_axes_from_the_panel() {
     assert!(f.slow_deg.min(180.0 - f.slow_deg) < 1.0, "{}", f.slow_deg);
 }
 
+#[cfg(feature = "extras")]
 #[test]
 fn measuring_a_line_by_clicking() {
     let (mut h, dir) = harness("measure");
@@ -320,6 +321,7 @@ fn shortcuts_toggle_overlays() {
     assert_eq!((h.state().saved.grid, h.state().saved.crosshair), (!g, !c));
 }
 
+#[cfg(feature = "extras")]
 #[test]
 fn processing_shows_an_unsaved_result() {
     let (mut h, dir) = harness("process");
@@ -396,6 +398,7 @@ fn choices_kept_between_sessions() {
     assert_eq!((back.count_class_names, back.multi_layout, back.overlay_tab), (s.count_class_names.clone(), s.multi_layout.clone(), s.overlay_tab.clone()));
 }
 
+#[cfg(feature = "extras")]
 #[test]
 fn opening_another_image_asks_about_measurements() {
     let (mut h, dir) = harness("ask");
@@ -662,6 +665,7 @@ fn render_shots() {
     t.state_mut().panels.set_open(PanelId::Alignment, true);
     t.state_mut().saved.capture_tab = 2;
     shot(&mut t, "3_alignment_timelapse");
+    #[cfg(feature = "extras")]
     t.state_mut().panels.set_open(PanelId::Measurements, true);
     t.state_mut().saved.capture_tab = 1;
     shot(&mut t, "4_measure_video");

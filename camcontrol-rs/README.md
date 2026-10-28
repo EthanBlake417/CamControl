@@ -53,6 +53,8 @@ cargo build --release
 
 The result is `target\release\camcontrol.exe` (about 13 MB, with the GET icon). It needs only DLLs that come with Windows (the C runtime is linked in, see `.cargo/config.toml`). Windows "N" editions need the Media Feature Pack for cameras.
 
+The **Measurements** panel and the **Process** menu (flat-field, focus stack, HDR, stitching, fluorescence; also in the Captures panel's right-click menu) are left out of the app for now; their code stays. Build with them: `cargo build --release --features extras` (test them: `cargo test --profile fast --lib --features extras`).
+
 Linux (build on the oldest distro you want to support, e.g. Ubuntu 22.04):
 
 ```
