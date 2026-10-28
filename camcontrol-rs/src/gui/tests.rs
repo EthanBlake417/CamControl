@@ -210,7 +210,7 @@ fn alignment_readings_reference_and_region() {
     assert!((h.state().alignment.reference_deg().unwrap() - 30.0).abs() < 1e-9);
     let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
     // Axes at 0° and 90°, the line at 30°: perpendicular is 120°, the 90° axis is 30° clockwise of it.
-    assert_eq!(lines, vec!["1: -30.00°", "2: -30.00°", "3: -30.00°"]);
+    assert_eq!(lines, vec!["1: fast -30.00°", "2: fast -30.00°", "3: fast -30.00°"]);
     // Its ends dragged: the line moves.
     h.state_mut().view_event(id, super::view::ViewEvent::ReferenceMoved((0.0, 300.0), (100.0, 300.0)));
     assert!(h.state().alignment.reference_deg().unwrap().abs() < 1e-9);
@@ -219,7 +219,7 @@ fn alignment_readings_reference_and_region() {
     let rows = h.state().alignment.rows.clone();
     assert_eq!(rows.len(), 3, "{rows:?}");
     for r in &rows {
-        assert!(r.n == 1 && r.std == 0.0 && (r.mean + 30.0).abs() < 0.5 && r.reference.is_some(), "off perpendicular: {r:?}");
+        assert!(r.n == 1 && r.std == 0.0 && (r.mean + 30.0).abs() < 0.5 && r.reference.is_some() && r.axis == "fast", "off perpendicular: {r:?}");
     }
     assert_eq!(rows.iter().map(|r| r.fiber).collect::<Vec<_>>(), vec![1, 2, 3]);
     // Only the two fibers whose centers are in the left 640 px.

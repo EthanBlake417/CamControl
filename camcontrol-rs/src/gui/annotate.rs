@@ -73,6 +73,12 @@ impl FiberDrawing {
         perpendicular_offset(f.slow_deg, self.reference?)
     }
 
+    /// With a reference line: which axis is the one nearest perpendicular to it, "slow" or "fast".
+    pub fn perpendicular_axis(&self, f: &FiberAxis) -> Option<&'static str> {
+        let r = self.reference?;
+        Some(if signed_angle(f.slow_deg - r - 90.0).abs() <= 45.0 { "slow" } else { "fast" })
+    }
+
     /// The number of the i-th fiber (in the order they're kept: top to bottom, then left to right).
     pub fn number(&self, i: usize) -> i64 {
         if self.ascending { self.first_number + i as i64 } else { self.first_number - i as i64 }
@@ -344,8 +350,9 @@ pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<V
         .enumerate()
         .map(|(i, f)| {
             // With a reference line, the one angle that matters: off perpendicular to it.
-            if let Some(d) = drawing.off_perpendicular(f) {
-                let mut line = vec![(format!("{}: {d:+.2}°", drawing.number(i)), READOUT_COLOR)];
+            if let (Some(d), Some(axis)) = (drawing.off_perpendicular(f), drawing.perpendicular_axis(f)) {
+                let color = opaque(if axis == "slow" { drawing.slow_color(f) } else { drawing.fast_color(f) });
+                let mut line = vec![(format!("{}: {axis} {d:+.2}°", drawing.number(i)), color)];
                 if !f.clear() {
                     line.push((" (unclear)".into(), [230, 230, 230, 255]));
                 }

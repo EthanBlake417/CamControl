@@ -50,7 +50,7 @@ const FIBER_HEADERS: &[&str] = &["#", "Type", "Slow axis (deg)", "Fast axis (deg
                                  "Axis y (px)", "Diameter (px)", "Center brightness (0-255)", "Fiber level (0-255)",
                                  "Background level (0-255)", "Contrast (%)", "Edge width (px)", "Noise", "SNR", "Clipped (%)",
                                  "Bright parts (0-255)", "Quality",
-                                 "Reference line (deg; axes given from it)", "Off perpendicular to the line (deg)", "Image"];
+                                 "Reference line (deg; axes given from it)", "Axis", "Angle (deg)", "Image"];
 
 /// `reference`: the reference line's angle, which the axes are given from.
 fn fiber_row(i: usize, f: &FiberAxis, source: &str, reference: Option<f64>) -> Vec<Cell> {
@@ -72,7 +72,9 @@ fn fiber_row(i: usize, f: &FiberAxis, source: &str, reference: Option<f64>) -> V
     ];
     row.extend(super::fiber_log::quality_cells(f.image_quality.as_ref(), true));
     row.push(reference.map(r2).unwrap_or(Cell::Empty));
-    row.push(reference.and_then(|r| super::annotate::perpendicular_offset(f.slow_deg, r)).map(r2).unwrap_or(Cell::Empty));
+    let drawing = super::annotate::FiberDrawing { reference, ..Default::default() };
+    row.push(drawing.perpendicular_axis(f).map(|a| Cell::Text(a.into())).unwrap_or(Cell::Empty));
+    row.push(drawing.off_perpendicular(f).map(r2).unwrap_or(Cell::Empty));
     row.push(Cell::Text(source.into()));
     row
 }

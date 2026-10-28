@@ -20,8 +20,9 @@ pub struct Entry {
     pub fiber: usize,
     pub slow: f64,
     pub fast: f64,
-    /// Off perpendicular to the reference line (when there is one).
+    /// With a reference line: the axis nearest perpendicular to it and how far it's off.
     pub perp: Option<f64>,
+    pub perp_axis: Option<&'static str>,
     pub quality: Option<FiberQuality>,
 }
 
@@ -115,7 +116,7 @@ pub struct FiberSummary {
 }
 
 impl FiberLog {
-    pub const HEADERS: [&'static str; 11] = ["Time", "Update", "Fiber", "Slow axis (deg)", "Fast axis (deg)", "Off perpendicular (deg)", "Contrast (%)",
+    pub const HEADERS: [&'static str; 12] = ["Time", "Update", "Fiber", "Slow axis (deg)", "Fast axis (deg)", "Axis", "Angle (deg)", "Contrast (%)",
                                              "Edge width (px)", "SNR", "Clipped (%)", "Quality"];
     pub const SUMMARY_HEADERS: [&'static str; 6] = ["Fiber", "Count", "Mean slow axis (deg)", "Mean fast axis (deg)", "Std (deg)",
                                                     "Mean contrast (%)"];
@@ -128,8 +129,9 @@ impl FiberLog {
         for (i, f) in fibers.iter().enumerate() {
             let r = reference.unwrap_or(0.0);
             let (slow, fast) = (signed_angle(f.slow_deg - r), signed_angle(f.fast_deg() - r));
-            let perp = reference.and_then(|r| super::annotate::perpendicular_offset(f.slow_deg, r));
-            self.entries.push(Entry { time: time.clone(), update: self.updates, fiber: i + 1, slow, fast, perp, quality: f.image_quality });
+            let drawing = super::annotate::FiberDrawing { reference, ..Default::default() };
+            let (perp, perp_axis) = (drawing.off_perpendicular(f), drawing.perpendicular_axis(f));
+            self.entries.push(Entry { time: time.clone(), update: self.updates, fiber: i + 1, slow, fast, perp, perp_axis, quality: f.image_quality });
         }
         fibers.len()
     }
@@ -155,7 +157,7 @@ impl FiberLog {
     pub fn sheet(&self) -> Sheet {
         let rows = self.entries.iter().map(|e| {
             let mut row = vec![Cell::Text(e.time.clone()), Cell::Num(e.update as f64), Cell::Num(e.fiber as f64), round2(e.slow), round2(e.fast),
-                               e.perp.map(round2).unwrap_or(Cell::Empty)];
+                               e.perp_axis.map(|a| Cell::Text(a.into())).unwrap_or(Cell::Empty), e.perp.map(round2).unwrap_or(Cell::Empty)];
             row.extend(quality_cells(e.quality.as_ref(), false));
             row
         }).collect();
@@ -254,7 +256,7 @@ impl App {
                 egui::Grid::new("fiber_log_rows_grid").striped(true).num_columns(8).start_row(range.start).show(ui, |ui| {
                     for i in range {
                         if i == 0 {
-                            for h in ["Time", "#", "Fiber", "Slow °", "Fast °", "From perp.", "Contrast", "Quality"] {
+                            for h in ["Time", "#", "Fiber", "Slow °", "Fast °", "Angle", "Contrast", "Quality"] {
                                 let r = ui.strong(h);
                                 if h == "Quality" || h == "Contrast" {
                                     r.on_hover_text(QUALITY_HELP);
@@ -267,7 +269,7 @@ impl App {
                             ui.label(e.fiber.to_string());
                             ui.label(format!("{:+.2}", e.slow));
                             ui.label(format!("{:+.2}", e.fast));
-                            ui.label(e.perp.map(|d| format!("{d:+.2}")).unwrap_or_default());
+                            ui.label(e.perp.zip(e.perp_axis).map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default());
                             let q = e.quality.as_ref();
                             ui.label(fmt_contrast(q)).on_hover_text(quality_hover(q));
                             ui.label(grade_text(q)).on_hover_text(quality_hover(q));

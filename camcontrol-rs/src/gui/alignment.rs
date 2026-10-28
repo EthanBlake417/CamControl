@@ -9,7 +9,7 @@ use eframe::egui::{self, RichText};
 use serde_json::json;
 
 use super::actions::{file_name, timestamp};
-use super::annotate::{fmt_angle, render_markup, signed_angle, Extras, Markup};
+use super::annotate::{render_markup, signed_angle, Extras, Markup};
 use super::fiber_log::axial_stats;
 use super::stripes::PanelId;
 use super::App;
@@ -30,6 +30,8 @@ pub struct Collecting {
     pub pane: u64,
     pub wanted: usize,
     pub readings: Vec<Vec<f64>>,
+    /// Which axis each fiber's reading is of ("fast" / "slow"), as last measured.
+    pub axes: Vec<&'static str>,
 }
 
 /// One table row: a fiber's fast axis over one set of readings.
@@ -43,6 +45,8 @@ pub struct Row {
     pub std: f64,
     /// The reference line's angle the readings were measured from.
     pub reference: Option<f64>,
+    /// The axis measured: with a line, the one nearest perpendicular to it; else the fast axis.
+    pub axis: &'static str,
 }
 
 pub struct Alignment {
@@ -55,7 +59,7 @@ pub struct Alignment {
     pub status: String,
 }
 
-pub const HEADERS: [&str; 7] = ["Time", "Fiber", "Readings", "Mean (deg)", "Std (deg)", "Mean of", "Reference line (deg)"];
+pub const HEADERS: [&str; 7] = ["Time", "Fiber", "Readings", "Axis", "Mean (deg)", "Std (deg)", "Reference line (deg)"];
 
 /// The line turned about its middle to `deg` (counter-clockwise from horizontal on screen), its length kept.
 pub fn rotate_line(a: (f64, f64), b: (f64, f64), deg: f64) -> ((f64, f64), (f64, f64)) {
@@ -88,13 +92,14 @@ impl Alignment {
     }
 
     /// Rows for each fiber (numbered from 1) from the readings taken (fast axes, from `reference` if given).
-    pub fn finish(&mut self, readings: &[Vec<f64>], reference: Option<f64>) -> usize {
+    pub fn finish(&mut self, readings: &[Vec<f64>], axes: &[&'static str], reference: Option<f64>) -> usize {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
         let fibers = readings.iter().map(|r| r.len()).max().unwrap_or(0);
         for i in 0..fibers {
             let angles: Vec<f64> = readings.iter().filter_map(|r| r.get(i).copied()).collect();
             let (mean, std) = axial_stats(&angles);
-            self.rows.push(Row { time: time.clone(), fiber: i as i64 + 1, n: angles.len(), mean: signed_angle(mean), std, reference });
+            let axis = axes.get(i).copied().unwrap_or("fast");
+            self.rows.push(Row { time: time.clone(), fiber: i as i64 + 1, n: angles.len(), mean: signed_angle(mean), std, reference, axis });
         }
         fibers
     }
@@ -102,8 +107,7 @@ impl Alignment {
     pub fn sheet(&self) -> Sheet {
         let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
         let rows = self.rows.iter().map(|r| vec![
-            Cell::Text(r.time.clone()), Cell::Num(r.fiber as f64), Cell::Num(r.n as f64), r2(r.mean), r2(r.std),
-            Cell::Text(from_label(r.reference)),
+            Cell::Text(r.time.clone()), Cell::Num(r.fiber as f64), Cell::Num(r.n as f64), Cell::Text(r.axis.into()), r2(r.mean), r2(r.std),
             r.reference.map(|v| r2(signed_angle(v))).unwrap_or(Cell::Empty),
         ]).collect();
         Sheet::new("Alignment", &HEADERS, rows)
@@ -111,19 +115,11 @@ impl Alignment {
 
     /// The table as text lines, for drawing on a photo.
     pub fn table_lines(&self) -> Vec<String> {
-        let mut lines = vec!["Fiber\tMean\tStd dev\tMean of\tn".to_string()];
+        let mut lines = vec!["Fiber\tAxis\tMean\tStd dev\tn".to_string()];
         for r in &self.rows {
-            lines.push(format!("{}\t{:+.2}°\t{:.2}°\t{}\t{}", r.fiber, r.mean, r.std, from_label(r.reference), r.n));
+            lines.push(format!("{}\t{}\t{:+.2}°\t{:.2}°\t{}", r.fiber, r.axis, r.mean, r.std, r.n));
         }
         lines
-    }
-}
-
-/// What a row's angle is measured from.
-fn from_label(reference: Option<f64>) -> String {
-    match reference {
-        Some(r) => format!("perpendicular to line at {}°", fmt_angle(r)),
-        None => "fast axis from horizontal".into(),
     }
 }
 
@@ -145,7 +141,7 @@ impl App {
             return;
         }
         let live = p.live;
-        self.alignment.collecting = Some(Collecting { pane: id, wanted: if live { self.alignment.n } else { 1 }, readings: Vec::new() });
+        self.alignment.collecting = Some(Collecting { pane: id, wanted: if live { self.alignment.n } else { 1 }, readings: Vec::new(), axes: Vec::new() });
         self.alignment.status = "Taking readings...".into();
         if !live {
             if self.pane(id).fibers.is_empty() {
@@ -164,6 +160,7 @@ impl App {
         let drawing = self.fiber_drawing();
         let angles: Vec<f64> = self.pane(pane).fibers.iter()
             .map(|f| drawing.off_perpendicular(f).unwrap_or_else(|| drawing.shown(f.fast_deg()))).collect();
+        let axes: Vec<&'static str> = self.pane(pane).fibers.iter().map(|f| drawing.perpendicular_axis(f).unwrap_or("fast")).collect();
         let c = self.alignment.collecting.as_mut().unwrap();
         if angles.is_empty() {
             if !self.pane(pane).live {
@@ -173,13 +170,14 @@ impl App {
             return;
         }
         c.readings.push(angles);
+        c.axes = axes;
         let (got, wanted) = (c.readings.len(), c.wanted);
         if got < wanted {
             self.alignment.status = format!("Taking readings: {got} of {wanted}");
             return;
         }
-        let readings = self.alignment.collecting.take().unwrap().readings;
-        let n = self.alignment.finish(&readings, drawing.reference);
+        let done = self.alignment.collecting.take().unwrap();
+        let n = self.alignment.finish(&done.readings, &done.axes, drawing.reference);
         self.alignment.status = format!("Added {n} fibers ({got} reading{} each).", if got == 1 { "" } else { "s" });
         if !self.panels.is_open(PanelId::Alignment) {
             self.panels.set_open(PanelId::Alignment, true);
@@ -318,15 +316,15 @@ impl App {
         ui.separator();
         egui::ScrollArea::vertical().id_salt("align_rows").max_height(150.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
             egui::Grid::new("align_grid").striped(true).num_columns(6).show(ui, |ui| {
-                for h in ["Fiber #", "Mean", "Std dev", "Mean of", "n", "Time"] {
+                for h in ["Fiber #", "Axis", "Mean", "Std dev", "n", "Time"] {
                     ui.strong(h);
                 }
                 ui.end_row();
                 for r in &self.alignment.rows {
                     ui.label(r.fiber.to_string());
+                    ui.label(r.axis);
                     ui.label(format!("{:+.2}°", r.mean));
                     ui.label(format!("{:.2}°", r.std));
-                    ui.label(from_label(r.reference));
                     ui.label(r.n.to_string());
                     ui.label(RichText::new(&r.time).weak());
                     ui.end_row();
@@ -441,7 +439,8 @@ impl App {
                 "number": d.number(i), "center_px": [f.cx, f.cy], "diameter_px": 2.0 * f.radius,
                 "center_brightness": f.centre_brightness, "on": on == Some(i),
                 "slow_axis_deg": d.shown(f.slow_deg), "fast_axis_deg": d.shown(f.fast_deg()),
-                "angles_from": from_label(d.reference),
+                "axis": d.perpendicular_axis(f), "angle_deg": d.off_perpendicular(f),
+                "reference_line_deg": d.reference.map(signed_angle),
             })).collect::<Vec<_>>(),
         });
         let r = render_markup(&image, &markup).save(&png).map_err(|e| e.to_string())
@@ -544,13 +543,14 @@ mod tests {
     #[test]
     fn rows_from_readings() {
         let mut a = Alignment::new(3, None, None);
-        let n = a.finish(&[vec![44.0, 89.0], vec![46.0, -89.0], vec![45.0, 90.0]], Some(30.0));
+        let n = a.finish(&[vec![44.0, 89.0], vec![46.0, -89.0], vec![45.0, 90.0]], &["slow", "fast"], Some(30.0));
         assert_eq!(n, 2);
         assert_eq!((a.rows[0].fiber, a.rows[1].fiber), (1, 2));
         assert!((a.rows[0].mean - 45.0).abs() < 1e-9 && (a.rows[0].std - 1.0).abs() < 1e-9);
         assert!((a.rows[1].mean.abs() - 90.0).abs() < 1e-6, "wraps at 90: {}", a.rows[1].mean);
         assert_eq!(a.rows[0].reference, Some(30.0));
         assert_eq!(a.table_lines().len(), 3);
-        assert!(a.table_lines()[1].contains("perpendicular to line at +30.0°"), "{:?}", a.table_lines());
+        assert_eq!((a.rows[0].axis, a.rows[1].axis), ("slow", "fast"));
+        assert!(a.table_lines()[1].starts_with("1\tslow\t+45.00°"), "{:?}", a.table_lines());
     }
 }

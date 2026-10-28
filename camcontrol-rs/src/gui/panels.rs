@@ -666,10 +666,10 @@ impl App {
                 let mut select = None;
                 egui::ScrollArea::both().max_height((ui.available_height() - 50.0).max(60.0)).auto_shrink([false, true]).show(ui, |ui| {
                     egui::Grid::new("fibers").striped(true).num_columns(13).show(ui, |ui| {
-                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "From perp. (°)", "Clarity", "Contrast", "Quality", "Method", "Center (px)",
+                        for h in ["#", "Type", "Slow axis (°)", "Fast axis (°)", "Angle (°)", "Clarity", "Contrast", "Quality", "Method", "Center (px)",
                                   "Axis through (px)", "Diameter (px)", "Center brightness"] {
                             let r = ui.strong(h);
-                            if h == "From perp. (°)" {
+                            if h == "Angle (°)" {
                                 r.on_hover_text("With a reference line (Alignment panel): how far the fiber's axis nearest\n\
                                                  perpendicular to the line is from perpendicular (slow or fast, whichever).");
                             } else if h == "Contrast" || h == "Quality" {
@@ -699,7 +699,8 @@ impl App {
                             let plain = |t: String| (egui::RichText::new(t), false);
                             let cells = [plain((i + 1).to_string()), plain(f.fiber_type.clone()), plain(fmt_angle(drawing.shown(f.slow_deg))),
                                          plain(fmt_angle(drawing.shown(f.fast_deg()))),
-                                         plain(drawing.off_perpendicular(f).map(|d| format!("{d:+.2}")).unwrap_or_default()), plain(clarity)].into_iter()
+                                         plain(drawing.off_perpendicular(f).zip(drawing.perpendicular_axis(f))
+                                             .map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default()), plain(clarity)].into_iter()
                                 .chain(quality.map(|t| (t, true)))
                                 .chain([method_label(&f.method).to_string(), format!("{:.1}, {:.1}", f.cx, f.cy), format!("{ax:.1}, {ay:.1}"),
                                         format!("{:.1}", 2.0 * f.radius),
