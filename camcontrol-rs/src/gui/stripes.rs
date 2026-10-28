@@ -52,9 +52,9 @@ impl PanelId {
             PanelId::Captures => "Captures",
             PanelId::Measurements => "Measurements",
             PanelId::Alignment => "Alignment",
-            PanelId::Fiber => "Fiber axis",
-            PanelId::FiberLog => "Fiber log",
-            PanelId::FiberCount => "Fiber count",
+            PanelId::Fiber => "Fiber Axis",
+            PanelId::FiberLog => "Fiber Log",
+            PanelId::FiberCount => "Fiber Count",
         }
     }
 

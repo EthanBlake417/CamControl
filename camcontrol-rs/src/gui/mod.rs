@@ -282,6 +282,9 @@ impl App {
             parts_fill: self.saved.fiber_lines.parts_fill(),
             parts_outline: self.saved.fiber_lines.parts_outline(),
             numbers_only: self.counting_clean(),
+            // Aligning: just the fiber being measured, with the number its readings will get.
+            only: self.panels.is_open(PanelId::Alignment)
+                .then(|| self.measured_index(self.active).map(|i| (i, self.alignment.next_number))).flatten(),
         }
     }
 

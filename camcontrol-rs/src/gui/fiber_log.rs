@@ -122,13 +122,12 @@ impl FiberLog {
                                                     "Mean contrast (%)"];
 
     /// Add one update's fibers (numbered from 1, left to right); returns how many entries were added.
-    /// `reference`: the reference line's angle, the axes logged from it (else from horizontal).
+    /// `reference`: the reference line's angle (for the Angle column; the axes are from horizontal).
     pub fn add(&mut self, fibers: &[FiberAxis], reference: Option<f64>) -> usize {
         self.updates += 1;
         let time = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
         for (i, f) in fibers.iter().enumerate() {
-            let r = reference.unwrap_or(0.0);
-            let (slow, fast) = (signed_angle(f.slow_deg - r), signed_angle(f.fast_deg() - r));
+            let (slow, fast) = (signed_angle(f.slow_deg), signed_angle(f.fast_deg()));
             let drawing = super::annotate::FiberDrawing { reference, ..Default::default() };
             let (perp, perp_axis) = (drawing.off_perpendicular(f), drawing.perpendicular_axis(f));
             self.entries.push(Entry { time: time.clone(), update: self.updates, fiber: i + 1, slow, fast, perp, perp_axis, quality: f.image_quality });
@@ -264,8 +263,8 @@ impl App {
                 ("Time", 64.0, ""),
                 ("#", 30.0, "Update number"),
                 ("Fiber", 38.0, ""),
-                ("Slow", 54.0, "Axis angle (°): from horizontal, or from the reference line."),
-                ("Fast", 54.0, "Axis angle (°): from horizontal, or from the reference line."),
+                ("Slow", 54.0, "Axis angle (°) from horizontal."),
+                ("Fast", 54.0, "Axis angle (°) from horizontal."),
                 ("Angle", 92.0, "With a reference line: the axis nearest perpendicular to it, and how far off (°)."),
                 ("Quality", 50.0, QUALITY_HELP),
             ].into_iter().filter(|c| c.0 != "Angle" || with_angle).collect();

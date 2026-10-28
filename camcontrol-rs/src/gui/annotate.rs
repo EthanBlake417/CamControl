@@ -54,6 +54,8 @@ pub struct FiberDrawing {
     pub parts_outline: Option<(Color, Dash)>,
     /// Only the fibers' outlines (and which is on): no axis lines, stress parts or readout (fiber counting).
     pub numbers_only: bool,
+    /// Read out only this fiber (its index), with this number (alignment: the fiber being measured).
+    pub only: Option<(usize, i64)>,
 }
 
 impl Default for FiberDrawing {
@@ -61,7 +63,7 @@ impl Default for FiberDrawing {
         Self { show_parts: false, long_lines: false, slow: SLOW_COLOR, fast: FAST_COLOR, show_slow: true, show_fast: true, slow_bands: None,
                fast_bands: None, first_number: 1, ascending: true, reference: None, readout_px: READOUT_PX,
                readout_mono: false, readout_bold: false, parts_fill: Some([255, 0, 200, 46]), parts_outline: Some((SLOW_COLOR, Dash::Dot)),
-               numbers_only: false }
+               numbers_only: false, only: None }
     }
 }
 
@@ -275,7 +277,6 @@ pub fn fmt_angle(deg: f64) -> String {
 pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f64, f64) -> P, zoom: f64, style: &Style,
                        selected: Option<usize>, drawing: FiberDrawing, area: (P, P)) {
     let show_parts = drawing.show_parts;
-    let brightest = brightest_centre(axes).map(|b| b.0);
     let circles: Vec<(P, f32)> = axes.iter().map(|f| (to_out(f.cx, f.cy), (f.radius * zoom) as f32)).collect();
     for (i, f) in axes.iter().enumerate() {
         let center = to_out(f.cx, f.cy);
@@ -299,10 +300,6 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
             }
         }
         c.ellipse(center, r, r, Some([255, 255, 255, 160]), (width / 2.0).max(1.0), Dash::Dot, None);
-        if brightest == Some(i) && !drawing.numbers_only { // counting: the number says "on" instead
-            let k = (r * 0.25).max(style.marker * 3.0);
-            c.ellipse(center, k, k, Some(READOUT_COLOR), width, Dash::Solid, None);
-        }
         if drawing.numbers_only {
             continue;
         }
@@ -340,17 +337,19 @@ pub fn perpendicular_offset(axis_deg: f64, line_deg: f64) -> Option<f64> {
 
 /// The readout's lines as colored pieces: per fiber (numbered left to right) the slow and fast
 /// axis angles in their line colors (opaque, to stay readable), "(unclear)" when unsure.
-/// (Which fiber is on, the brightest center: ringed in green, and in the Fiber count panel.)
+/// (Which fiber is on, the brightest center: in the tables and the Fiber Count panel.)
 pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<Vec<(String, Color)>> {
     let opaque = |c: Color| [c[0], c[1], c[2], 255];
     let lines: Vec<Vec<(String, Color)>> = axes
         .iter()
         .enumerate()
+        .filter(|(i, _)| drawing.only.is_none_or(|o| o.0 == *i))
         .map(|(i, f)| {
+            let number = drawing.only.map(|o| o.1).unwrap_or_else(|| drawing.number(i));
             // With a reference line, the one angle that matters: off perpendicular to it.
             if let (Some(d), Some(axis)) = (drawing.off_perpendicular(f), drawing.perpendicular_axis(f)) {
                 let color = opaque(if axis == "slow" { drawing.slow_color(f) } else { drawing.fast_color(f) });
-                let mut line = vec![(format!("{}: {axis} {d:+.2}°", drawing.number(i)), color)];
+                let mut line = vec![(format!("{number}: {axis} {d:+.2}°"), color)];
                 if !f.clear() {
                     line.push((" (unclear)".into(), [230, 230, 230, 255]));
                 }
@@ -366,7 +365,7 @@ pub fn fiber_readout_pieces(axes: &[FiberAxis], drawing: &FiberDrawing) -> Vec<V
                 line[1].0.insert_str(0, "  ");
             }
             let first = line.first().map(|p| p.1).unwrap_or(READOUT_COLOR);
-            line.insert(0, (format!("{}: ", drawing.number(i)), first));
+            line.insert(0, (format!("{number}: "), first));
             if !f.clear() {
                 line.push((" (unclear)".into(), [230, 230, 230, 255]));
             }

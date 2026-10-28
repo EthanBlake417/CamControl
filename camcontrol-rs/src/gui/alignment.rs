@@ -331,6 +331,11 @@ impl App {
     /// The fiber measured for alignment: one at a time, so the one nearest the middle of the
     /// region of interest (or of the image) when several are found.
     fn measured_fiber(&self, pane: u64) -> Option<FiberAxis> {
+        self.measured_index(pane).map(|i| self.pane(pane).fibers[i].clone())
+    }
+
+    /// The index of the fiber measured for alignment (see measured_fiber).
+    pub(crate) fn measured_index(&self, pane: u64) -> Option<usize> {
         let p = self.pane(pane);
         let (mx, my) = match self.alignment.region {
             Some(r) => {
@@ -339,7 +344,7 @@ impl App {
             }
             None => p.image().map(|i| (i.width() as f64 / 2.0, i.height() as f64 / 2.0)).unwrap_or((0.0, 0.0)),
         };
-        p.fibers.iter().min_by(|a, b| (a.cx - mx).hypot(a.cy - my).total_cmp(&(b.cx - mx).hypot(b.cy - my))).cloned()
+        p.fibers.iter().enumerate().min_by(|a, b| (a.1.cx - mx).hypot(a.1.cy - my).total_cmp(&(b.1.cx - mx).hypot(b.1.cy - my))).map(|(i, _)| i)
     }
 
     /// A shape drawn for the region of interest or the reference line.
@@ -452,34 +457,35 @@ impl App {
     pub(crate) fn alignment_panel(&mut self, ui: &mut egui::Ui) {
         // Side by side when there's room (the bottom edge), else stacked (a side edge).
         let w = ui.available_width();
+        // The results next to (or under) the readings; the setup and the trend aside.
         if w > 1000.0 {
             ui.columns(3, |c| {
                 self.align_readings_box(&mut c[0]);
-                c[0].add_space(6.0);
-                self.align_trend_box(&mut c[0]);
-                self.align_setup_box(&mut c[1]);
-                self.align_table(&mut c[2]);
+                self.align_table(&mut c[1]);
+                self.align_setup_box(&mut c[2]);
+                c[2].add_space(6.0);
+                self.align_trend_box(&mut c[2]);
             });
         } else if w > 600.0 {
             ui.columns(2, |c| {
                 self.align_readings_box(&mut c[0]);
                 c[0].add_space(6.0);
-                self.align_trend_box(&mut c[0]);
+                self.align_table(&mut c[0]);
                 self.align_setup_box(&mut c[1]);
                 c[1].add_space(6.0);
-                self.align_table(&mut c[1]);
+                self.align_trend_box(&mut c[1]);
             });
         } else {
             self.align_readings_box(ui);
+            self.align_table(ui);
             self.align_trend_box(ui);
             self.align_setup_box(ui);
-            self.align_table(ui);
         }
     }
 
     fn align_readings_box(&mut self, ui: &mut egui::Ui) {
         let busy = self.alignment.collecting.is_some();
-        section(ui, "Readings", None, |ui| {
+        section(ui, "", None, |ui| {
             let text = if busy { "Taking readings..." } else { "Take readings  (Space)" };
             let (fill, color) = if busy { (ui.visuals().widgets.inactive.weak_bg_fill, ui.visuals().weak_text_color()) }
                                 else { (egui::Color32::from_rgb(0x2f, 0x6f, 0xd0), egui::Color32::WHITE) };
@@ -615,9 +621,9 @@ impl App {
                 ui.label(RichText::new("No readings yet: press Take readings (Space).").weak());
                 return;
             }
-            egui::ScrollArea::vertical().id_salt("align_rows").max_height(ui.available_height().max(120.0) - 30.0)
+            egui::ScrollArea::both().id_salt("align_rows").max_height(ui.available_height().max(120.0) - 30.0)
                 .stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
-                egui::Grid::new("align_grid").striped(true).num_columns(6).spacing(egui::vec2(16.0, 4.0)).show(ui, |ui| {
+                egui::Grid::new("align_grid").striped(true).num_columns(6).spacing(egui::vec2(12.0, 4.0)).show(ui, |ui| {
                     for h in ["Fiber #", "Axis", "Mean", "Std dev", "n", "Time"] {
                         ui.strong(h);
                     }
@@ -688,7 +694,7 @@ impl App {
             return;
         }
         let notes = self.count_notes(&fibers);
-        let mut markup = self.markup_of(id, notes.clone());
+        let mut markup = self.markup_of(id, Vec::new());
         markup.extras.numbers = true;
         let d = self.fiber_drawing();
         let on = brightest_centre(&fibers).map(|b| b.0);
@@ -720,7 +726,7 @@ impl App {
         let rows = fibers.iter().enumerate().map(|(i, f)| vec![
             Cell::Text(d.number(i).to_string()), r1(f.cx), r1(f.cy), r1(2.0 * f.radius),
             f.centre_brightness.map(r1).unwrap_or(Cell::Empty), Cell::Text(if on == Some(i) { "on".into() } else { String::new() }),
-            r1(d.shown(f.slow_deg)), r1(d.shown(f.fast_deg())),
+            r1(signed_angle(f.slow_deg)), r1(signed_angle(f.fast_deg())),
         ]).collect();
         let sheet = Sheet::new("Fibers", &["Fiber", "Center x (px)", "Center y (px)", "Diameter (px)", "Center brightness (0-255)", "On",
                                            "Slow axis (deg)", "Fast axis (deg)"], rows);

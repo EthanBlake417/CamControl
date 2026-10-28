@@ -214,9 +214,15 @@ fn alignment_readings_reference_and_region() {
     let (dx, dy) = (100.0 * 30f64.to_radians().cos(), -100.0 * 30f64.to_radians().sin());
     h.state_mut().view_event(id, super::view::ViewEvent::Drawn("line".into(), vec![(0.0, 300.0), (dx, 300.0 + dy)]));
     assert!((h.state().alignment.reference_deg().unwrap() - 30.0).abs() < 1e-9);
-    let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
     // Axes at 0° and 90°, the line at 30°: perpendicular is 120°, the 90° axis is 30° clockwise of it.
-    assert_eq!(lines, vec!["1: fast -30.00°", "2: fast -30.00°", "3: fast -30.00°"]);
+    // Aligning (the Alignment panel open): just the fiber measured, by its Fiber # (the middle one).
+    h.state_mut().panels.set_open(PanelId::Alignment, true);
+    let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
+    assert_eq!(lines, vec!["1: fast -30.00°"]);
+    h.state_mut().alignment.next_number = 5;
+    let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
+    assert_eq!(lines, vec!["5: fast -30.00°"]);
+    h.state_mut().alignment.next_number = 1;
     // Its ends dragged: the line moves.
     h.state_mut().view_event(id, super::view::ViewEvent::ReferenceMoved((0.0, 300.0), (100.0, 300.0)));
     assert!(h.state().alignment.reference_deg().unwrap().abs() < 1e-9);

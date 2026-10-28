@@ -687,12 +687,12 @@ and ring the point the axis turns about. Also on saved images and videos.");
                             for h in ["#", "Type", "Slow", "Fast", "Angle", "Clarity", "Contrast", "Quality", "Method", "Center (px)", "Ø (px)", "Brightness"] {
                                 let r = ui.strong(h);
                                 match h {
-                                    "Slow" | "Fast" => { r.on_hover_text("Axis angle (°): from horizontal, or from the reference line if there is one."); }
+                                    "Slow" | "Fast" => { r.on_hover_text("Axis angle (°) from horizontal, counter-clockwise +.\nWith a reference line, Angle gives the axis against it."); }
                                     "Angle" => { r.on_hover_text("With a reference line (Alignment panel): how far the fiber's axis nearest\n\
                                                                  perpendicular to the line is from perpendicular (slow or fast, whichever)."); }
                                     "Contrast" | "Quality" => { r.on_hover_text(super::fiber_log::QUALITY_HELP); }
                                     "Brightness" => { r.on_hover_text("Brightness (0-255) of the brightest spot near the fiber's center, e.g. light in the core;\n\
-                                                                      \"on\": the brightest of several fibers (ringed in green)."); }
+                                                                      \"on\": the brightest of several fibers."); }
                                     "Clarity" => { r.on_hover_text("How sure the axis is. Panda rods: how much of the rods' outlines was found (below 50%,\n\
                                                                    or faint, isn't clear). Other methods: how much longer the stress parts spread along\n\
                                                                    the slow axis than across it (below 1.3 isn't clear)."); }
@@ -715,8 +715,8 @@ and ring the point the axis turns about. Also on saved images and videos.");
                                 let q = f.image_quality.as_ref();
                                 let quality = [RichText::new(super::fiber_log::fmt_contrast(q)), super::fiber_log::grade_text(q)];
                                 let plain = |t: String| (RichText::new(t), false);
-                                let cells = [plain((i + 1).to_string()), plain(f.fiber_type.clone()), plain(fmt_angle(drawing.shown(f.slow_deg))),
-                                             plain(fmt_angle(drawing.shown(f.fast_deg()))),
+                                let cells = [plain((i + 1).to_string()), plain(f.fiber_type.clone()), plain(fmt_angle(f.slow_deg)),
+                                             plain(fmt_angle(f.fast_deg())),
                                              plain(drawing.off_perpendicular(f).zip(drawing.perpendicular_axis(f))
                                                  .map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default()), plain(clarity)].into_iter()
                                     .chain(quality.map(|t| (t, true)))
