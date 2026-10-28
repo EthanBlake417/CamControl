@@ -261,7 +261,7 @@ fn alignment_readings_reference_and_region() {
     assert!(dir.join("run-001.csv").is_file());
     let csv = std::fs::read_to_string(dir.join("run-001.csv")).unwrap();
     let header = csv.lines().next().unwrap();
-    assert!(header.contains("Rod edge (px, mean)") && header.contains("Quality") && csv.contains("Panda"), "{csv}");
+    assert!(header.contains("Rod edge (px)") && header.contains("Rod contrast (%)") && header.contains("Quality") && csv.contains("Panda"), "{csv}");
     assert!(dir.join(format!("run-001_fiber{}-{}.png", a.fiber, b.fiber)).is_file());
 }
 
@@ -576,7 +576,7 @@ fn records_the_fiber_axes_on_the_video() {
     let axis = crate::processing::fiber_axis::FiberAxis {
         cx: 320.0, cy: 240.0, radius: 120.0, slow_deg: 5.0, elongation: 0.5, fiber_type: "Panda".into(), n_parts: 2,
         method: "rods".into(), axis_x: None, axis_y: None, parts: Vec::new(), part_centres: Vec::new(), threshold: 0.0,
-        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None, centre_brightness: None, core_clear: None, image_quality: None, rod_edge: None,
+        quality: Some(3.0), coverage: Some(0.9), rod_radii: Vec::new(), turned_gain: None, centre_brightness: None, core_clear: None, image_quality: None, rod_edge: None, rod_contrast: None,
     };
     t.state_mut().active_pane_mut().fibers = vec![axis];
     t.state_mut().request_recording(true);
@@ -796,4 +796,9 @@ fn render_shots() {
         t.state_mut().fiber_log.add(&fibers, None);
     }
     shot(&mut t, "8_fiber_log_right");
+    for slot in t.state_mut().panels.slots.iter_mut().filter(|s| s.id == PanelId::FiberLog) {
+        slot.edge = super::stripes::Edge::Bottom;
+    }
+    t.state_mut().panels.set_open(PanelId::FiberLog, true);
+    shot(&mut t, "9_fiber_log_bottom");
 }

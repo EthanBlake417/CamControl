@@ -77,7 +77,7 @@ impl FiberQuality {
     pub fn grade(&self) -> (Grade, Vec<String>) {
         let at_least = |v: f64, (good, fair): (f64, f64)| if v >= good { Grade::Good } else if v >= fair { Grade::Fair } else { Grade::Poor };
         let at_most = |v: f64, (good, fair): (f64, f64)| if v <= good { Grade::Good } else if v <= fair { Grade::Fair } else { Grade::Poor };
-        let mut checks = vec![(at_least(self.contrast.abs(), CONTRAST), "low contrast".to_string())];
+        let mut checks = vec![(at_least(self.contrast.abs(), CONTRAST), "low background contrast".to_string())];
         if let Some(snr) = self.snr() {
             checks.push((at_least(snr, SNR), "noisy".to_string()));
         }
@@ -98,7 +98,7 @@ impl FiberQuality {
         if !why.is_empty() {
             s += &format!(": {}", why.join(", "));
         }
-        s += &format!("\nContrast {:+.0}% (fiber {:.0}, background {:.0})", 100.0 * self.contrast, self.fiber, self.background);
+        s += &format!("\nBackground contrast {:+.0}% (fiber {:.0}, background {:.0})", 100.0 * self.contrast, self.fiber, self.background);
         s += &match self.edge_px {
             Some(e) => format!("\nEdge width {e:.1} px ({:.1}% of the radius)", 100.0 * e / self.radius.max(1.0)),
             None => "\nEdge width: no edge found".into(),
@@ -244,6 +244,44 @@ fn edge_width_across(lum: &ip::ImgF, cx: f64, cy: f64, radius: f64, from: f64, t
     (widths.len() >= SECTORS / 4).then(|| ip::median_f64(&widths))
 }
 
+/// How clearly the stress rods stand out: Michelson contrast (rods - cladding) / (rods + cladding)
+/// of the mean luma inside the rods and the mean of the cladding within one rod radius of
+/// their edges (leaving out the core, `core` px round the fiber's center, the other rod, and
+/// anything outside the fiber). - = rods darker. `fiber`: (center x, center y, radius);
+/// `rods`: (center x, center y, radius).
+pub fn rod_contrast(image: &RgbImage, fiber: (f64, f64, f64), rods: &[(f64, f64, f64)], core: f64) -> Option<f64> {
+    if rods.is_empty() {
+        return None;
+    }
+    let (fx, fy, fr) = fiber;
+    let (w, h) = (image.width() as f64, image.height() as f64);
+    let (mut rod, mut rod_n, mut clad, mut clad_n) = (0.0, 0usize, 0.0, 0usize);
+    let x0 = rods.iter().map(|r| r.0 - 2.0 * r.2).fold(f64::INFINITY, f64::min).max(0.0).floor() as u32;
+    let x1 = rods.iter().map(|r| r.0 + 2.0 * r.2).fold(f64::NEG_INFINITY, f64::max).min(w - 1.0).ceil() as u32;
+    let y0 = rods.iter().map(|r| r.1 - 2.0 * r.2).fold(f64::INFINITY, f64::min).max(0.0).floor() as u32;
+    let y1 = rods.iter().map(|r| r.1 + 2.0 * r.2).fold(f64::NEG_INFINITY, f64::max).min(h - 1.0).ceil() as u32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+            let v = luma(image.get_pixel(x, y).0) as f64;
+            if rods.iter().any(|r| (px - r.0).hypot(py - r.1) <= r.2) {
+                rod += v;
+                rod_n += 1;
+            } else if rods.iter().any(|r| (px - r.0).hypot(py - r.1) <= 2.0 * r.2)
+                && (px - fx).hypot(py - fy) > core
+                && (px - fx).hypot(py - fy) <= fr {
+                clad += v;
+                clad_n += 1;
+            }
+        }
+    }
+    if rod_n < 10 || clad_n < 10 {
+        return None;
+    }
+    let (r, c) = (rod / rod_n as f64, clad / clad_n as f64);
+    (r + c > 0.0).then(|| (r - c) / (r + c))
+}
+
 /// Focus on the stress rods: how many pixels their edges take to go from rod to cladding
 /// (as edge_width, across each rod's outline), the rods averaged. Smaller is sharper. None if
 /// no rod edge could be measured. `rods`: (center x, center y, radius).
@@ -266,6 +304,21 @@ pub fn rod_edge_width(image: &RgbImage, rods: &[(f64, f64, f64)]) -> Option<f64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rods_against_the_cladding() {
+        let mut img = RgbImage::from_pixel(400, 400, image::Rgb([30; 3]));
+        draw::fill_circle_px(&mut img, 200, 200, 150, [200; 3]);
+        for x in [125, 275] {
+            draw::fill_circle_px(&mut img, x, 200, 35, [60; 3]);
+        }
+        draw::fill_circle_px(&mut img, 200, 200, 15, [255; 3]); // a lit core: left out
+        // (Pixel x is centered at x + 0.5.)
+        let rods = [(125.5, 200.5, 35.0), (275.5, 200.5, 35.0)];
+        let c = rod_contrast(&img, (200.5, 200.5, 150.0), &rods, 18.0).unwrap();
+        assert!((c - (60.0 - 200.0) / (60.0 + 200.0)).abs() < 0.01, "{c}");
+        assert_eq!(rod_contrast(&img, (200.0, 200.0, 150.0), &[], 18.0), None);
+    }
 
     #[test]
     fn rod_edges_sharp_and_blurred() {

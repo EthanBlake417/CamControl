@@ -1,7 +1,6 @@
-//! Fiber log panel: record the slow and fast axes and the image quality
-//! (contrast, focus, noise, clipping) of every fiber at each update; a
-//! per-fiber summary (mean, standard deviation) sits above the log, and both
-//! can be saved to CSV (or Excel) afterwards.
+//! Fiber log panel: record everything the Fiber Axis table shows for every
+//! fiber at each update; a per-fiber summary (mean, standard deviation) beside
+//! the log, and both can be saved to CSV (or Excel) afterwards.
 
 use eframe::egui;
 
@@ -24,6 +23,9 @@ pub struct Entry {
     pub perp: Option<f64>,
     pub perp_axis: Option<&'static str>,
     pub quality: Option<FiberQuality>,
+    /// The fiber as measured (everything the Fiber Axis table shows), and whether it had the brightest center.
+    pub details: FiberAxis,
+    pub on: bool,
 }
 
 #[derive(Default)]
@@ -96,7 +98,7 @@ pub(crate) fn quality_hover(q: Option<&FiberQuality>) -> String {
 }
 
 pub(crate) const QUALITY_HELP: &str = "Image quality round the fiber, the worst of:\n\
-    contrast (fiber against background, Michelson: + brighter, - darker; Good 20%+, Fair 8%+),\n\
+    background contrast (fiber against the background round it, Michelson: + brighter, - darker; Good 20%+, Fair 8%+),\n\
     focus (how many pixels the cladding edge takes; Good up to 5% of the radius, Fair 10%),\n\
     noise (contrast step over the background noise, SNR; Good 20+, Fair 8+; not on a black background),\n\
     exposure (fiber pixels clipped at full white: Good up to 1%, Fair 10%; and its bright parts: Good 60+, Fair 30+).\n\
@@ -116,21 +118,28 @@ pub struct FiberSummary {
 }
 
 impl FiberLog {
-    pub const HEADERS: [&'static str; 12] = ["Time", "Update", "Fiber", "Slow axis (deg)", "Fast axis (deg)", "Axis", "Angle (deg)", "Contrast (%)",
-                                             "Edge width (px)", "SNR", "Clipped (%)", "Quality"];
+    /// The log's columns: the update, the axis against the reference line, then all the Fiber Axis details.
+    pub fn headers() -> Vec<String> {
+        let mut h: Vec<String> = ["Time", "Update", "Fiber", "Axis", "Angle (deg)"].iter().map(|s| s.to_string()).collect();
+        h.extend(super::alignment::DETAIL_HEADERS.iter().map(|s| s.to_string()));
+        h.push("On".into());
+        h
+    }
     pub const SUMMARY_HEADERS: [&'static str; 6] = ["Fiber", "Count", "Mean slow axis (deg)", "Mean fast axis (deg)", "Std (deg)",
-                                                    "Mean contrast (%)"];
+                                                    "Mean background contrast (%)"];
 
     /// Add one update's fibers (numbered from 1, left to right); returns how many entries were added.
     /// `reference`: the reference line's angle (for the Angle column; the axes are from horizontal).
     pub fn add(&mut self, fibers: &[FiberAxis], reference: Option<f64>) -> usize {
         self.updates += 1;
         let time = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f").to_string();
+        let on = crate::processing::fiber_axis::brightest_centre(fibers).map(|b| b.0);
         for (i, f) in fibers.iter().enumerate() {
             let (slow, fast) = (signed_angle(f.slow_deg), signed_angle(f.fast_deg()));
             let drawing = super::annotate::FiberDrawing { reference, ..Default::default() };
             let (perp, perp_axis) = (drawing.off_perpendicular(f), drawing.perpendicular_axis(f));
-            self.entries.push(Entry { time: time.clone(), update: self.updates, fiber: i + 1, slow, fast, perp, perp_axis, quality: f.image_quality });
+            self.entries.push(Entry { time: time.clone(), update: self.updates, fiber: i + 1, slow, fast, perp, perp_axis, quality: f.image_quality,
+                                      details: f.clone(), on: on == Some(i) });
         }
         fibers.len()
     }
@@ -155,12 +164,13 @@ impl FiberLog {
 
     pub fn sheet(&self) -> Sheet {
         let rows = self.entries.iter().map(|e| {
-            let mut row = vec![Cell::Text(e.time.clone()), Cell::Num(e.update as f64), Cell::Num(e.fiber as f64), round2(e.slow), round2(e.fast),
+            let mut row = vec![Cell::Text(e.time.clone()), Cell::Text(e.update.to_string()), Cell::Text(e.fiber.to_string()),
                                e.perp_axis.map(|a| Cell::Text(a.into())).unwrap_or(Cell::Empty), e.perp.map(round2).unwrap_or(Cell::Empty)];
-            row.extend(quality_cells(e.quality.as_ref(), false));
+            row.extend(super::alignment::detail_cells(&e.details, e.details.rod_edge));
+            row.push(Cell::Text(if e.on { "on".into() } else { String::new() }));
             row
         }).collect();
-        Sheet::from_strings("Fiber log", Self::HEADERS.map(String::from).to_vec(), rows)
+        Sheet::from_strings("Fiber log", Self::headers(), rows)
     }
 
     pub fn summary_sheet(&self) -> Sheet {
@@ -206,16 +216,37 @@ impl App {
         }
     }
 
-    /// Everything stacked (recording, summary, log), so it fits a side column as well as the bottom.
+    /// Recording and the summary beside the log when there's room (the bottom edge), else stacked.
     pub(crate) fn fiber_log_panel(&mut self, ui: &mut egui::Ui) {
+        if ui.available_width() > 800.0 {
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(330.0);
+                    self.log_recording_box(ui);
+                    ui.add_space(6.0);
+                    self.log_summary_box(ui);
+                });
+                ui.vertical(|ui| self.log_rows_box(ui));
+            });
+        } else {
+            self.log_recording_box(ui);
+            ui.add_space(6.0);
+            self.log_summary_box(ui);
+            ui.add_space(6.0);
+            self.log_rows_box(ui);
+        }
+    }
+
+    fn log_recording_box(&mut self, ui: &mut egui::Ui) {
         let has_rows = !self.fiber_log.entries.is_empty();
         super::alignment::section(ui, "Recording", None, |ui| {
             ui.checkbox(&mut self.fiber_log.record, "Record each update").on_hover_text(
-                "Log the slow and fast axes and image quality of every fiber each time the Fiber axis panel measures\n\
+                "Log everything the Fiber Axis table shows for every fiber each time it measures\n\
                  (Find axes, or every update with Update live on, live or on a playing video).");
             ui.horizontal(|ui| {
                 if ui.add_enabled(has_rows, egui::Button::new("Save to CSV..."))
-                    .on_hover_text("Save the log, with the summary beside it (..._summary.csv).\nPick Excel in the dialog for one .xlsx file instead.")
+                    .on_hover_text("Save the log (every Fiber Axis column), with the summary beside it (..._summary.csv).\n\
+                                    Pick Excel in the dialog for one .xlsx file instead.")
                     .clicked() {
                     self.save_fiber_log();
                 }
@@ -226,17 +257,18 @@ impl App {
                 ui.label(egui::RichText::new(format!("{} rows, {} updates", log.entries.len(), log.updates)).weak());
             });
         });
+    }
+
+    fn log_summary_box(&mut self, ui: &mut egui::Ui) {
         let log = &self.fiber_log;
-        if !has_rows {
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("Nothing recorded yet: tick Record each update, then measure.").weak());
-            return;
-        }
-        ui.add_space(6.0);
         super::alignment::section(ui, "Summary", None, |ui| {
+            if log.entries.is_empty() {
+                ui.label(egui::RichText::new("Nothing recorded yet: tick Record each update, then measure.").weak());
+                return;
+            }
             egui::Grid::new("fiber_log_summary").striped(true).num_columns(6).spacing(egui::vec2(12.0, 4.0)).show(ui, |ui| {
                 for (h, tip) in [("Fiber", ""), ("n", "Updates logged"), ("μ slow", "Mean slow axis (°)"), ("μ fast", "Mean fast axis (°)"),
-                                 ("σ", "Standard deviation (°), the same for both axes"), ("μ contrast", "Mean contrast")] {
+                                 ("σ", "Standard deviation (°), the same for both axes"), ("μ bg contrast", "Mean background contrast")] {
                     let r = ui.strong(h);
                     if !tip.is_empty() {
                         r.on_hover_text(tip);
@@ -254,58 +286,91 @@ impl App {
                 }
             });
         });
-        ui.add_space(6.0);
-        // The angle against a reference line only when some update had one.
+    }
+
+    /// Every update's fibers, every Fiber Axis column; the headings stay put, the rows scroll
+    /// (and everything sideways when it's wider than the panel).
+    fn log_rows_box(&mut self, ui: &mut egui::Ui) {
+        let log = &self.fiber_log;
+        if log.entries.is_empty() {
+            return;
+        }
         let with_angle = log.entries.iter().any(|e| e.perp.is_some());
+        let cols: Vec<(&str, f32, &str)> = [
+            ("Time", 64.0, ""),
+            ("#", 30.0, "Update number"),
+            ("Fiber", 38.0, ""),
+            ("Type", 64.0, ""),
+            ("Slow", 50.0, "Slow axis (°) from horizontal"),
+            ("Fast", 50.0, "Fast axis (°) from horizontal"),
+            ("Angle", 90.0, "With a reference line: the axis nearest perpendicular to it, and how far off (°)."),
+            ("Clarity", 64.0, "How sure the axis is (rod outline found, or elongation)."),
+            ("Rod edge", 62.0, "Focus: the stress rods' edge width (px). Smaller is sharper."),
+            ("Rod contrast", 80.0, "How clearly the stress rods stand out from the cladding round them."),
+            ("Bg contrast", 76.0, "Background contrast: the fiber against the background round it."),
+            ("Quality", 50.0, QUALITY_HELP),
+            ("Method", 58.0, ""),
+            ("Center (px)", 80.0, ""),
+            ("Ø (px)", 44.0, "Diameter in image pixels"),
+            ("Brightness", 72.0, "Brightest spot near the center (0-255); on: the brightest fiber."),
+        ].into_iter().filter(|c| c.0 != "Angle" || with_angle).collect();
+        let cell = |ui: &mut egui::Ui, w: f32, text: egui::RichText| {
+            ui.add_sized([w, 18.0], egui::Label::new(text).truncate())
+        };
         super::alignment::section(ui, "Log", None, |ui| {
-            // Column widths shared by the headings and the rows.
-            let cols: Vec<(&str, f32, &str)> = [
-                ("Time", 64.0, ""),
-                ("#", 30.0, "Update number"),
-                ("Fiber", 38.0, ""),
-                ("Slow", 54.0, "Axis angle (°) from horizontal."),
-                ("Fast", 54.0, "Axis angle (°) from horizontal."),
-                ("Angle", 92.0, "With a reference line: the axis nearest perpendicular to it, and how far off (°)."),
-                ("Quality", 50.0, QUALITY_HELP),
-            ].into_iter().filter(|c| c.0 != "Angle" || with_angle).collect();
-            let cell = |ui: &mut egui::Ui, w: f32, text: egui::RichText| {
-                ui.add_sized([w, 18.0], egui::Label::new(text).truncate())
-            };
-            ui.horizontal(|ui| {
-                for &(h, w, tip) in &cols {
-                    let r = cell(ui, w, egui::RichText::new(h).strong());
-                    if !tip.is_empty() {
-                        r.on_hover_text(tip);
-                    }
-                }
-            });
-            ui.separator();
-            let row_h = 18.0 + ui.spacing().item_spacing.y;
-            egui::ScrollArea::vertical().id_salt("fiber_log_rows").stick_to_bottom(true).auto_shrink([false, false])
-                .show_rows(ui, row_h, log.entries.len(), |ui, range| {
-                    for i in range {
-                        let e = &log.entries[i];
-                        let q = e.quality.as_ref();
-                        let texts: Vec<(&str, egui::RichText)> = vec![
-                            ("Time", e.time.get(11..19).unwrap_or(&e.time).into()),
-                            ("#", e.update.to_string().into()),
-                            ("Fiber", e.fiber.to_string().into()),
-                            ("Slow", format!("{:+.2}", e.slow).into()),
-                            ("Fast", format!("{:+.2}", e.fast).into()),
-                            ("Angle", e.perp.zip(e.perp_axis).map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default().into()),
-                            ("Quality", grade_text(q)),
-                        ];
-                        ui.horizontal(|ui| {
-                            for (name, text) in texts {
-                                let Some(&(_, w, _)) = cols.iter().find(|c| c.0 == name) else { continue };
-                                let r = cell(ui, w, text);
-                                if name == "Quality" {
-                                    r.on_hover_text(quality_hover(q));
-                                }
+            egui::ScrollArea::horizontal().id_salt("fiber_log_wide").auto_shrink([false, true]).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        for &(h, w, tip) in &cols {
+                            let r = cell(ui, w, egui::RichText::new(h).strong());
+                            if !tip.is_empty() {
+                                r.on_hover_text(tip);
+                            }
+                        }
+                    });
+                    ui.separator();
+                    let row_h = 18.0 + ui.spacing().item_spacing.y;
+                    egui::ScrollArea::vertical().id_salt("fiber_log_rows").stick_to_bottom(true).auto_shrink([true, false])
+                        .show_rows(ui, row_h, log.entries.len(), |ui, range| {
+                            for i in range {
+                                let e = &log.entries[i];
+                                let f = &e.details;
+                                let q = e.quality.as_ref();
+                                let clarity = match f.coverage {
+                                    Some(c) => format!("{:.0}%", c * 100.0),
+                                    None => format!("{:.2}", f.elongation),
+                                } + if f.clear() { "" } else { " unclear" };
+                                let texts: Vec<(&str, egui::RichText)> = vec![
+                                    ("Time", e.time.get(11..19).unwrap_or(&e.time).into()),
+                                    ("#", e.update.to_string().into()),
+                                    ("Fiber", e.fiber.to_string().into()),
+                                    ("Type", f.fiber_type.clone().into()),
+                                    ("Slow", format!("{:+.2}", e.slow).into()),
+                                    ("Fast", format!("{:+.2}", e.fast).into()),
+                                    ("Angle", e.perp.zip(e.perp_axis).map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default().into()),
+                                    ("Clarity", clarity.into()),
+                                    ("Rod edge", f.rod_edge.map(|v| format!("{v:.1} px")).unwrap_or_default().into()),
+                                    ("Rod contrast", f.rod_contrast.map(|c| format!("{:+.0}%", 100.0 * c)).unwrap_or_default().into()),
+                                    ("Bg contrast", fmt_contrast(q).into()),
+                                    ("Quality", grade_text(q)),
+                                    ("Method", super::panels::short_method(&f.method).into()),
+                                    ("Center (px)", format!("{:.0}, {:.0}", f.cx, f.cy).into()),
+                                    ("Ø (px)", format!("{:.0}", 2.0 * f.radius).into()),
+                                    ("Brightness", f.centre_brightness.map(|b| format!("{b:.0}{}", if e.on { " on" } else { "" })).unwrap_or_default().into()),
+                                ];
+                                ui.horizontal(|ui| {
+                                    for (name, text) in texts {
+                                        let Some(&(_, w, _)) = cols.iter().find(|c| c.0 == name) else { continue };
+                                        let r = cell(ui, w, text);
+                                        if name == "Quality" || name == "Bg contrast" {
+                                            r.on_hover_text(quality_hover(q));
+                                        }
+                                    }
+                                });
                             }
                         });
-                    }
                 });
+            });
         });
     }
 }
@@ -313,6 +378,20 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::axial_stats;
+
+    #[test]
+    fn the_log_keeps_every_fiber_axis_column() {
+        let mut f = crate::processing::fiber_axis::FiberAxis::new(100.0, 120.0, 50.0, 30.0, 1.5, "Panda", 2);
+        f.rod_edge = Some(2.5);
+        f.rod_contrast = Some(-0.4);
+        let mut log = super::FiberLog::default();
+        log.add(&[f.clone(), f], None);
+        let sheet = log.sheet();
+        assert_eq!(sheet.headers.len(), super::FiberLog::headers().len());
+        assert!(sheet.headers.iter().any(|h| h == "Rod contrast (%)") && sheet.headers.iter().any(|h| h == "Rod edge (px)"));
+        assert_eq!(sheet.rows.len(), 2);
+        assert!(sheet.rows.iter().all(|r| r.len() == sheet.headers.len()));
+    }
 
     #[test]
     fn stats_wrap_at_90() {

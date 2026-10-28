@@ -683,14 +683,17 @@ and ring the point the axis turns about. Also on saved images and videos.");
                         return;
                     }
                     egui::ScrollArea::both().max_height(ui.available_height().max(80.0)).auto_shrink([false, true]).show(ui, |ui| {
-                        egui::Grid::new("fibers").striped(true).num_columns(13).spacing(egui::vec2(14.0, 4.0)).show(ui, |ui| {
-                            for h in ["#", "Type", "Slow", "Fast", "Angle", "Clarity", "Rod edge", "Contrast", "Quality", "Method", "Center (px)", "Ø (px)", "Brightness"] {
+                        egui::Grid::new("fibers").striped(true).num_columns(14).spacing(egui::vec2(14.0, 4.0)).show(ui, |ui| {
+                            for h in ["#", "Type", "Slow", "Fast", "Angle", "Clarity", "Rod edge", "Rod contrast", "Background contrast", "Quality", "Method", "Center (px)", "Ø (px)", "Brightness"] {
                                 let r = ui.strong(h);
                                 match h {
                                     "Slow" | "Fast" => { r.on_hover_text("Axis angle (°) from horizontal, counter-clockwise +.\nWith a reference line, Angle gives the axis against it."); }
                                     "Angle" => { r.on_hover_text("With a reference line (Alignment panel): how far the fiber's axis nearest\n\
                                                                  perpendicular to the line is from perpendicular (slow or fast, whichever)."); }
-                                    "Contrast" | "Quality" => { r.on_hover_text(super::fiber_log::QUALITY_HELP); }
+                                    "Background contrast" | "Quality" => { r.on_hover_text(super::fiber_log::QUALITY_HELP); }
+                                    "Rod contrast" => { r.on_hover_text("How clearly the stress rods stand out: (rods - cladding) / (rods + cladding), the mean\n\
+                                                                        brightness inside the rods against the cladding within one rod radius of them (not the\n\
+                                                                        core). - = rods darker. Further from 0 is clearer."); }
                                     "Rod edge" => { r.on_hover_text("Focus: how many pixels the stress rods' edges take to go from rod to cladding\n\
                                                                     (Panda fibers measured by their rods). Smaller is sharper: focus to make it smallest."); }
                                     "Brightness" => { r.on_hover_text("Brightness (0-255) of the brightest spot near the fiber's center, e.g. light in the core;\n\
@@ -721,7 +724,8 @@ and ring the point the axis turns about. Also on saved images and videos.");
                                              plain(fmt_angle(f.fast_deg())),
                                              plain(drawing.off_perpendicular(f).zip(drawing.perpendicular_axis(f))
                                                  .map(|(d, a)| format!("{a} {d:+.2}")).unwrap_or_default()), plain(clarity),
-                                             plain(f.rod_edge.map(|e| format!("{e:.1} px")).unwrap_or_default())].into_iter()
+                                             plain(f.rod_edge.map(|e| format!("{e:.1} px")).unwrap_or_default()),
+                                             plain(f.rod_contrast.map(|c| format!("{:+.0}%", 100.0 * c)).unwrap_or_default())].into_iter()
                                     .chain(quality.map(|t| (t, true)))
                                     .chain([short_method(&f.method).to_string(), format!("{:.0}, {:.0}", f.cx, f.cy), format!("{:.0}", 2.0 * f.radius),
                                             f.centre_brightness.map(|b| format!("{b:.0}{}", if brightest == Some(i) { " on" } else { "" }))
@@ -760,7 +764,7 @@ and ring the point the axis turns about. Also on saved images and videos.");
 }
 
 /// A method's short name, for the fibers table.
-fn short_method(name: &str) -> &'static str {
+pub(crate) fn short_method(name: &str) -> &'static str {
     match name {
         "auto" => "Auto",
         "rods" => "Rods",

@@ -18,7 +18,7 @@ use image::RgbImage;
 use serde::{Deserialize, Serialize};
 
 use crate::imgproc::{self as ip, ImgF, Mask};
-use super::fiber_quality::{fiber_quality, rod_edge_width, FiberQuality};
+use super::fiber_quality::{fiber_quality, rod_contrast, rod_edge_width, FiberQuality};
 
 pub const CORE_FRACTION: f64 = 0.12;
 pub const EDGE_FRACTION: f64 = 0.92;
@@ -147,6 +147,8 @@ pub struct FiberAxis {
     pub image_quality: Option<FiberQuality>,
     /// Focus on the stress rods: their edges' width in px (smaller is sharper), see fiber_quality::rod_edge_width.
     pub rod_edge: Option<f64>,
+    /// How clearly the stress rods stand out from the cladding round them (-1 to 1), see fiber_quality::rod_contrast.
+    pub rod_contrast: Option<f64>,
 }
 
 impl FiberAxis {
@@ -173,6 +175,7 @@ impl FiberAxis {
             core_clear: None,
             image_quality: None,
             rod_edge: None,
+            rod_contrast: None,
         }
     }
 
@@ -2373,6 +2376,7 @@ pub fn analyse_in(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, previou
                     if f.rod_radii.len() == 2 && f.part_centres.len() == 2 {
                         let rods: Vec<(f64, f64, f64)> = f.part_centres.iter().zip(&f.rod_radii).map(|(&(x, y), &r)| (x, y, r)).collect();
                         f.rod_edge = rod_edge_width(image, &rods);
+                        f.rod_contrast = rod_contrast(image, (f.cx, f.cy, f.radius), &rods, CORE_FRACTION * f.radius);
                     }
                     f
                 })

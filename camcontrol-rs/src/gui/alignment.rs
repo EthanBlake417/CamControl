@@ -157,10 +157,26 @@ pub fn fit_line(points: &[(f64, f64)], extend: f64) -> Option<((f64, f64), (f64,
 }
 
 /// The Fiber Axis details saved with each fiber (Include Fiber Axis details).
-pub const DETAIL_HEADERS: [&str; 19] = ["Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity (rod outline % or elongation)", "Method",
-    "Center x (px)", "Center y (px)", "Diameter (px)", "Center brightness (0-255)", "Rod edge (px, mean)",
-    "Fiber level (0-255)", "Background level (0-255)", "Contrast (%)", "Edge width (px)", "Noise", "SNR", "Clipped (%)",
+pub const DETAIL_HEADERS: [&str; 20] = ["Type", "Slow axis (deg)", "Fast axis (deg)", "Clarity (rod outline % or elongation)", "Method",
+    "Center x (px)", "Center y (px)", "Diameter (px)", "Center brightness (0-255)", "Rod edge (px)", "Rod contrast (%)",
+    "Fiber level (0-255)", "Background level (0-255)", "Background contrast (%)", "Edge width (px)", "Noise", "SNR", "Clipped (%)",
     "Bright parts (0-255)", "Quality"];
+
+/// A fiber's Fiber Axis details as table cells (DETAIL_HEADERS); `rod_edge` as given.
+pub fn detail_cells(f: &FiberAxis, rod_edge: Option<f64>) -> Vec<Cell> {
+    let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
+    let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
+    let mut cells = vec![
+        Cell::Text(f.fiber_type.clone()), r2(signed_angle(f.slow_deg)), r2(signed_angle(f.fast_deg())),
+        f.coverage.map(|c| r1(100.0 * c)).unwrap_or_else(|| Cell::Num((f.elongation * 100.0).round() / 100.0)),
+        Cell::Text(crate::processing::fiber_axis::method_label(&f.method).into()),
+        r1(f.cx), r1(f.cy), r1(2.0 * f.radius), f.centre_brightness.map(r1).unwrap_or(Cell::Empty),
+        rod_edge.map(r2).unwrap_or(Cell::Empty),
+        f.rod_contrast.map(|c| r1(100.0 * c)).unwrap_or(Cell::Empty),
+    ];
+    cells.extend(super::fiber_log::quality_cells(f.image_quality.as_ref(), true));
+    cells
+}
 
 pub const HEADERS: [&str; 7] = ["Time", "Fiber", "Readings", "Axis", "Mean (deg)", "Std (deg)", "Reference line (deg)"];
 
@@ -231,7 +247,6 @@ impl Alignment {
 
     /// The table; with `details`, each fiber's Fiber Axis details as well.
     pub fn sheet(&self, details: bool) -> Sheet {
-        let r1 = |v: f64| Cell::Num((v * 10.0).round() / 10.0);
         let r2 = |v: f64| Cell::Num((v * 100.0).round() / 100.0);
         let rows = self.rows.iter().map(|r| {
             let mut row = vec![
@@ -240,16 +255,8 @@ impl Alignment {
             ];
             if details {
                 match &r.details {
-                    Some(f) => {
-                        row.extend([
-                            Cell::Text(f.fiber_type.clone()), r2(signed_angle(f.slow_deg)), r2(signed_angle(f.fast_deg())),
-                            f.coverage.map(|c| r1(100.0 * c)).unwrap_or_else(|| Cell::Num((f.elongation * 100.0).round() / 100.0)),
-                            Cell::Text(crate::processing::fiber_axis::method_label(&f.method).into()),
-                            r1(f.cx), r1(f.cy), r1(2.0 * f.radius), f.centre_brightness.map(r1).unwrap_or(Cell::Empty),
-                            r.rod_edge.map(r2).unwrap_or(Cell::Empty),
-                        ]);
-                        row.extend(super::fiber_log::quality_cells(f.image_quality.as_ref(), true));
-                    }
+                    // (the rod edge averaged over the take)
+                    Some(f) => row.extend(detail_cells(f, r.rod_edge)),
                     None => row.extend(vec![Cell::Empty; DETAIL_HEADERS.len()]),
                 }
             }
