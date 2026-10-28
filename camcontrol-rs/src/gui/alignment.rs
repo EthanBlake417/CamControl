@@ -24,14 +24,14 @@ pub enum DrawTarget {
     Reference,
 }
 
-/// Readings being taken: the slow axis of each fiber at each update.
+/// Readings being taken of one fiber (the one nearest the middle), one per update.
 #[derive(Clone, Debug)]
 pub struct Collecting {
     pub pane: u64,
     pub wanted: usize,
-    pub readings: Vec<Vec<f64>>,
-    /// Which axis each fiber's reading is of ("fast" / "slow"), as last measured.
-    pub axes: Vec<&'static str>,
+    pub readings: Vec<f64>,
+    /// Which axis the readings are of ("fast" / "slow"), as last measured.
+    pub axis: &'static str,
 }
 
 /// One table row: a fiber's fast axis over one set of readings.
@@ -57,6 +57,9 @@ pub struct Alignment {
     pub reference: Option<((f64, f64), (f64, f64))>,
     pub drawing: Option<DrawTarget>,
     pub status: String,
+    /// The number the next take's fiber gets, and whether numbers count up (else down).
+    pub next_number: i64,
+    pub ascending: bool,
 }
 
 pub const HEADERS: [&str; 7] = ["Time", "Fiber", "Readings", "Axis", "Mean (deg)", "Std (deg)", "Reference line (deg)"];
@@ -75,7 +78,7 @@ pub fn line_angle(a: (f64, f64), b: (f64, f64)) -> f64 {
 }
 
 impl Alignment {
-    pub fn new(n: usize, region: Option<Region>, reference: Option<[f64; 4]>) -> Self {
+    pub fn new(n: usize, region: Option<Region>, reference: Option<[f64; 4]>, next_number: i64, ascending: bool) -> Self {
         Self {
             n: n.clamp(1, 1000),
             collecting: None,
@@ -84,6 +87,8 @@ impl Alignment {
             reference: reference.map(|r| ((r[0], r[1]), (r[2], r[3]))),
             drawing: None,
             status: String::new(),
+            next_number,
+            ascending,
         }
     }
 
@@ -91,17 +96,14 @@ impl Alignment {
         self.reference.map(|(a, b)| line_angle(a, b))
     }
 
-    /// Rows for each fiber (numbered from 1) from the readings taken (fast axes, from `reference` if given).
-    pub fn finish(&mut self, readings: &[Vec<f64>], axes: &[&'static str], reference: Option<f64>) -> usize {
+    /// A row for the fiber from the readings taken, numbered next_number (which then counts
+    /// on, up or down, for the next fiber).
+    pub fn finish(&mut self, readings: &[f64], axis: &'static str, reference: Option<f64>) -> &Row {
         let time = chrono::Local::now().format("%H:%M:%S").to_string();
-        let fibers = readings.iter().map(|r| r.len()).max().unwrap_or(0);
-        for i in 0..fibers {
-            let angles: Vec<f64> = readings.iter().filter_map(|r| r.get(i).copied()).collect();
-            let (mean, std) = axial_stats(&angles);
-            let axis = axes.get(i).copied().unwrap_or("fast");
-            self.rows.push(Row { time: time.clone(), fiber: i as i64 + 1, n: angles.len(), mean: signed_angle(mean), std, reference, axis });
-        }
-        fibers
+        let (mean, std) = axial_stats(readings);
+        self.rows.push(Row { time, fiber: self.next_number, n: readings.len(), mean: signed_angle(mean), std, reference, axis });
+        self.next_number += if self.ascending { 1 } else { -1 };
+        self.rows.last().unwrap()
     }
 
     pub fn sheet(&self) -> Sheet {
@@ -141,7 +143,7 @@ impl App {
             return;
         }
         let live = p.live;
-        self.alignment.collecting = Some(Collecting { pane: id, wanted: if live { self.alignment.n } else { 1 }, readings: Vec::new(), axes: Vec::new() });
+        self.alignment.collecting = Some(Collecting { pane: id, wanted: if live { self.alignment.n } else { 1 }, readings: Vec::new(), axis: "fast" });
         self.alignment.status = "Taking readings...".into();
         if !live {
             if self.pane(id).fibers.is_empty() {
@@ -158,30 +160,43 @@ impl App {
             return;
         }
         let drawing = self.fiber_drawing();
-        let angles: Vec<f64> = self.pane(pane).fibers.iter()
-            .map(|f| drawing.off_perpendicular(f).unwrap_or_else(|| drawing.shown(f.fast_deg()))).collect();
-        let axes: Vec<&'static str> = self.pane(pane).fibers.iter().map(|f| drawing.perpendicular_axis(f).unwrap_or("fast")).collect();
-        let c = self.alignment.collecting.as_mut().unwrap();
-        if angles.is_empty() {
+        let Some(f) = self.measured_fiber(pane) else {
             if !self.pane(pane).live {
                 self.alignment.collecting = None;
-                self.alignment.status = "No fibers found.".into();
+                self.alignment.status = "No fiber found.".into();
             }
             return;
-        }
-        c.readings.push(angles);
-        c.axes = axes;
+        };
+        let angle = drawing.off_perpendicular(&f).unwrap_or_else(|| drawing.shown(f.fast_deg()));
+        let axis = drawing.perpendicular_axis(&f).unwrap_or("fast");
+        let c = self.alignment.collecting.as_mut().unwrap();
+        c.readings.push(angle);
+        c.axis = axis;
         let (got, wanted) = (c.readings.len(), c.wanted);
         if got < wanted {
             self.alignment.status = format!("Taking readings: {got} of {wanted}");
             return;
         }
         let done = self.alignment.collecting.take().unwrap();
-        let n = self.alignment.finish(&done.readings, &done.axes, drawing.reference);
-        self.alignment.status = format!("Added {n} fibers ({got} reading{} each).", if got == 1 { "" } else { "s" });
+        let fiber = self.alignment.finish(&done.readings, done.axis, drawing.reference).fiber;
+        self.alignment.status = format!("Added fiber {fiber} ({got} reading{}).", if got == 1 { "" } else { "s" });
         if !self.panels.is_open(PanelId::Alignment) {
             self.panels.set_open(PanelId::Alignment, true);
         }
+    }
+
+    /// The fiber measured for alignment: one at a time, so the one nearest the middle of the
+    /// region of interest (or of the image) when several are found.
+    fn measured_fiber(&self, pane: u64) -> Option<FiberAxis> {
+        let p = self.pane(pane);
+        let (mx, my) = match self.alignment.region {
+            Some(r) => {
+                let (x0, y0, x1, y1) = r.bounds();
+                ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
+            }
+            None => p.image().map(|i| (i.width() as f64 / 2.0, i.height() as f64 / 2.0)).unwrap_or((0.0, 0.0)),
+        };
+        p.fibers.iter().min_by(|a, b| (a.cx - mx).hypot(a.cy - my).total_cmp(&(b.cx - mx).hypot(b.cy - my))).cloned()
     }
 
     /// A shape drawn for the region of interest or the reference line.
@@ -227,11 +242,14 @@ impl App {
 
     /// What's drawn over the views besides measurements and fiber axes.
     pub(crate) fn view_extras(&self) -> Extras {
+        let clean = self.counting_clean();
         Extras {
-            region: self.alignment.region,
-            reference: self.alignment.reference,
+            region: self.alignment.region.filter(|_| !clean),
+            reference: self.alignment.reference.filter(|_| !clean),
             numbers: self.panels.is_open(PanelId::FiberCount),
             notes: Vec::new(),
+            region_look: Some(self.saved.fiber_lines.region_look()),
+            reference_look: Some(self.saved.fiber_lines.reference_look()),
         }
     }
 
@@ -277,113 +295,172 @@ impl App {
     }
 
     pub(crate) fn alignment_panel(&mut self, ui: &mut egui::Ui) {
+        // Side by side when there's room (the bottom edge), else stacked (a side edge).
+        let w = ui.available_width();
+        if w > 1000.0 {
+            ui.columns(3, |c| {
+                self.align_readings_box(&mut c[0]);
+                self.align_setup_box(&mut c[1]);
+                self.align_table(&mut c[2]);
+            });
+        } else if w > 600.0 {
+            ui.columns(2, |c| {
+                self.align_readings_box(&mut c[0]);
+                self.align_setup_box(&mut c[1]);
+            });
+            ui.add_space(6.0);
+            self.align_table(ui);
+        } else {
+            self.align_readings_box(ui);
+            self.align_setup_box(ui);
+            self.align_table(ui);
+        }
+    }
+
+    fn align_readings_box(&mut self, ui: &mut egui::Ui) {
         let busy = self.alignment.collecting.is_some();
-        ui.horizontal_wrapped(|ui| {
+        section(ui, "Readings", None, |ui| {
             let text = if busy { "Taking readings..." } else { "Take readings  (Space)" };
             let (fill, color) = if busy { (ui.visuals().widgets.inactive.weak_bg_fill, ui.visuals().weak_text_color()) }
                                 else { (egui::Color32::from_rgb(0x2f, 0x6f, 0xd0), egui::Color32::WHITE) };
-            if ui.add_enabled(!busy, egui::Button::new(RichText::new(text).size(20.0).strong().color(color)).fill(fill).min_size(egui::vec2(300.0, 52.0)))
-                .on_hover_text("Measure the fiber this many times (live: the next updates) and add the mean and\n\
-                                standard deviation to the table: with a reference line, how far its axis is from\n\
-                                perpendicular to the line; without, its fast axis from horizontal.").clicked() {
+            let button = egui::Button::new(RichText::new(text).size(20.0).strong().color(color)).fill(fill)
+                .min_size(egui::vec2(ui.available_width(), 44.0));
+            if ui.add_enabled(!busy, button)
+                .on_hover_text("Measure the fiber (the one nearest the middle) this many times (live: the next\n\
+                                updates) and add the mean and standard deviation to the table as fiber #: with a\n\
+                                reference line, how far its axis nearest perpendicular to the line is from perpendicular;\n\
+                                without, its fast axis from horizontal.").clicked() {
                 self.take_readings();
             }
-            ui.vertical(|ui| {
+            ui.add_space(4.0);
+            egui::Grid::new("align_inputs").num_columns(2).spacing(egui::vec2(10.0, 6.0)).show(ui, |ui| {
+                ui.label("Fiber #");
                 ui.horizontal(|ui| {
-                    ui.label("Readings:");
-                    ui.add_enabled(!busy, egui::DragValue::new(&mut self.alignment.n).range(1..=1000));
+                    ui.add_enabled(!busy, egui::DragValue::new(&mut self.alignment.next_number).range(-99999..=99999))
+                        .on_hover_text("The number the next fiber measured gets; it then counts up or down by one for each take.");
+                    ui.radio_value(&mut self.alignment.ascending, true, "Up");
+                    ui.radio_value(&mut self.alignment.ascending, false, "Down");
+                });
+                ui.end_row();
+                ui.label("Readings");
+                ui.horizontal(|ui| {
+                    ui.add_enabled(!busy, egui::DragValue::new(&mut self.alignment.n).range(1..=1000))
+                        .on_hover_text("How many measurements each take averages.");
                     if busy && ui.button("Cancel").clicked() {
                         self.alignment.collecting = None;
                         self.alignment.status = "Cancelled.".into();
                     }
                 });
+                ui.end_row();
+            });
+            if !self.alignment.status.is_empty() {
                 ui.label(RichText::new(&self.alignment.status).weak());
+            }
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Save measurement").on_hover_text("Save the table as CSV in the output folder.").clicked() {
+                    self.save_alignment(false);
+                }
+                if ui.button("Save with photo")
+                    .on_hover_text("Save the table (CSV) and the view's image with everything drawn on it and the\n\
+                                    table (PNG) in the output folder.").clicked() {
+                    self.save_alignment(true);
+                }
             });
         });
-        ui.horizontal_wrapped(|ui| {
-            if ui.button("Save measurement").on_hover_text("Save the table as CSV in the output folder.").clicked() {
-                self.save_alignment(false);
+    }
+
+    fn align_setup_box(&mut self, ui: &mut egui::Ui) {
+        let drawing = self.alignment.drawing;
+        section(ui, "Reference line", Some(c32(self.saved.fiber_lines.reference_look().0)), |ui| {
+            ui.horizontal(|ui| {
+                if big_toggle(ui, drawing == Some(DrawTarget::Reference), if self.alignment.reference.is_some() { "Draw again" } else { "Draw line" })
+                    .on_hover_text("Drag a line on the image along the fibers' edge (e.g. the groove): the readout and\n\
+                                    the readings then give each fiber's axis against perpendicular to it.").clicked() {
+                    self.start_drawing(DrawTarget::Reference);
+                }
+                if ui.add_enabled(self.alignment.reference.is_some(), egui::Button::new("Clear").min_size(egui::vec2(0.0, 30.0))).clicked() {
+                    self.alignment.reference = None;
+                }
+            });
+            match self.alignment.reference {
+                Some((a, b)) => {
+                    ui.horizontal(|ui| {
+                        let mut deg = signed_angle(line_angle(a, b));
+                        ui.label("Angle");
+                        let mut changed = ui.add(egui::DragValue::new(&mut deg).range(-90.0..=90.0).speed(0.01).fixed_decimals(2).suffix("°"))
+                            .on_hover_text("Type or drag the line's angle (counter-clockwise from horizontal): it turns about its middle.").changed();
+                        if ui.button("-0.1°").clicked() {
+                            deg -= 0.1;
+                            changed = true;
+                        }
+                        if ui.button("+0.1°").clicked() {
+                            deg += 0.1;
+                            changed = true;
+                        }
+                        if changed {
+                            self.alignment.reference = Some(rotate_line(a, b, deg));
+                        }
+                    });
+                    ui.label(RichText::new("Drag its ends on the image to move it.").weak());
+                }
+                None => {
+                    ui.label(RichText::new("None: angles from horizontal.").weak());
+                }
             }
-            if ui.button("Save measurement with photo")
-                .on_hover_text("Also save the view's image with everything drawn on it (fiber axes, readout,\n\
-                                region, reference line, measurements) and the table, as PNG.").clicked() {
-                self.save_alignment(true);
+        });
+        ui.add_space(6.0);
+        section(ui, "Region of interest", Some(c32(self.saved.fiber_lines.region_look().0)), |ui| {
+            ui.horizontal(|ui| {
+                if big_toggle(ui, drawing == Some(DrawTarget::RegionRect), "Rectangle")
+                    .on_hover_text("Drag a rectangle on the image: fibers are only looked for inside it.").clicked() {
+                    self.start_drawing(DrawTarget::RegionRect);
+                }
+                if big_toggle(ui, drawing == Some(DrawTarget::RegionCircle), "Circle")
+                    .on_hover_text("Drag from the center outwards: fibers are only looked for inside it.").clicked() {
+                    self.start_drawing(DrawTarget::RegionCircle);
+                }
+                if ui.add_enabled(self.alignment.region.is_some(), egui::Button::new("Clear").min_size(egui::vec2(0.0, 30.0))).clicked() {
+                    self.alignment.region = None;
+                    self.region_changed();
+                }
+            });
+            ui.label(RichText::new(match self.alignment.region {
+                None => "None: the whole image is searched.",
+                Some(Region::Rect { .. }) => "Fibers are looked for inside the rectangle.",
+                Some(Region::Circle { .. }) => "Fibers are looked for inside the circle.",
+            }).weak());
+        });
+    }
+
+    fn align_table(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Results", None, |ui| {
+            if self.alignment.rows.is_empty() {
+                ui.label(RichText::new("No readings yet: press Take readings (Space).").weak());
+                return;
             }
-            if ui.add_enabled(!self.alignment.rows.is_empty(), egui::Button::new("Clear table")).clicked() {
+            egui::ScrollArea::vertical().id_salt("align_rows").max_height(ui.available_height().max(120.0) - 30.0)
+                .stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
+                egui::Grid::new("align_grid").striped(true).num_columns(6).spacing(egui::vec2(16.0, 4.0)).show(ui, |ui| {
+                    for h in ["Fiber #", "Axis", "Mean", "Std dev", "n", "Time"] {
+                        ui.strong(h);
+                    }
+                    ui.end_row();
+                    for r in &self.alignment.rows {
+                        ui.label(RichText::new(r.fiber.to_string()).strong());
+                        ui.label(r.axis);
+                        ui.label(RichText::new(format!("{:+.2}°", r.mean)).strong());
+                        ui.label(format!("{:.2}°", r.std));
+                        ui.label(r.n.to_string());
+                        ui.label(RichText::new(&r.time).weak());
+                        ui.end_row();
+                    }
+                });
+            });
+            if ui.button("Clear table").clicked() {
                 self.alignment.rows.clear();
             }
         });
-        ui.separator();
-        egui::ScrollArea::vertical().id_salt("align_rows").max_height(150.0).stick_to_bottom(true).auto_shrink([false, true]).show(ui, |ui| {
-            egui::Grid::new("align_grid").striped(true).num_columns(6).show(ui, |ui| {
-                for h in ["Fiber #", "Axis", "Mean", "Std dev", "n", "Time"] {
-                    ui.strong(h);
-                }
-                ui.end_row();
-                for r in &self.alignment.rows {
-                    ui.label(r.fiber.to_string());
-                    ui.label(r.axis);
-                    ui.label(format!("{:+.2}°", r.mean));
-                    ui.label(format!("{:.2}°", r.std));
-                    ui.label(r.n.to_string());
-                    ui.label(RichText::new(&r.time).weak());
-                    ui.end_row();
-                }
-            });
-        });
-        ui.separator();
-        // Bottom half: region of interest and reference line.
-        let drawing = self.alignment.drawing;
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("Region of interest:");
-            if super::panels::toggle(ui, drawing == Some(DrawTarget::RegionRect), "Draw rectangle")
-                .on_hover_text("Drag a rectangle on the image: fibers are only looked for inside it.").clicked() {
-                self.start_drawing(DrawTarget::RegionRect);
-            }
-            if super::panels::toggle(ui, drawing == Some(DrawTarget::RegionCircle), "Draw circle")
-                .on_hover_text("Drag from the center outwards: fibers are only looked for inside it.").clicked() {
-                self.start_drawing(DrawTarget::RegionCircle);
-            }
-            if ui.add_enabled(self.alignment.region.is_some(), egui::Button::new("Clear")).clicked() {
-                self.alignment.region = None;
-                self.region_changed();
-            }
-            ui.label(RichText::new(match self.alignment.region {
-                None => "whole image",
-                Some(Region::Rect { .. }) => "inside the rectangle",
-                Some(Region::Circle { .. }) => "inside the circle",
-            }).weak());
-        });
-        ui.horizontal_wrapped(|ui| {
-            ui.strong("Reference line:");
-            if super::panels::toggle(ui, drawing == Some(DrawTarget::Reference), "Draw line")
-                .on_hover_text("Drag a line on the image along the fibers' edge (e.g. the groove): the readout and\n\
-                                the readings then give how far each fiber's axis is from perpendicular to it.").clicked() {
-                self.start_drawing(DrawTarget::Reference);
-            }
-            if ui.add_enabled(self.alignment.reference.is_some(), egui::Button::new("Clear")).clicked() {
-                self.alignment.reference = None;
-            }
-            if let Some((a, b)) = self.alignment.reference {
-                let mut deg = signed_angle(line_angle(a, b));
-                ui.label("at");
-                let mut changed = ui.add(egui::DragValue::new(&mut deg).range(-90.0..=90.0).speed(0.01).fixed_decimals(2).suffix("°"))
-                    .on_hover_text("Type or drag the line's angle (counter-clockwise from horizontal): it turns about\n\
-                                    its middle. Its ends can also be dragged on the image.").changed();
-                if ui.small_button("-0.1°").clicked() {
-                    deg -= 0.1;
-                    changed = true;
-                }
-                if ui.small_button("+0.1°").clicked() {
-                    deg += 0.1;
-                    changed = true;
-                }
-                if changed {
-                    self.alignment.reference = Some(rotate_line(a, b, deg));
-                }
-            }
-        });
-
     }
 
     // --- fiber count -----------------------------------------------------------------------------------
@@ -452,50 +529,96 @@ impl App {
     }
 
     pub(crate) fn fiber_count_panel(&mut self, ui: &mut egui::Ui) {
+        let w = ui.available_width();
+        if w > 1000.0 {
+            ui.columns(3, |c| {
+                self.count_find_box(&mut c[0]);
+                self.count_numbering_box(&mut c[1]);
+                self.count_table(&mut c[2]);
+            });
+        } else if w > 600.0 {
+            ui.columns(2, |c| {
+                self.count_find_box(&mut c[0]);
+                self.count_numbering_box(&mut c[1]);
+            });
+            ui.add_space(6.0);
+            self.count_table(ui);
+        } else {
+            self.count_find_box(ui);
+            self.count_numbering_box(ui);
+            self.count_table(ui);
+        }
+    }
+
+    fn count_find_box(&mut self, ui: &mut egui::Ui) {
         let fibers = self.active_pane().fibers.clone();
-        ui.horizontal_wrapped(|ui| {
-            if super::panels::primary(ui, "Find fibers", true, egui::vec2(120.0, 26.0))
-                .on_hover_text("Find and number all the fibers in the view (turns off Only the center fiber).").clicked() {
+        let d = self.fiber_drawing();
+        section(ui, "Fibers", None, |ui| {
+            let button = egui::Button::new(RichText::new("Find fibers").size(20.0).strong().color(egui::Color32::WHITE))
+                .fill(egui::Color32::from_rgb(0x2f, 0x6f, 0xd0)).min_size(egui::vec2(ui.available_width(), 44.0));
+            if ui.add(button).on_hover_text("Find and number all the fibers in the view (turns off Only the center fiber).").clicked() {
                 self.find_all_fibers();
             }
+            ui.add_space(4.0);
             ui.label(RichText::new(match fibers.len() {
                 0 => "No fibers found yet.".to_string(),
                 1 => "1 fiber".to_string(),
                 n => format!("{n} fibers"),
-            }).strong());
+            }).size(16.0).strong());
+            match brightest_centre(&fibers) {
+                Some((i, _)) => {
+                    ui.label(RichText::new(format!("Fiber {} is on", d.number(i))).size(20.0).strong().color(egui::Color32::from_rgb(20, 150, 40)))
+                        .on_hover_text("The fiber with the brightest center (light in its core).");
+                }
+                None if fibers.len() == 1 => {
+                    ui.label(RichText::new("One fiber: nothing to compare its brightness with.").weak());
+                }
+                None => {}
+            }
+        });
+    }
+
+    fn count_numbering_box(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Numbering", None, |ui| {
+            egui::Grid::new("count_inputs").num_columns(2).spacing(egui::vec2(10.0, 6.0)).show(ui, |ui| {
+                ui.label("Top fiber #");
+                ui.add(egui::DragValue::new(&mut self.saved.count_first).range(-99999..=99999))
+                    .on_hover_text("The top fiber's number (side by side: the left one's).");
+                ui.end_row();
+                ui.label("Counting");
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.saved.count_ascending, true, "Up");
+                    ui.radio_value(&mut self.saved.count_ascending, false, "Down");
+                });
+                ui.end_row();
+            });
+            ui.checkbox(&mut self.saved.count_show_axes, "Show axes, angles and region")
+                .on_hover_text("While this panel is open, also show the fibers' axis lines, stress parts, the angles box,\n\
+                                the region of interest and the reference line (on the view and the saved image).");
+            ui.add_space(4.0);
             if ui.button("Save image with information").on_hover_text("Save the view's image with the numbers and which fiber is on\n\
                                                                      (PNG), and the details (JSON), in the output folder.").clicked() {
                 self.save_fiber_count();
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Top fiber is number");
-            ui.add(egui::DragValue::new(&mut self.saved.count_first).range(-99999..=99999));
-            ui.radio_value(&mut self.saved.count_ascending, true, "Ascending");
-            ui.radio_value(&mut self.saved.count_ascending, false, "Descending");
-            ui.label(RichText::new("(down from the top fiber; side by side: from the left)").weak());
-        });
-        let d = self.fiber_drawing();
-        match brightest_centre(&fibers) {
-            Some((i, _)) => {
-                ui.label(RichText::new(format!("Fiber {} is on", d.number(i))).size(18.0).color(egui::Color32::from_rgb(20, 150, 40)))
-                    .on_hover_text("The fiber with the brightest center (light in its core).");
-            }
-            None if fibers.len() == 1 => {
-                ui.label(RichText::new("One fiber: nothing to compare its brightness with.").weak());
-            }
-            None => {}
+    }
+
+    fn count_table(&mut self, ui: &mut egui::Ui) {
+        let fibers = self.active_pane().fibers.clone();
+        if fibers.is_empty() {
+            return;
         }
-        if !fibers.is_empty() {
-            let on = brightest_centre(&fibers).map(|b| b.0);
-            egui::ScrollArea::vertical().id_salt("count_rows").max_height(160.0).auto_shrink([false, true]).show(ui, |ui| {
-                egui::Grid::new("count_grid").striped(true).num_columns(4).show(ui, |ui| {
+        let d = self.fiber_drawing();
+        let on = brightest_centre(&fibers).map(|b| b.0);
+        section(ui, "Each fiber", None, |ui| {
+            egui::ScrollArea::vertical().id_salt("count_rows").max_height(ui.available_height().max(120.0)).auto_shrink([false, true]).show(ui, |ui| {
+                egui::Grid::new("count_grid").striped(true).num_columns(4).spacing(egui::vec2(16.0, 4.0)).show(ui, |ui| {
                     for h in ["Number", "Center (px)", "Center brightness", ""] {
                         ui.strong(h);
                     }
                     ui.end_row();
                     for (i, f) in fibers.iter().enumerate() {
-                        ui.label(d.number(i).to_string());
+                        ui.label(RichText::new(d.number(i).to_string()).strong());
                         ui.label(format!("{:.0}, {:.0}", f.cx, f.cy));
                         ui.label(f.centre_brightness.map(|b| format!("{b:.0}")).unwrap_or_default());
                         ui.label(if on == Some(i) { RichText::new("on").strong().color(egui::Color32::from_rgb(20, 150, 40)) } else { RichText::new("") });
@@ -503,8 +626,33 @@ impl App {
                     }
                 });
             });
-        }
+        });
     }
+}
+
+/// A framed group with a title (and a color swatch: what it looks like on the image).
+fn section<R>(ui: &mut egui::Ui, title: &str, swatch: Option<egui::Color32>, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(8)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            if let Some(c) = swatch {
+                let (r, _) = ui.allocate_exact_size(egui::vec2(18.0, 6.0), egui::Sense::hover());
+                ui.painter().rect_filled(r, 2.0, c);
+            }
+            ui.label(RichText::new(title).strong().size(15.0));
+        });
+        ui.add_space(4.0);
+        add(ui)
+    }).inner
+}
+
+/// A larger on/off button (for drawing on the image).
+fn big_toggle(ui: &mut egui::Ui, on: bool, text: &str) -> egui::Response {
+    ui.add(egui::Button::new(RichText::new(text).size(14.0)).selected(on).min_size(egui::vec2(0.0, 30.0)))
+}
+
+fn c32(c: crate::draw::Color) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
 }
 
 #[cfg(test)]
@@ -542,15 +690,15 @@ mod tests {
 
     #[test]
     fn rows_from_readings() {
-        let mut a = Alignment::new(3, None, None);
-        let n = a.finish(&[vec![44.0, 89.0], vec![46.0, -89.0], vec![45.0, 90.0]], &["slow", "fast"], Some(30.0));
-        assert_eq!(n, 2);
-        assert_eq!((a.rows[0].fiber, a.rows[1].fiber), (1, 2));
+        let mut a = Alignment::new(3, None, None, 17, false);
+        a.finish(&[44.0, 46.0, 45.0], "slow", Some(30.0));
+        a.finish(&[89.0, -89.0, 90.0], "fast", Some(30.0));
+        assert_eq!((a.rows[0].fiber, a.rows[1].fiber, a.next_number), (17, 16, 15), "counting down from 17");
         assert!((a.rows[0].mean - 45.0).abs() < 1e-9 && (a.rows[0].std - 1.0).abs() < 1e-9);
         assert!((a.rows[1].mean.abs() - 90.0).abs() < 1e-6, "wraps at 90: {}", a.rows[1].mean);
         assert_eq!(a.rows[0].reference, Some(30.0));
         assert_eq!(a.table_lines().len(), 3);
         assert_eq!((a.rows[0].axis, a.rows[1].axis), ("slow", "fast"));
-        assert!(a.table_lines()[1].starts_with("1\tslow\t+45.00°"), "{:?}", a.table_lines());
+        assert!(a.table_lines()[1].starts_with("17\tslow\t+45.00°"), "{:?}", a.table_lines());
     }
 }

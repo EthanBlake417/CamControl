@@ -123,6 +123,22 @@ pub struct FiberLineStyle {
     pub readout_size: f64,
     pub readout_font: String,
     pub readout_bold: bool,
+    /// The stress parts (Show stress parts): color, filled (with opacity %), outlined (opacity %, line style).
+    pub parts_color: String,
+    pub parts_fill: bool,
+    pub parts_fill_opacity: i64,
+    pub parts_line: bool,
+    pub parts_line_opacity: i64,
+    pub parts_line_style: String,
+    /// The reference line and the region of interest: color, opacity %, width (px on screen), line style.
+    pub reference_color: String,
+    pub reference_opacity: i64,
+    pub reference_width: f64,
+    pub reference_line: String,
+    pub region_color: String,
+    pub region_opacity: i64,
+    pub region_width: f64,
+    pub region_line: String,
 }
 
 impl Default for FiberLineStyle {
@@ -138,6 +154,20 @@ impl Default for FiberLineStyle {
             readout_size: 26.0,
             readout_font: "sans".into(),
             readout_bold: false,
+            parts_color: "#ff00c8".into(),
+            parts_fill: true,
+            parts_fill_opacity: 18,
+            parts_line: true,
+            parts_line_opacity: 100,
+            parts_line_style: "dot".into(),
+            reference_color: "#00dcff".into(),
+            reference_opacity: 100,
+            reference_width: 5.0,
+            reference_line: "solid".into(),
+            region_color: "#ffdc00".into(),
+            region_opacity: 100,
+            region_width: 3.5,
+            region_line: "dash".into(),
         }
     }
 }
@@ -146,13 +176,35 @@ impl FiberLineStyle {
     pub fn from_value(data: &Value) -> Self {
         let mut v = serde_json::to_value(Self::default()).unwrap();
         merge_fields(&mut v, data);
-        for k in ["slow_opacity", "fast_opacity"] {
+        for k in ["slow_opacity", "fast_opacity", "parts_fill_opacity", "parts_line_opacity", "reference_opacity", "region_opacity"] {
             if let Some(n) = v[k].as_f64() {
                 v[k] = (n as i64).into();
             }
         }
         let mut s: Self = serde_json::from_value(v).unwrap_or_default();
         let d = Self::default();
+        if parse_color(&s.parts_color).is_none() {
+            s.parts_color = d.parts_color.clone();
+        }
+        s.parts_fill_opacity = s.parts_fill_opacity.clamp(0, 100);
+        s.parts_line_opacity = s.parts_line_opacity.clamp(0, 100);
+        if !LINE_STYLES.iter().any(|l| l.0 == s.parts_line_style) {
+            s.parts_line_style = d.parts_line_style.clone();
+        }
+        for (color, default) in [(&mut s.reference_color, &d.reference_color), (&mut s.region_color, &d.region_color)] {
+            if parse_color(color).is_none() {
+                *color = default.clone();
+            }
+        }
+        for (line, default) in [(&mut s.reference_line, &d.reference_line), (&mut s.region_line, &d.region_line)] {
+            if !LINE_STYLES.iter().any(|l| l.0 == line.as_str()) {
+                *line = default.clone();
+            }
+        }
+        s.reference_opacity = s.reference_opacity.clamp(5, 100);
+        s.region_opacity = s.region_opacity.clamp(5, 100);
+        s.reference_width = if s.reference_width.is_finite() { s.reference_width.clamp(0.5, 20.0) } else { d.reference_width };
+        s.region_width = if s.region_width.is_finite() { s.region_width.clamp(0.5, 20.0) } else { d.region_width };
         if parse_color(&s.slow_color).is_none() {
             s.slow_color = d.slow_color;
         }
@@ -178,6 +230,40 @@ impl FiberLineStyle {
 
     pub fn slow(&self) -> Color {
         rgba(&self.slow_color, self.slow_opacity)
+    }
+
+    /// The stress parts' fill and outline (None: not drawn).
+    pub fn parts_fill(&self) -> Option<Color> {
+        self.parts_fill.then(|| rgba(&self.parts_color, self.parts_fill_opacity))
+    }
+
+    pub fn parts_outline(&self) -> Option<(Color, Dash)> {
+        self.parts_line.then(|| (rgba(&self.parts_color, self.parts_line_opacity), dash(&self.parts_line_style)))
+    }
+
+    /// How the reference line and the region of interest are drawn: (color, width on screen, line style).
+    pub fn reference_look(&self) -> (Color, f32, Dash) {
+        (rgba(&self.reference_color, self.reference_opacity), self.reference_width as f32, dash(&self.reference_line))
+    }
+
+    pub fn region_look(&self) -> (Color, f32, Dash) {
+        (rgba(&self.region_color, self.region_opacity), self.region_width as f32, dash(&self.region_line))
+    }
+
+    /// Back to the standard reference line and region look, the rest kept.
+    pub fn default_marks(&mut self) {
+        let d = Self::default();
+        (self.reference_color, self.reference_opacity, self.reference_width, self.reference_line) =
+            (d.reference_color, d.reference_opacity, d.reference_width, d.reference_line);
+        (self.region_color, self.region_opacity, self.region_width, self.region_line) =
+            (d.region_color, d.region_opacity, d.region_width, d.region_line);
+    }
+
+    /// Back to the standard stress-parts look, the rest kept.
+    pub fn default_parts(&mut self) {
+        let d = Self::default();
+        (self.parts_color, self.parts_fill, self.parts_fill_opacity) = (d.parts_color, d.parts_fill, d.parts_fill_opacity);
+        (self.parts_line, self.parts_line_opacity, self.parts_line_style) = (d.parts_line, d.parts_line_opacity, d.parts_line_style);
     }
 
     pub fn fast(&self) -> Color {
@@ -312,6 +398,31 @@ impl CrosshairStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stress_parts_look() {
+        let s = FiberLineStyle::from_value(&serde_json::json!({"parts_fill": false, "parts_line_opacity": 40.0, "parts_line_style": "bogus",
+                                                                "parts_color": "#00ff00"}));
+        assert_eq!(s.parts_fill(), None);
+        assert_eq!(s.parts_outline(), Some(([0, 255, 0, 102], Dash::Dot)), "bad line style: the default");
+        let d = FiberLineStyle::default();
+        assert_eq!(d.parts_fill(), Some([255, 0, 200, 46]));
+        let mut t = s.clone();
+        t.slow_color = "#123456".into();
+        t.default_parts();
+        assert_eq!((t.parts_fill(), t.slow_color.as_str()), (d.parts_fill(), "#123456"));
+    }
+
+    #[test]
+    fn region_and_line_look() {
+        let s = FiberLineStyle::from_value(&serde_json::json!({"reference_color": "#ff0000", "reference_width": 99.0, "region_line": "solid",
+                                                                "region_opacity": 50.0}));
+        assert_eq!(s.reference_look(), ([255, 0, 0, 255], 20.0, Dash::Solid), "width capped");
+        assert_eq!(s.region_look(), ([255, 220, 0, 127], 3.5, Dash::Solid));
+        let mut t = s.clone();
+        t.default_marks();
+        assert_eq!(t.reference_look(), FiberLineStyle::default().reference_look());
+    }
 
     #[test]
     fn styles_from_saved_settings() {

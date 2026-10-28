@@ -167,11 +167,9 @@ struct FiberRequest {
     kind: FiberKind,
     from_camera: bool,
     generation: u64,
-    circles: Option<Vec<(f64, f64, f64)>>,
     /// Live frames: the fibers measured last, to follow instead of searching again.
     previous: Option<Vec<(f64, f64, f64)>>,
     method: String,
-    parts_centre: bool,
     detection: Detection,
     centre_only: bool,
     region: Option<crate::processing::fiber_axis::Region>,
@@ -180,10 +178,8 @@ struct FiberRequest {
 pub struct FiberSettings {
     pub live: bool,
     pub method: String,
-    pub parts_centre: bool,
     pub show_parts: bool,
     pub centre_only: bool,
-    pub use_circles: bool,
     pub advanced: bool,
     pub detection: Detection,
     /// The automatic threshold last measured (shown when Auto is on).
@@ -284,7 +280,15 @@ impl App {
             readout_px: self.saved.fiber_lines.readout_size as f32,
             readout_mono: self.saved.fiber_lines.readout_font == "mono",
             readout_bold: self.saved.fiber_lines.readout_bold,
+            parts_fill: self.saved.fiber_lines.parts_fill(),
+            parts_outline: self.saved.fiber_lines.parts_outline(),
+            numbers_only: self.counting_clean(),
         }
+    }
+
+    /// The Fiber count panel is open with its axes, angles and region hidden.
+    pub(crate) fn counting_clean(&self) -> bool {
+        self.panels.is_open(PanelId::FiberCount) && !self.saved.count_show_axes
     }
 }
 
@@ -382,16 +386,14 @@ impl App {
         let fiber = FiberSettings {
             live: saved.fiber_live,
             method: saved.fiber_method.clone(),
-            parts_centre: saved.fiber_parts_centre,
             show_parts: saved.fiber_show_parts,
             centre_only: saved.fiber_centre_only,
-            use_circles: saved.fiber_use_circles,
             advanced: saved.fiber_advanced,
             detection: saved.fiber_detection.clone(),
             shown_threshold: 6.0,
         };
         let multi_layout = if views::LAYOUTS.iter().any(|l| l.0 == saved.multi_layout && l.0 != "single") { saved.multi_layout.clone() } else { "grid".into() };
-        let overlay_tab = if ["grid", "crosshair", "fiber"].contains(&saved.overlay_tab.as_str()) { saved.overlay_tab.clone() } else { "grid".into() };
+        let overlay_tab = if ["grid", "crosshair", "fiber", "parts", "marks"].contains(&saved.overlay_tab.as_str()) { saved.overlay_tab.clone() } else { "grid".into() };
         let class_names = if saved.count_class_names.len() == default_names().len() { saved.count_class_names.clone() } else { default_names() };
         let mut gallery = Gallery::new(wake.clone());
         gallery.count = saved.gallery_count.clamp(1, 500);
@@ -399,7 +401,7 @@ impl App {
         let mut app = Self {
             fiber_log: fiber_log::FiberLog { record: saved.fiber_log_record, ..Default::default() },
             histogram: histogram::Histogram::new(saved.histogram_log, saved.histogram_colors),
-            alignment: alignment::Alignment::new(saved.align_n, saved.align_region, saved.align_reference),
+            alignment: alignment::Alignment::new(saved.align_n, saved.align_region, saved.align_reference, saved.align_next, saved.align_ascending),
             panes: Vec::new(),
             active: 0,
             controlled: None,
@@ -1073,17 +1075,17 @@ impl App {
         self.saved.fiber_method = self.fiber.method.clone();
         self.saved.fiber_advanced = self.fiber.advanced;
         self.saved.fiber_centre_only = self.fiber.centre_only;
-        self.saved.fiber_parts_centre = self.fiber.parts_centre;
         self.saved.fiber_show_parts = self.fiber.show_parts;
         self.saved.histogram_log = self.histogram.log;
         self.saved.histogram_colors = self.histogram.colors;
         self.saved.fiber_detection = self.fiber.detection.clone();
         self.saved.fiber_live = self.fiber.live;
-        self.saved.fiber_use_circles = self.fiber.use_circles;
         self.saved.fiber_log_record = self.fiber_log.record;
         self.saved.align_n = self.alignment.n;
         self.saved.align_region = self.alignment.region;
         self.saved.align_reference = self.alignment.reference.map(|(a, b)| [a.0, a.1, b.0, b.1]);
+        self.saved.align_next = self.alignment.next_number;
+        self.saved.align_ascending = self.alignment.ascending;
         self.saved.count_class_names = self.class_names.clone();
         self.saved.multi_layout = self.multi_layout.clone();
         self.saved.overlay_tab = self.overlay_tab.clone();

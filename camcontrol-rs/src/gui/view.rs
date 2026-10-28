@@ -635,7 +635,7 @@ impl ImageView {
         annotate::draw_extras(&mut canvas, overlays.extras, overlays.fibers, &overlays.fiber_drawing, &to_screen, zoom as f64, &style, area);
         if let Some((a, b)) = overlays.extras.reference {
             for p in [a, b] {
-                canvas.ellipse(to_screen(p.0, p.1), GRAB_PX * 0.6, GRAB_PX * 0.6, Some(annotate::REFERENCE_COLOR), 2.0, Dash::Solid, None);
+                canvas.ellipse(to_screen(p.0, p.1), GRAB_PX * 0.6, GRAB_PX * 0.6, Some(overlays.extras.reference_look().0), 2.0, Dash::Solid, None);
             }
         }
         if let Some(c) = overlays.crosshair {

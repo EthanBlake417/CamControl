@@ -23,7 +23,7 @@ use crate::camera::worker::{CameraLink, CaptureRequest, Cmd, Ev, RecordOverlay, 
 use crate::camera::{camera_list, DeviceKey};
 use crate::capture::{self, clean_name, next_capture_path, HD2_SCALE};
 use crate::export::{self, Cell, Sheet};
-use crate::measure::{compute, is_circle, kind, Measurement};
+use crate::measure::{compute, kind, Measurement};
 use crate::processing::fiber_axis::{self, method_label, FiberAxis};
 use crate::processing::flatfield::FlatField;
 use crate::video::is_video;
@@ -1315,24 +1315,15 @@ impl App {
     /// Measure a view's image in the background with the panel's settings as they are now.
     /// One runs at a time; a request made meanwhile waits (the newest per view), except live frames.
     pub(crate) fn request_fibers(&mut self, id: u64, image: Arc<RgbImage>, kind: FiberKind) {
-        let circles = self.fiber.use_circles.then(|| {
-            self.pane(id).measurements.iter().filter(|m| is_circle(&m.kind)).filter_map(|m| {
-                let r = compute(m, &crate::calibration::Calibration::pixels()).ok()?;
-                let (x, y) = r.center_px?;
-                Some((x, y, r.radius?))
-            }).collect::<Vec<_>>()
-        }).filter(|c| !c.is_empty());
         let req = FiberRequest {
             pane: id,
             image,
             kind: kind.clone(),
             from_camera: self.pane(id).live,
             generation: self.fiber_generation,
-            circles,
             previous: (kind == FiberKind::Live && self.pane(id).fiber_locked && !self.pane(id).fibers.is_empty())
                 .then(|| self.pane(id).fibers.iter().map(|f| (f.cx, f.cy, f.radius)).collect()),
             method: self.fiber.method.clone(),
-            parts_centre: self.fiber.parts_centre,
             detection: self.fiber.detection.clone(),
             centre_only: self.fiber.centre_only,
             region: self.alignment.region,
@@ -1346,13 +1337,13 @@ impl App {
         }
         let (tx, rx) = mpsc::channel();
         let wake = self.wake();
-        let (img, circles, method, pc, det, co) = (req.image.clone(), req.circles.clone(), req.method.clone(), req.parts_centre, req.detection.clone(), req.centre_only);
+        let (img, method, det, co) = (req.image.clone(), req.method.clone(), req.detection.clone(), req.centre_only);
         let previous = req.previous.clone();
         let region = req.region;
         std::thread::Builder::new()
             .name("fiber axes".into())
             .spawn(move || {
-                let axes = fiber_axis::analyse_in(&img, circles.as_deref(), previous.as_deref(), &method, pc, &det, co, region.as_ref());
+                let axes = fiber_axis::analyse_in(&img, None, previous.as_deref(), &method, false, &det, co, region.as_ref());
                 let _ = tx.send(axes);
                 wake();
             })
@@ -1413,7 +1404,7 @@ impl App {
                 let note = if unclear > 0 { format!(" ({unclear} unclear)") } else { String::new() };
                 self.message(format!("Found {n} fiber{}{note}.", if n != 1 { "s" } else { "" }), Some(6.0));
             } else {
-                self.message("No fibers found. Draw a Circle (3 pt or center) round the fiber in Measurements, then Find axes.", Some(10.0));
+                self.message("No fibers found. Check the focus and lighting, or draw a region of interest round the fiber (Alignment tab).", Some(10.0));
             }
         }
     }
@@ -1619,8 +1610,7 @@ impl App {
     fn fiber_settings_value(&self) -> Value {
         let f = &self.fiber;
         json!({
-            "method": f.method, "live": f.live, "show_parts": f.show_parts, "centre_only": f.centre_only,
-            "use_circles": f.use_circles, "parts_centre": f.parts_centre, "advanced": f.advanced,
+            "method": f.method, "live": f.live, "show_parts": f.show_parts, "centre_only": f.centre_only, "advanced": f.advanced,
             "detection": serde_json::to_value(&f.detection).unwrap(),
             "outside_lines": self.saved.fiber_long_lines,
             "lines": serde_json::to_value(&self.saved.fiber_lines).unwrap(),
@@ -1639,7 +1629,7 @@ impl App {
             f.method = m.into();
         }
         for (key, slot) in [("live", &mut f.live), ("show_parts", &mut f.show_parts), ("centre_only", &mut f.centre_only),
-                            ("use_circles", &mut f.use_circles), ("parts_centre", &mut f.parts_centre), ("advanced", &mut f.advanced)] {
+                            ("advanced", &mut f.advanced)] {
             if let Some(b) = v[key].as_bool() {
                 *slot = b;
             }

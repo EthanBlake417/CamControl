@@ -608,10 +608,6 @@ impl App {
                             }
                         }
                     });
-                    changed |= ui.add_enabled(self.fiber.method != "rods", egui::Checkbox::new(&mut self.fiber.parts_centre, "Turn about stress parts"))
-                        .on_hover_text("Measure the axis about the center of the stress parts instead of the fiber center\n(Mirror symmetry and Second moments; for stress parts off the fiber's middle).").changed();
-                    ui.checkbox(&mut self.fiber.use_circles, "Use circle measurements").on_hover_text(
-                        "If there are Circle measurements, measure the fibers inside them\ninstead of finding fibers automatically.");
                 }
             });
             if self.fiber.advanced {
@@ -729,8 +725,8 @@ impl App {
                 }
                 hint(ui, "Clarity: how sure the result is; \"(unclear)\" means check it by eye. Angles: 0° is horizontal, + is turned \
                           counter-clockwise, - clockwise (-90° to +90°). Solid magenta line: slow axis (through the stress rods / wedges / \
-                          ellipse). Dashed yellow: fast axis. Fibers are found automatically; for one that isn't, draw a Circle \
-                          (3 pt or center) round it in Measurements, then Find axes.");
+                          ellipse). Dashed yellow: fast axis. Fibers are found automatically; to keep to some of the image, draw a \
+                          region of interest in the Alignment tab.");
             });
         });
         if changed {

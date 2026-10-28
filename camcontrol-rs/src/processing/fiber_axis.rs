@@ -225,9 +225,9 @@ pub fn find_fibers(image: &RgbImage, max_fibers: usize) -> Vec<(f64, f64, f64)> 
     let gray = ip::to_gray(image);
     let mut found: Vec<(f64, f64, f64)> = Vec::new();
     let bright = otsu_mask(&gray);
-    let touching = touching_fibers(&gray, &bright, max_fibers);
+    let touching = touching_fibers(&gray, &bright, max_fibers, FIRST_MIN_R);
     let had_touching = !touching.is_empty();
-    let candidates: Vec<_> = touching.into_iter().chain(round_regions(&gray, &bright)).collect();
+    let candidates: Vec<_> = touching.into_iter().chain(round_regions(&gray, &bright, FIRST_MIN_R)).collect();
     // Every candidate's edge fit at once (some are dropped below as repeats).
     let fits: Vec<Option<(f64, f64, f64)>> = std::thread::scope(|s| {
         let jobs: Vec<_> = candidates
@@ -263,6 +263,7 @@ pub fn find_fibers(image: &RgbImage, max_fibers: usize) -> Vec<(f64, f64, f64)> 
     let check = EdgeCheck::new(&gray);
     found.retain(|c| check.has_edge(c));
     found = more_fibers(&gray, &check, found, max_fibers);
+    found = prune_nested(found);
     found.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     found.truncate(max_fibers);
     found
@@ -280,10 +281,12 @@ fn more_fibers(gray: &image::GrayImage, check: &EdgeCheck, mut found: Vec<(f64, 
     let flat = flatten_lighting(gray);
     let gray = &flat;
     let bright = otsu_mask(gray);
-    let rough: Vec<(f64, f64, f64)> = touching_fibers(gray, &bright, max_fibers).into_iter()
-        .chain(round_regions(gray, &bright))
-        .chain(hough_circles(gray, 10, 800.0, None))
-        .filter(|c| found.iter().all(|k| (c.0 - k.0).hypot(c.1 - k.1) > 0.8 * k.2.max(c.2)))
+    // Smaller fibers too than the first search looks for (many in a groove, each small in the picture).
+    let similar = |a: &(f64, f64, f64), b: &(f64, f64, f64)| a.2 < 1.5 * b.2 && b.2 < 1.5 * a.2 && (a.0 - b.0).hypot(a.1 - b.1) < 0.8 * a.2.max(b.2);
+    let rough: Vec<(f64, f64, f64)> = touching_fibers(gray, &bright, max_fibers, MORE_MIN_R).into_iter()
+        .chain(round_regions(gray, &bright, MORE_MIN_R))
+        .chain(hough_circles_sized(gray, max_fibers, 1000.0, None, MORE_MIN_R, 2.0 * MORE_MIN_R))
+        .filter(|c| !found.iter().any(|k| similar(c, k)))
         .collect();
     let fits: Vec<Option<(f64, f64, f64)>> = std::thread::scope(|s| {
         let jobs: Vec<_> = rough.iter().map(|&c| s.spawn(move || fit_cladding_edge(gray, c.0, c.1, c.2, 360))).collect();
@@ -297,11 +300,27 @@ fn more_fibers(gray: &image::GrayImage, check: &EdgeCheck, mut found: Vec<(f64, 
     }).filter(|c| check.is_fiber(c)).collect();
     extra.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap());
     for c in extra {
-        if found.len() < max_fibers && found.iter().all(|k| (c.0 - k.0).hypot(c.1 - k.1) > 0.8 * k.2.max(c.2)) {
+        if found.len() < max_fibers && !found.iter().any(|k| similar(&c, k)) {
             found.push(c);
         }
     }
-    same_size_neighbours(gray, check, found, max_fibers)
+    same_size_neighbours(gray, check, prune_nested(found), max_fibers)
+}
+
+/// Smallest fiber radius looked for, share of the image's short side: by the first search,
+/// and by the extra searches (a groove full of fibers, each small in the picture).
+const FIRST_MIN_R: f64 = 0.05;
+const MORE_MIN_R: f64 = 0.02;
+
+/// Fibers don't lie in each other: a circle round several found fibers is something else
+/// (the edge of the lit area, a column of fibers); a circle inside a bigger fiber is one of its
+/// stress rods or its core.
+fn prune_nested(found: Vec<(f64, f64, f64)>) -> Vec<(f64, f64, f64)> {
+    let inside = |small: &(f64, f64, f64), big: &(f64, f64, f64)| small.2 < 0.7 * big.2 && (small.0 - big.0).hypot(small.1 - big.1) < big.2;
+    // Much smaller fibers in it or across its edge: three or more and it isn't a fiber.
+    let overlapping = |small: &(f64, f64, f64), big: &(f64, f64, f64)| small.2 < 0.5 * big.2 && (small.0 - big.0).hypot(small.1 - big.1) < big.2 + small.2;
+    let kept: Vec<_> = found.iter().filter(|b| found.iter().filter(|s| overlapping(s, b)).count() < 3).copied().collect();
+    kept.iter().filter(|s| !kept.iter().any(|b| inside(s, b))).copied().collect()
 }
 
 /// The gray image with its lighting evened out: a smooth surface (quadratic in
@@ -466,7 +485,12 @@ pub struct Support {
 /// of that size (the best-edged one's) that the first search missed.
 fn same_size_neighbours(gray: &image::GrayImage, check: &EdgeCheck, mut found: Vec<(f64, f64, f64)>, max_fibers: usize)
                         -> Vec<(f64, f64, f64)> {
-    let Some(best) = found.iter().copied().max_by(|a, b| check.support(a).sharp.partial_cmp(&check.support(b).sharp).unwrap()) else {
+    // The best-edged of the typical size (not an odd one out, e.g. a circle round a column of fibers).
+    let mut radii: Vec<f64> = found.iter().map(|c| c.2).collect();
+    radii.sort_by(|a, b| a.total_cmp(b));
+    let typical = radii.get(radii.len() / 2).copied().unwrap_or(0.0);
+    let Some(best) = found.iter().copied().filter(|c| c.2 < 1.25 * typical && c.2 > 0.8 * typical)
+        .max_by(|a, b| check.support(a).sharp.partial_cmp(&check.support(b).sharp).unwrap()) else {
         return found;
     };
     if found.len() >= max_fibers {
@@ -476,7 +500,7 @@ fn same_size_neighbours(gray: &image::GrayImage, check: &EdgeCheck, mut found: V
     let extra: Vec<(f64, f64)> = fixed_radius_centres(gray, r, max_fibers)
         .into_iter()
         // (a much smaller circle there may be a rod or core, which this fiber replaces below)
-        .filter(|&(x, y)| found.iter().all(|f| f.2 < 0.8 * r || (x - f.0).hypot(y - f.1) > 0.8 * (r + f.2)))
+        .filter(|&(x, y)| found.iter().all(|f| f.2 < 0.8 * r || f.2 > 1.5 * r || (x - f.0).hypot(y - f.1) > 0.8 * (r + f.2)))
         .collect();
     let fits: Vec<Option<(f64, f64, f64)>> = std::thread::scope(|s| {
         let jobs: Vec<_> = extra.iter().map(|&(x, y)| s.spawn(move || fit_cladding_edge(gray, x, y, r, 360))).collect();
@@ -492,7 +516,8 @@ fn same_size_neighbours(gray: &image::GrayImage, check: &EdgeCheck, mut found: V
         }
         // A much smaller circle inside it is one of its stress rods or its core, not a fiber.
         found.retain(|k| !(k.2 < 0.8 * c.2 && (c.0 - k.0).hypot(c.1 - k.1) < c.2));
-        if found.len() < max_fibers && found.iter().all(|k| (c.0 - k.0).hypot(c.1 - k.1) > 0.8 * (c.2 + k.2)) {
+        // (a much bigger circle round it isn't a fiber: prune_nested drops it afterwards)
+        if found.len() < max_fibers && found.iter().all(|k| k.2 > 1.5 * c.2 || (c.0 - k.0).hypot(c.1 - k.1) > 0.8 * (c.2 + k.2)) {
             found.push(c);
         }
     }
@@ -540,15 +565,16 @@ fn otsu_mask(gray: &image::GrayImage) -> Mask {
 
 /// Fibers that touch each other or run off the image, the best seen first.
 pub fn find_touching_fibers(gray: &image::GrayImage, max_fibers: usize) -> Vec<(f64, f64, f64)> {
-    touching_fibers(gray, &otsu_mask(gray), max_fibers)
+    touching_fibers(gray, &otsu_mask(gray), max_fibers, FIRST_MIN_R)
 }
 
-fn touching_fibers(gray: &image::GrayImage, bright: &Mask, max_fibers: usize) -> Vec<(f64, f64, f64)> {
+/// `min_r`: the smallest fiber radius, share of the image's short side.
+fn touching_fibers(gray: &image::GrayImage, bright: &Mask, max_fibers: usize, min_r: f64) -> Vec<(f64, f64, f64)> {
     let mask = ip::open(&ip::fill_holes(bright), &ip::ellipse_kernel(9));
     let depth = ip::distance_transform(&mask);
     let (x, y) = depth.argmax();
     let d = depth.at(x, y) as f64;
-    if d < gray.width().min(gray.height()) as f64 * 0.05 {
+    if d < gray.width().min(gray.height()) as f64 * min_r {
         return Vec::new();
     }
     let Some(first) = fit_cladding_edge(gray, x as f64, y as f64, d, 360) else {
@@ -808,9 +834,9 @@ fn fixed_radius_centres(gray: &image::GrayImage, radius: f64, max_fibers: usize)
     found
 }
 
-fn round_regions(gray: &image::GrayImage, bright: &Mask) -> Vec<(f64, f64, f64)> {
+fn round_regions(gray: &image::GrayImage, bright: &Mask, min_share: f64) -> Vec<(f64, f64, f64)> {
     let (w, h) = (gray.width() as f64, gray.height() as f64);
-    let min_r = w.min(h) * 0.05;
+    let min_r = w.min(h) * min_share;
     let mut found = Vec::new();
     for mask in [bright.clone(), bright.not()] {
         for c in ip::outer_contours(&mask) {
@@ -862,6 +888,12 @@ const FAINT_EDGE_MIN: f32 = 6.0;
 
 /// `faint`: None = edges of fixed strength; Some(share) = this image's strongest `share` of gradients.
 fn hough_circles(gray: &image::GrayImage, max_fibers: usize, size: f64, faint: Option<f64>) -> Vec<(f64, f64, f64)> {
+    hough_circles_sized(gray, max_fibers, size, faint, 0.06, 0.15)
+}
+
+/// `min_r`, `min_dist`: the smallest radius and the closest centers, shares of the short side.
+fn hough_circles_sized(gray: &image::GrayImage, max_fibers: usize, size: f64, faint: Option<f64>, min_share: f64, dist_share: f64)
+                       -> Vec<(f64, f64, f64)> {
     let (w, h) = (gray.width() as f64, gray.height() as f64);
     let scale = (size / w.max(h)).min(1.0);
     let small = ip::resize_gray(gray, rne(w * scale) as u32, rne(h * scale) as u32, ip::Interp::Area);
@@ -876,7 +908,7 @@ fn hough_circles(gray: &image::GrayImage, max_fibers: usize, size: f64, faint: O
         }
     };
     let short = small.width().min(small.height()) as f64;
-    let (min_r, max_r) = (rne(short * 0.06), rne(short * 0.5));
+    let (min_r, max_r) = (rne(short * min_share).max(4.0), rne(short * 0.5));
     let dp = 1.5;
     let (aw, ah) = ((f.w as f64 / dp).ceil() as usize + 1, (f.h as f64 / dp).ceil() as usize + 1);
     let mut acc = ImgF::new(aw, ah);
@@ -903,7 +935,7 @@ fn hough_circles(gray: &image::GrayImage, max_fibers: usize, size: f64, faint: O
         }
     }
     // Centers: local maxima above the accumulator threshold, at least minDist apart.
-    let min_dist = short * 0.15;
+    let min_dist = short * dist_share;
     let mut peaks: Vec<(f32, usize, usize)> = Vec::new();
     for y in 1..ah - 1 {
         for x in 1..aw - 1 {
@@ -2242,6 +2274,9 @@ pub fn analyse_tracking(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, p
     analyse_in(image, circles, previous, method, parts_centre, detection, centre_only, None)
 }
 
+/// The most fibers looked for in one image.
+pub const MAX_FIBERS: usize = 50;
+
 /// Where fibers are looked for (a region of interest), in image pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "shape", rename_all = "lowercase")]
@@ -2283,7 +2318,7 @@ pub fn find_in_region(image: &RgbImage, region: &Region) -> Vec<(f64, f64, f64)>
         return Vec::new();
     }
     let crop = image::imageops::crop_imm(image, x0, y0, x1 - x0, y1 - y0).to_image();
-    find_fibers(&crop, 10).into_iter().map(|(x, y, r)| (x + x0 as f64, y + y0 as f64, r)).filter(|c| region.contains(c.0, c.1)).collect()
+    find_fibers(&crop, MAX_FIBERS).into_iter().map(|(x, y, r)| (x + x0 as f64, y + y0 as f64, r)).filter(|c| region.contains(c.0, c.1)).collect()
 }
 
 /// As analyse_tracking; with a region, fibers are only looked for (and kept) inside it.
@@ -2300,7 +2335,7 @@ pub fn analyse_in(image: &RgbImage, circles: Option<&[(f64, f64, f64)]>, previou
         _ => {
             let found = match region {
                 Some(r) => find_in_region(image, r),
-                None => find_fibers(image, 10),
+                None => find_fibers(image, MAX_FIBERS),
             };
             match (centre_only, region) {
                 (false, _) => found,
@@ -2486,6 +2521,31 @@ mod tests {
         assert_eq!(found.len(), 4, "{found:?}");
         for (f, &y) in found.iter().zip(&ys) {
             assert!((f.0 - 480.0).abs() < 3.0 && (f.1 - y as f64).abs() < 3.0 && (f.2 - 66.0).abs() < 4.0, "{found:?}");
+        }
+    }
+
+    /// A groove full of fibers, each small in the picture (the user's 2026-10-27 captures):
+    /// every one found, and no circle round the column.
+    #[test]
+    fn a_column_of_small_fibers() {
+        let mut img = RgbImage::from_fn(1920, 1080, |x, _| image::Rgb([(120.0 - 100.0 * (x as f64 / 1920.0)) as u8; 3]));
+        let ys: Vec<i64> = (0..14).map(|k| 104 + 71 * k).collect();
+        for &y in &ys {
+            draw::fill_circle_px(&mut img, 950, y, 34, [190, 190, 190]);
+            for s in [-1, 1] {
+                draw::fill_circle_px(&mut img, 950, y + s * 15, 7, [60, 60, 60]);
+            }
+        }
+        let img = crate::imgproc::gaussian_blur_rgb(&img, 1.5);
+        let found = find_fibers(&img, MAX_FIBERS);
+        assert_eq!(found.len(), 14, "{found:?}");
+        assert!(found.iter().all(|f| (f.2 - 34.0).abs() < 3.0 && (f.0 - 950.0).abs() < 3.0), "{found:?}");
+        // The user's captures, if here.
+        let dir = std::path::Path::new("C:/Users/ethan/Desktop/Fiber Tests");
+        for name in ["cap_20261027_175731.tif", "cap_20261027_175752.tif"] {
+            if let Some(img) = crate::capture::load_image(&dir.join(name)) {
+                assert_eq!(find_fibers(&img, MAX_FIBERS).len(), 14, "{name}");
+            }
         }
     }
 

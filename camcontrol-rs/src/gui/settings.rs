@@ -84,21 +84,24 @@ pub struct Saved {
     pub fiber_method: String,
     pub fiber_advanced: bool,
     pub fiber_centre_only: bool,
-    pub fiber_parts_centre: bool,
     pub fiber_show_parts: bool,
     /// Axis lines outside the fibers only, to the edges of the picture (and the crosshair on a fiber outside it only).
     pub fiber_long_lines: bool,
     pub fiber_lines: FiberLineStyle,
     pub fiber_live: bool,
-    pub fiber_use_circles: bool,
     pub fiber_log_record: bool,
     /// Alignment panel: readings per Take readings, region of interest, reference line (x0, y0, x1, y1).
     pub align_n: usize,
     pub align_region: Option<Region>,
     pub align_reference: Option<[f64; 4]>,
+    /// The next fiber's number in the Alignment table, and counting up (else down).
+    pub align_next: i64,
+    pub align_ascending: bool,
     /// Fiber count panel: the top fiber's number, and counting up from it.
     pub count_first: i64,
     pub count_ascending: bool,
+    /// Fiber count panel open: still show the axis lines, angles, region and reference line.
+    pub count_show_axes: bool,
     /// Counting class names (empty: Class 1, Class 2, ...).
     pub count_class_names: Vec<String>,
     /// The layout "Several views" goes back to.
@@ -142,18 +145,19 @@ impl Default for Saved {
             fiber_method: "auto".into(),
             fiber_advanced: false,
             fiber_centre_only: false,
-            fiber_parts_centre: false,
             fiber_show_parts: true,
             fiber_long_lines: false,
             fiber_lines: FiberLineStyle::default(),
             fiber_live: false,
-            fiber_use_circles: true,
             fiber_log_record: false,
             align_n: 10,
             align_region: None,
             align_reference: None,
+            align_next: 1,
+            align_ascending: true,
             count_first: 1,
             count_ascending: true,
+            count_show_axes: false,
             count_class_names: Vec::new(),
             multi_layout: "grid".into(),
             overlay_tab: "grid".into(),

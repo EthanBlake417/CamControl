@@ -50,13 +50,19 @@ pub struct FiberDrawing {
     pub readout_px: f32,
     pub readout_mono: bool,
     pub readout_bold: bool,
+    /// The stress parts' fill and outline (None: not drawn).
+    pub parts_fill: Option<Color>,
+    pub parts_outline: Option<(Color, Dash)>,
+    /// Only the fibers' outlines (and which is on): no axis lines, stress parts or readout (fiber counting).
+    pub numbers_only: bool,
 }
 
 impl Default for FiberDrawing {
     fn default() -> Self {
         Self { show_parts: false, long_lines: false, slow: SLOW_COLOR, fast: FAST_COLOR, show_slow: true, show_fast: true, slow_bands: None,
                fast_bands: None, first_number: 1, ascending: true, reference: None, readout_px: READOUT_PX,
-               readout_mono: false, readout_bold: false }
+               readout_mono: false, readout_bold: false, parts_fill: Some([255, 0, 200, 46]), parts_outline: Some((SLOW_COLOR, Dash::Dot)),
+               numbers_only: false }
     }
 }
 
@@ -289,24 +295,28 @@ pub fn draw_fiber_axes(c: &mut dyn Canvas, axes: &[FiberAxis], to_out: &dyn Fn(f
         let pivot = to_out(ax, ay);
         let r = (f.radius * zoom) as f32;
         let width = style.line_width * if Some(i) == selected { 1.6 } else { 1.0 };
-        if show_parts {
-            let mut fill = drawing.slow;
-            fill[3] = 45;
+        if show_parts && !drawing.numbers_only {
+            let (line, dash) = drawing.parts_outline.unwrap_or(([0, 0, 0, 0], Dash::Solid));
             for outline in &f.parts {
                 let pts: Vec<P> = outline.iter().map(|&(x, y)| to_out(x, y)).collect();
-                c.polyline(&pts, true, drawing.slow, (width / 2.0).max(1.0), Dash::Dot, Some(fill));
+                c.polyline(&pts, true, line, (width / 2.0).max(1.0), dash, drawing.parts_fill);
             }
+            // A cross at each part's center, in the outline's color (the fill's, opaque, without one).
+            let mark = drawing.parts_outline.map(|o| o.0).or(drawing.parts_fill.map(|f| [f[0], f[1], f[2], 255]));
             let k = style.marker * 1.5;
-            for &(x, y) in &f.part_centres {
-                let p = to_out(x, y);
-                c.line((p.0 - k, p.1 - k), (p.0 + k, p.1 + k), drawing.slow, width, Dash::Solid);
-                c.line((p.0 - k, p.1 + k), (p.0 + k, p.1 - k), drawing.slow, width, Dash::Solid);
+            for &(x, y) in f.part_centres.iter().filter(|_| mark.is_some()) {
+                let (p, m) = (to_out(x, y), mark.unwrap());
+                c.line((p.0 - k, p.1 - k), (p.0 + k, p.1 + k), m, width, Dash::Solid);
+                c.line((p.0 - k, p.1 + k), (p.0 + k, p.1 - k), m, width, Dash::Solid);
             }
         }
         c.ellipse(center, r, r, Some([255, 255, 255, 160]), (width / 2.0).max(1.0), Dash::Dot, None);
         if brightest == Some(i) {
             let k = (r * 0.25).max(style.marker * 3.0);
             c.ellipse(center, k, k, Some(READOUT_COLOR), width, Dash::Solid, None);
+        }
+        if drawing.numbers_only {
+            continue;
         }
         let shown = [(drawing.show_fast, f.fast_deg(), drawing.fast_color(f), Dash::Dash), (drawing.show_slow, f.slow_deg, drawing.slow_color(f), Dash::Solid)];
         for (deg, color, dash) in shown.into_iter().filter(|a| a.0).map(|a| (a.1, a.2, a.3)) {
@@ -390,7 +400,7 @@ pub fn fiber_readout_lines_with(axes: &[FiberAxis], drawing: &FiberDrawing) -> V
 /// The angles in a dark box with its top-left corner at `corner`.
 pub fn draw_fiber_readout(c: &mut dyn Canvas, axes: &[FiberAxis], drawing: &FiberDrawing, corner: P, font_px: f32) {
     let lines = fiber_readout_pieces(axes, drawing);
-    if lines.is_empty() {
+    if lines.is_empty() || drawing.numbers_only {
         return;
     }
     let pad = font_px * 0.4;
@@ -417,6 +427,19 @@ pub struct Extras {
     pub reference: Option<((f64, f64), (f64, f64))>,
     pub numbers: bool,
     pub notes: Vec<String>,
+    /// How the region and the reference line are drawn: (color, width on screen, line style); None: the standard look.
+    pub region_look: Option<(Color, f32, Dash)>,
+    pub reference_look: Option<(Color, f32, Dash)>,
+}
+
+impl Extras {
+    pub fn region_look(&self) -> (Color, f32, Dash) {
+        self.region_look.unwrap_or((REGION_COLOR, 3.5, Dash::Dash))
+    }
+
+    pub fn reference_look(&self) -> (Color, f32, Dash) {
+        self.reference_look.unwrap_or((REFERENCE_COLOR, 5.0, Dash::Solid))
+    }
 }
 
 pub fn draw_extras(c: &mut dyn Canvas, extras: &Extras, axes: &[FiberAxis], drawing: &FiberDrawing, to_out: &dyn Fn(f64, f64) -> P,
@@ -425,11 +448,13 @@ pub fn draw_extras(c: &mut dyn Canvas, extras: &Extras, axes: &[FiberAxis], draw
     match extras.region {
         Some(Region::Rect { x0, y0, x1, y1 }) => {
             let pts = [to_out(x0, y0), to_out(x1, y0), to_out(x1, y1), to_out(x0, y1)];
-            c.polyline(&pts, true, REGION_COLOR, w, Dash::Dash, None);
+            let (color, width, dash) = extras.region_look();
+            c.polyline(&pts, true, color, width * w / 2.0, dash, None);
         }
         Some(Region::Circle { cx, cy, r }) => {
             let r = (r * zoom) as f32;
-            c.ellipse(to_out(cx, cy), r, r, Some(REGION_COLOR), w, Dash::Dash, None);
+            let (color, width, dash) = extras.region_look();
+            c.ellipse(to_out(cx, cy), r, r, Some(color), width * w / 2.0, dash, None);
         }
         None => {}
     }
@@ -440,9 +465,11 @@ pub fn draw_extras(c: &mut dyn Canvas, extras: &Extras, axes: &[FiberAxis], draw
         let far = (area.1 .0 - area.0 .0).abs() + (area.1 .1 - area.0 .1).abs() + (p.0 - area.0 .0).abs() + (p.1 - area.0 .1).abs();
         let u = ((q.0 - p.0) / len * far, (q.1 - p.1) / len * far);
         if let Some((s, e)) = clip_to_rect((p.0 - u.0, p.1 - u.1), (p.0 + u.0, p.1 + u.1), area.0, area.1) {
-            c.line(s, e, REFERENCE_COLOR, w, Dash::Dash);
+            let (color, width, _) = extras.reference_look();
+            c.line(s, e, color, (0.6 * width * w / 2.0).max(1.0), Dash::Dash);
         }
-        c.line(p, q, REFERENCE_COLOR, w * 1.5, Dash::Solid);
+        let (color, width, dash) = extras.reference_look();
+        c.line(p, q, color, width * w / 2.0, dash);
     }
     if extras.numbers {
         let on = brightest_centre(axes).map(|b| b.0);

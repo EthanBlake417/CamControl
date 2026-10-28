@@ -12,7 +12,7 @@ fn main() {
     let center = args.iter().any(|a| a == "--center");
     let img = camcontrol::capture::load_image(std::path::Path::new(path)).expect("unreadable image");
     let t = Instant::now();
-    let circles = find_fibers(&img, 10);
+    let circles = find_fibers(&img, camcontrol::processing::fiber_axis::MAX_FIBERS);
     println!("find_fibers: {:.0} ms -> {:?}", t.elapsed().as_secs_f64() * 1000.0,
              circles.iter().map(|c| format!("({:.0}, {:.0}) r {:.0}", c.0, c.1, c.2)).collect::<Vec<_>>());
     let t = Instant::now();

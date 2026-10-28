@@ -290,10 +290,54 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
             ui.selectable_value(tab, "grid".into(), "Grid");
             ui.selectable_value(tab, "crosshair".into(), "Crosshair");
             ui.selectable_value(tab, "fiber".into(), "Fiber axes");
+            ui.selectable_value(tab, "parts".into(), "Stress parts");
+            ui.selectable_value(tab, "marks".into(), "Region & line");
         });
         ui.separator();
         egui::Grid::new("overlay").num_columns(2).show(ui, |ui| {
-            if tab == "fiber" {
+            if tab == "marks" {
+                let f = &mut *fiber;
+                for (name, color, opacity, width, line) in [
+                    ("Reference line", &mut f.reference_color, &mut f.reference_opacity, &mut f.reference_width, &mut f.reference_line),
+                    ("Region of interest", &mut f.region_color, &mut f.region_opacity, &mut f.region_width, &mut f.region_line),
+                ] {
+                    ui.strong(name);
+                    ui.end_row();
+                    ui.label("Color:");
+                    color_button(ui, color);
+                    ui.end_row();
+                    ui.label("Opacity:");
+                    ui.add(egui::Slider::new(opacity, 5..=100).suffix("%"));
+                    ui.end_row();
+                    ui.label("Width:");
+                    ui.add(egui::DragValue::new(width).range(0.5..=20.0).speed(0.1).suffix(" px"));
+                    ui.end_row();
+                    ui.label("Line style:");
+                    line_combo(ui, &format!("{name}_line"), line);
+                    ui.end_row();
+                }
+            } else if tab == "parts" {
+                ui.label("Color:");
+                color_button(ui, &mut fiber.parts_color);
+                ui.end_row();
+                ui.label("Fill:");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut fiber.parts_fill, "");
+                    ui.add_enabled(fiber.parts_fill, egui::Slider::new(&mut fiber.parts_fill_opacity, 0..=100).suffix("%"))
+                        .on_hover_text("How solid the color filling the stress parts is");
+                });
+                ui.end_row();
+                ui.label("Outline:");
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut fiber.parts_line, "");
+                    ui.add_enabled(fiber.parts_line, egui::Slider::new(&mut fiber.parts_line_opacity, 0..=100).suffix("%"))
+                        .on_hover_text("How solid the line round each stress part is");
+                });
+                ui.end_row();
+                ui.label("Outline style:");
+                ui.add_enabled_ui(fiber.parts_line, |ui| line_combo(ui, "parts_line", &mut fiber.parts_line_style));
+                ui.end_row();
+            } else if tab == "fiber" {
                 ui.label("Show:");
                 ui.horizontal(|ui| {
                     for (name, label) in SHOW_AXES {
@@ -375,6 +419,10 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
         });
         if tab == "fiber" {
             ui.label(egui::RichText::new("The colors are also used for the angles in the readout.").weak());
+        } else if tab == "parts" {
+            ui.label(egui::RichText::new("Drawn when Show stress parts is on (Fiber axis panel), and on exports and videos.").weak());
+        } else if tab == "marks" {
+            ui.label(egui::RichText::new("Drawn in the Alignment panel (Reference line, Region of interest). Exports scale the width.").weak());
         }
         ui.horizontal(|ui| {
             if ui.button("Defaults").on_hover_text("Back to the standard look").clicked() {
@@ -382,8 +430,17 @@ pub fn overlay_window(ctx: &egui::Context, tab: &mut String, grid: &mut GridStyl
                     "crosshair" => *crosshair = CrosshairStyle::default(),
                     "fiber" => {
                         *outside = false;
+                        let parts = fiber.clone();
                         *fiber = FiberLineStyle::default();
+                        (fiber.parts_color, fiber.parts_fill, fiber.parts_fill_opacity) = (parts.parts_color, parts.parts_fill, parts.parts_fill_opacity);
+                        (fiber.parts_line, fiber.parts_line_opacity, fiber.parts_line_style) = (parts.parts_line, parts.parts_line_opacity, parts.parts_line_style);
+                        (fiber.reference_color, fiber.reference_opacity, fiber.reference_width, fiber.reference_line) =
+                            (parts.reference_color, parts.reference_opacity, parts.reference_width, parts.reference_line);
+                        (fiber.region_color, fiber.region_opacity, fiber.region_width, fiber.region_line) =
+                            (parts.region_color, parts.region_opacity, parts.region_width, parts.region_line);
                     }
+                    "parts" => fiber.default_parts(),
+                    "marks" => fiber.default_marks(),
                     _ => *grid = GridStyle::default(),
                 }
             }

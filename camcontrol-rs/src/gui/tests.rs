@@ -215,13 +215,16 @@ fn alignment_readings_reference_and_region() {
     h.state_mut().view_event(id, super::view::ViewEvent::ReferenceMoved((0.0, 300.0), (100.0, 300.0)));
     assert!(h.state().alignment.reference_deg().unwrap().abs() < 1e-9);
     h.state_mut().alignment.reference = Some(super::alignment::rotate_line((0.0, 300.0), (100.0, 300.0), 30.0));
+    // One fiber per take (the middle one), numbered from the chosen number up.
+    h.state_mut().alignment.next_number = 7;
+    h.state_mut().take_readings();
     h.state_mut().take_readings();
     let rows = h.state().alignment.rows.clone();
-    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows.len(), 2, "{rows:?}");
     for r in &rows {
         assert!(r.n == 1 && r.std == 0.0 && (r.mean + 30.0).abs() < 0.5 && r.reference.is_some() && r.axis == "fast", "off perpendicular: {r:?}");
     }
-    assert_eq!(rows.iter().map(|r| r.fiber).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(rows.iter().map(|r| r.fiber).collect::<Vec<_>>(), vec![7, 8]);
     // Only the two fibers whose centers are in the left 640 px.
     h.state_mut().alignment.drawing = Some(DrawTarget::RegionRect);
     h.state_mut().view_event(id, super::view::ViewEvent::Drawn("rectangle".into(), vec![(0.0, 0.0), (640.0, 340.0)]));
@@ -262,6 +265,12 @@ fn fiber_count_numbers_and_saves() {
     h.state_mut().fiber.centre_only = true;
     h.state_mut().find_all_fibers();
     assert!(!h.state().fiber.centre_only, "Find fibers looks for all of them");
+    // Just the fibers and their numbers: no axes, angles or region while counting (unless asked for).
+    h.state_mut().alignment.region = Some(crate::processing::fiber_axis::Region::rect((0.0, 0.0), (960.0, 340.0)));
+    assert!(h.state().fiber_drawing().numbers_only && h.state().view_extras().region.is_none());
+    h.state_mut().saved.count_show_axes = true;
+    assert!(!h.state().fiber_drawing().numbers_only && h.state().view_extras().region.is_some());
+    h.state_mut().saved.count_show_axes = false;
     wait(&mut h, "fiber axes", |a| a.active_pane().fibers.len() == 3);
     assert!(h.state().panels.is_open(PanelId::FiberCount), "Find fibers stays on the Fiber count tab");
     let lines = super::annotate::fiber_readout_lines_with(&h.state().active_pane().fibers, &h.state().fiber_drawing());
@@ -362,23 +371,26 @@ fn choices_kept_between_sessions() {
     let (mut h, _dir) = harness("remember");
     let app = h.state_mut();
     app.fiber.live = true;
-    app.fiber.use_circles = false;
+    app.fiber.centre_only = true;
     app.fiber_log.record = true;
     app.class_names[0] = "Cores".into();
     app.multi_layout = "row".into();
     app.overlay_tab = "fiber".into();
     app.alignment.n = 7;
+    app.alignment.next_number = 23;
+    app.alignment.ascending = false;
     app.alignment.reference = Some(((1.0, 2.0), (3.0, 4.0)));
     app.alignment.region = Some(crate::processing::fiber_axis::Region::Circle { cx: 5.0, cy: 6.0, r: 7.0 });
     app.saved.count_first = 17;
     app.saved.recording.photo_markup = true;
     app.save_state_for_test();
     let s = &app.saved;
-    assert!(s.fiber_live && !s.fiber_use_circles && s.fiber_log_record);
+    assert!(s.fiber_live && s.fiber_centre_only && s.fiber_log_record);
     assert_eq!((s.count_class_names[0].as_str(), s.multi_layout.as_str(), s.overlay_tab.as_str()), ("Cores", "row", "fiber"));
     let back: super::settings::Saved = serde_json::from_value(serde_json::to_value(s).unwrap()).unwrap();
-    assert!(back.fiber_live && !back.fiber_use_circles && back.fiber_log_record);
+    assert!(back.fiber_live && back.fiber_centre_only && back.fiber_log_record);
     assert_eq!((back.align_n, back.align_reference, back.count_first), (7, Some([1.0, 2.0, 3.0, 4.0]), 17));
+    assert_eq!((back.align_next, back.align_ascending), (23, false));
     assert_eq!(back.align_region, Some(crate::processing::fiber_axis::Region::Circle { cx: 5.0, cy: 6.0, r: 7.0 }));
     assert!(back.recording.photo_markup && !back.recording.tl_markup);
     assert_eq!((back.count_class_names, back.multi_layout, back.overlay_tab), (s.count_class_names.clone(), s.multi_layout.clone(), s.overlay_tab.clone()));
@@ -676,9 +688,15 @@ fn render_shots() {
     shot(&mut t, "6_fiber_panel");
     t.state_mut().fiber.advanced = true;
     t.state_mut().overlay_open = true;
+    t.state_mut().overlay_tab = "marks".into();
+    shot(&mut t, "7c_region_line");
     t.state_mut().overlay_tab = "fiber".into();
     t.state_mut().saved.fiber_lines.slow_by_angle.on = true;
     shot(&mut t, "7_fiber_advanced_overlay");
+    t.state_mut().overlay_tab = "parts".into();
+    t.state_mut().saved.fiber_lines.parts_fill_opacity = 60;
+    shot(&mut t, "7b_stress_parts");
+    t.state_mut().overlay_tab = "fiber".into();
     t.state_mut().overlay_open = false;
     for slot in t.state_mut().panels.slots.iter_mut().filter(|s| s.id == PanelId::FiberLog) {
         slot.edge = super::stripes::Edge::Right;
