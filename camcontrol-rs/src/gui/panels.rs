@@ -682,15 +682,17 @@ and ring the point the axis turns about. Also on saved images and videos.");
                         ui.label(RichText::new("No fibers measured yet: press Find axes.").weak());
                         return;
                     }
+                    // Solid bars take their own space instead of floating over the last row.
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
                     egui::ScrollArea::both().max_height(ui.available_height().max(80.0)).auto_shrink([false, true]).show(ui, |ui| {
                         egui::Grid::new("fibers").striped(true).num_columns(14).spacing(egui::vec2(14.0, 4.0)).show(ui, |ui| {
-                            for h in ["#", "Type", "Slow", "Fast", "Angle", "Clarity", "Rod edge", "Rod contrast", "Background contrast", "Quality", "Method", "Center (px)", "Ø (px)", "Brightness"] {
+                            for h in ["#", "Type", "Slow", "Fast", "Angle", "Clarity", "Rod edge", "Rod contrast", "Bg contrast", "Quality", "Method", "Center (px)", "Ø (px)", "Brightness"] {
                                 let r = ui.strong(h);
                                 match h {
                                     "Slow" | "Fast" => { r.on_hover_text("Axis angle (°) from horizontal, counter-clockwise +.\nWith a reference line, Angle gives the axis against it."); }
                                     "Angle" => { r.on_hover_text("With a reference line (Alignment panel): how far the fiber's axis nearest\n\
                                                                  perpendicular to the line is from perpendicular (slow or fast, whichever)."); }
-                                    "Background contrast" | "Quality" => { r.on_hover_text(super::fiber_log::QUALITY_HELP); }
+                                    "Bg contrast" | "Quality" => { r.on_hover_text(super::fiber_log::QUALITY_HELP); }
                                     "Rod contrast" => { r.on_hover_text("How clearly the stress rods stand out: (rods - cladding) / (rods + cladding), the mean\n\
                                                                         brightness inside the rods against the cladding within one rod radius of them (not the\n\
                                                                         core). - = rods darker. Further from 0 is clearer."); }

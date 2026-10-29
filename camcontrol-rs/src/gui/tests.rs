@@ -209,6 +209,11 @@ fn alignment_readings_reference_and_region() {
     let (a, b) = h.state().alignment.reference.unwrap();
     assert!((a.1 - 30.0).abs() < 1.5 && (b.1 - 30.0).abs() < 1.5 && (b.0 - a.0).abs() > 600.0, "{a:?} {b:?}");
     let id = h.state().active;
+    // Clicking a drawing button again stops drawing.
+    h.state_mut().start_drawing(DrawTarget::RegionRect);
+    assert_eq!(h.state().tool.as_deref(), Some("rectangle"));
+    h.state_mut().start_drawing(DrawTarget::RegionRect);
+    assert_eq!((h.state().alignment.drawing, h.state().tool.as_deref()), (None, None));
     h.state_mut().alignment.drawing = Some(DrawTarget::Reference);
     // A line at +30°: every angle shown is measured from it.
     let (dx, dy) = (100.0 * 30f64.to_radians().cos(), -100.0 * 30f64.to_radians().sin());

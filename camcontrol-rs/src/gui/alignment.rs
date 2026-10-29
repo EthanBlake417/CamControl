@@ -460,8 +460,14 @@ impl App {
         }
     }
 
-    fn start_drawing(&mut self, target: DrawTarget) {
+    /// Clicking the button that's already drawing stops drawing.
+    pub(crate) fn start_drawing(&mut self, target: DrawTarget) {
         self.picking_rod = false;
+        if self.alignment.drawing == Some(target) {
+            self.alignment.drawing = None;
+            self.tool = None;
+            return;
+        }
         self.alignment.drawing = Some(target);
         self.tool = Some(match target {
             DrawTarget::RegionRect => "rectangle",
@@ -914,7 +920,7 @@ impl App {
                         ui.selectable_value(&mut self.saved.count_format, i, *label);
                     }
                 });
-                if ui.button("Save image with information").on_hover_text("Save the view's image with the numbers and which fiber is on\n\
+                if ui.button("Save Image w/ Info").on_hover_text("Save the view's image with the numbers and which fiber is on\n\
                                                                          (details inside it), and a CSV table of the fibers beside it.").clicked() {
                     self.save_fiber_count();
                 }
